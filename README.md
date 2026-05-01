@@ -19,6 +19,16 @@ Pre-built `.EXE` binaries are attached to each [GitHub release](../../releases).
 
 The `ext4` prefix marks them as belonging to the ext4 module; future modules (LFN, networking, etc.) will follow the same pattern.
 
+## Known limitations
+
+- **Read-only.** Writes are out of scope for v1.
+- **MS-DOS 4: DIR's "bytes free" display is wrong for ext4 disks larger than ~96 MB.** The redirector returns the right numbers; only MS-DOS 4 DIR's printed `bytes free` line is wrong (a buggy display path in MS-DOS 4 itself). FreeDOS shows the correct value. *Actual file operations are unaffected.* Future fix: implement `INT 2Fh AX=11A3h` (Get Extended Free Space) so callers that opt in get full 32-bit precision.
+- **Long filenames** are not exposed — names get truncated to 8.3. The DOS LFN ecosystem (DOSLFN.COM etc.) is FAT-only and has no protocol for asking redirectors about long names. See [`docs/dos-internals.md`](docs/dos-internals.md) for the full story.
+
+## DOS internals: working notes
+
+A lot of what made this project work is folklore — undocumented DOS quirks, redirector subfunction dispatch, CDS flag bits that differ between FreeDOS and MS-DOS 4, etc. Everything we learned is captured in [`docs/dos-internals.md`](docs/dos-internals.md). Required reading if you're picking up the project or writing a different DOS redirector.
+
 Builds for every push are also available from the [Actions](../../actions) tab under the `dosix-binaries` artifact (auth required).
 
 ## Why
