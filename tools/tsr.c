@@ -741,7 +741,27 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             return;
         }
 
-        case 0x0C: { /* Get Disk Space — real values from ext4 superblock */
+        case 0x0C: { /* Get Disk Space — real values from ext4 superblock.
+                      *
+                      * DOS reports free space as four 16-bit numbers:
+                      *   AX = sectors per cluster
+                      *   BX = total clusters
+                      *   CX = bytes per sector
+                      *   DX = free clusters
+                      * (Per FreeDOS dosfns.c rg[0..3] — some RBIL sources
+                      * disagree on order; this layout is empirical.)
+                      *
+                      * The cluster counts are 16-bit. For ext4 disks with
+                      * more than 65535 blocks we'd lose precision if we
+                      * truncated. Instead we DOUBLE the sectors-per-cluster
+                      * (and halve the cluster counts) until both counts
+                      * fit. The total bytes (spc × clusters × bps) stays
+                      * the same — we're just expressing the same total in
+                      * a different unit.
+                      *
+                      * Future: handle AX=11A3h "Get Extended Free Space"
+                      * for callers that want full 32-bit precision (Win95+
+                      * AX=7303h dispatches there). */
             uint32_t blocks_total;
             uint32_t blocks_free;
             uint32_t bs;
@@ -759,17 +779,37 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             blocks_free  = (uint32_t)g_fs.sb.free_blocks_count;
             spc = (uint16_t)(bs / 512u);
             if (spc == 0u) spc = 1u;
-            /* DOS uses 16-bit cluster counts; cap. Real-world disks > 32 MB
-             * with 1 KB blocks need cluster scaling; v1 just truncates. */
+
+            /* Two-phase strategy:
+             *
+             *   1. If blocks_total <= 0x18000 (1.5 × 65536), just truncate
+             *      to fit 16 bits. Loses at most ~50% of the count, but
+             *      empirically MS-DOS 4 DIR's "bytes free" display
+             *      misbehaves when spc is scaled up (returns garbage like
+             *      ~2 GB for a 64 MB disk). FreeDOS handles either path
+             *      correctly. For our typical small-disk test fixtures
+             *      (≤96 MB), truncation is the path that keeps both DOSes
+             *      happy.
+             *
+             *   2. For genuinely large disks, doubling spc until counts
+             *      fit is the only way to report a meaningful total —
+             *      truncating a 1 GB disk to 64 MB would be far worse
+             *      than the MS-DOS 4 display quirk.
+             *
+             * Scaling rounds up on total (avoid claiming non-existent
+             * space) and down on free (conservative). Cap spc at 64 —
+             * beyond that DOS apps may stumble on >32 KB clusters. */
+            if (blocks_total > 0x18000ul) {
+                while ((blocks_total > 0xFFFFul || blocks_free > 0xFFFFul)
+                       && spc < 64u) {
+                    spc *= 2u;
+                    blocks_total = (blocks_total + 1u) >> 1;
+                    blocks_free  = blocks_free  >> 1;
+                }
+            }
             if (blocks_total > 0xFFFFul) blocks_total = 0xFFFFul;
             if (blocks_free  > 0xFFFFul) blocks_free  = 0xFFFFul;
 
-            /* Per FreeDOS dosfns.c (rg[0..3] = AX, BX, CX, DX):
-             *   AX = sectors per cluster
-             *   BX = total clusters
-             *   CX = bytes per sector
-             *   DX = free clusters
-             * (Some RBIL sources order these differently — empirical.) */
             r.w.ax = spc;                    /* sectors/cluster */
             r.w.bx = (uint16_t)blocks_total; /* total clusters */
             r.w.cx = 512u;                   /* bytes/sector */
