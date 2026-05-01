@@ -18,10 +18,14 @@ fixture attached at INT 13h drive 0x81.
 - **`DIR Y:`: working.** Lists ext4 entries with timestamps and free
   space. MS-DOS 4 dispatches FindFirst through the IFS-style
   `IFS_SEQ_SEARCH_FIRST` (INT 2Fh AL=0x19) variant, which we now handle.
-- **`TYPE Y:\file`: not yet working.** MS-DOS 4 routes file opens through
-  AL=0x2E (Extended Open) and our handler — currently aliased to AL=0x16
-  — reports failure. Smaller follow-up: figure out the right SDA/SFT
-  contract for ExtOpen.
+- **`TYPE Y:\file`: not yet working.** MS-DOS 4 routes the open through
+  AL=0x2E (Extended Open). With our INT 2Fh default arm chaining unknown
+  subfunctions to the kernel (rather than claiming "file not found" for
+  everything), the failure mode is now "Invalid function -
+  Y:\HELLO.TXT" instead of "File not found" — the kernel and our
+  handler are talking past each other on the SFT/ExtOpen contract. The
+  fix is in our case 0x16/0x2E open path; the SDA path field looks
+  right but something the kernel expects isn't being set.
 
 The header comment in `scripts/run-msdos4-test.sh` documents the
 investigation path so anyone re-visiting can skip the dead ends. The

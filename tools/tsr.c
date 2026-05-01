@@ -786,9 +786,15 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             return;
 
         default:
-            r.w.ax = DOS_ERR_FILE_NOT_FOUND;
-            r.w.flags |= 1u;
-            return;
+            /* Unknown AH=11h subfunction. DON'T claim it as ours — the
+             * MS-DOS 4 kernel issues several extended subfunctions
+             * (AL=0x22, 0x2B, 0x2D, 0x3E ...) that we don't implement,
+             * and answering "file not found" for them confuses the
+             * kernel's path-resolution / file-info plumbing on Y:
+             * (visible symptom: COMMAND.COM TYPE Y:\file fails even
+             * though DIR Y: works). Fall through to the chain so the
+             * default DOS handler can deal with it. */
+            break;
         }
     }
 
