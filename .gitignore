@@ -19,6 +19,9 @@ tests/images/*.img
 tests/images/*.ext4
 tests/images/*.raw
 
+# FreeDOS test image + cached download (large, fetched on demand)
+tests/freedos/
+
 # macOS
 .DS_Store
 

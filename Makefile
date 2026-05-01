@@ -79,6 +79,9 @@ dos-test: dos-build fixture-partitioned
 tsr-test: dos-build
 	@bash scripts/run-tsr-test.sh
 
+freedos-test: dos-build
+	@bash scripts/run-freedos-test.sh
+
 fixtures: fixture fixture-partitioned
 fixture:             tests/images/small.img
 fixture-partitioned: tests/images/disk.img
