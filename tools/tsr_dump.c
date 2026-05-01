@@ -50,6 +50,8 @@ struct ff_capture {
         uint8_t  name_len;
         char     name[16];
         uint8_t  pri_path[80];
+        uint8_t  name83[11];
+        uint8_t  searchdir_after[32];
     } calls[4];
 #pragma pack(pop)
 };
@@ -177,6 +179,25 @@ int main(void) {
                     putchar(isprint(c) ? (char)c : '?');
                 }
                 printf("'\n");
+            }
+            if (cap->calls[i].rc == 0) {
+                int j;
+                printf("    name83[11]   =");
+                for (j = 0; j < 11; j++)
+                    printf(" %02x", (unsigned char)cap->calls[i].name83[j]);
+                printf("  '");
+                for (j = 0; j < 11; j++) {
+                    uint8_t c = cap->calls[i].name83[j];
+                    putchar(isprint(c) ? (char)c : '.');
+                }
+                printf("'\n");
+                printf("    SearchDir    =");
+                for (j = 0; j < 16; j++)
+                    printf(" %02x", (unsigned char)cap->calls[i].searchdir_after[j]);
+                printf("\n                  ");
+                for (j = 16; j < 32; j++)
+                    printf(" %02x", (unsigned char)cap->calls[i].searchdir_after[j]);
+                printf("\n");
             }
         }
     }

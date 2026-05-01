@@ -115,6 +115,8 @@ struct ff_capture {
         uint8_t  name_len;
         char     name[16];
         uint8_t  pri_path[80];
+        uint8_t  name83[11];
+        uint8_t  searchdir_after[32];
     } calls[4];
 #pragma pack(pop)
 };
@@ -148,11 +150,40 @@ struct find_iter_state {
     uint8_t  file_type;
 };
 
+static int name_is_8_3_safe(const char *name, uint8_t name_len) {
+    /* DOS 8.3 char set: A-Z 0-9 ! # $ % & ' ( ) - @ ^ _ ` { } ~ + spaces.
+     * We're conservative: alnum + a few common safe chars. Reject names
+     * whose base or extension don't fit 8.3 too. */
+    int i;
+    int dot_at = -1;
+    for (i = 0; i < name_len; i++) {
+        char c = name[i];
+        if (c == '.') {
+            if (dot_at >= 0) return 0;  /* multiple dots */
+            dot_at = i;
+            continue;
+        }
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '~')) {
+            return 0;
+        }
+    }
+    if (dot_at < 0) {
+        if (name_len > 8) return 0;
+    } else {
+        if (dot_at > 8) return 0;
+        if (name_len - dot_at - 1 > 3) return 0;
+    }
+    return 1;
+}
+
 static int find_iter_cb(const struct ext4_dir_entry *e, void *ud) {
     struct find_iter_state *s = (struct find_iter_state *)ud;
     /* Skip . and .. — FAT root convention */
     if (e->name_len == 1 && e->name[0] == '.') return 0;
     if (e->name_len == 2 && e->name[0] == '.' && e->name[1] == '.') return 0;
+    /* Skip names that don't fit DOS 8.3 (no LFN support yet). */
+    if (!name_is_8_3_safe(e->name, e->name_len)) return 0;
 
     if (s->current_index == s->target_index) {
         s->name_len  = e->name_len;
@@ -179,7 +210,9 @@ static int do_findfirst_or_next(uint16_t entry_index) {
     static struct find_iter_state state;
     uint8_t      __far *sdb;
     uint8_t      __far *dirent;
-    uint8_t              name83[11];
+    /* Static so &name83 resolves via DS, not SS. to_8_3() writes to it
+     * via near pointer, and in interrupt context SS != DS. */
+    static uint8_t       name83[11];
     int                  i;
     int                  rc;
     int                  result = 0;
@@ -251,6 +284,12 @@ static int do_findfirst_or_next(uint16_t entry_index) {
     sdb[DM_DRIVE_OFF]      = (uint8_t)(DRIVE_INDEX | 0x80u);
     sdb[DM_ATTR_SRCH_OFF]  = g_sda[SDA_SATTR_OFF];
     *(uint16_t __far *)(sdb + DM_ENTRY_OFF) = (uint16_t)(entry_index + 1);
+
+    if (slot >= 0) {
+        for (i = 0; i < 11; i++) g_ff_capture.calls[slot].name83[i] = name83[i];
+        for (i = 0; i < 32; i++)
+            g_ff_capture.calls[slot].searchdir_after[i] = dirent[i];
+    }
 
     g_ff_capture.flow_success++;
     result = 0;
@@ -358,6 +397,13 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
         case 0x1B:  /* FindFirst */
             if (!g_fs_ready) {
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            /* For volume-label searches, ext4 has no FAT-style volume entry —
+             * the volume name lives in the superblock. Just say "no files". */
+            if ((g_sda[SDA_SATTR_OFF] & 0x08u) != 0u) {
+                r.w.ax = DOS_ERR_NO_MORE_FILES;
                 r.w.flags |= 1u;
                 return;
             }
