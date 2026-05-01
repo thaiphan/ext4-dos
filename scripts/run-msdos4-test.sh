@@ -38,44 +38,53 @@ mkdir -p "$MSDOS4_DIR"
 cp "$SOURCE_IMG" "$TEST_IMG"
 
 # ============================================================================
-# MS-DOS 4 status: install + DIR Y: working, TYPE Y: still blocked.
+# MS-DOS 4 status: full DIR + TYPE working end-to-end.
 # ============================================================================
-# What works:
-#   - TSR installs via CONFIG.SYS INSTALL=A:\TSR.EXE.
-#   - DIR Y: lists ext4 entries with timestamps and free-space (uses
-#     IFS_SEQ_SEARCH_FIRST = INT 2Fh AL=0x19, the MS-DOS-4-specific variant
-#     of FindFirst).
-#   - Boot proceeds cleanly to A> prompt.
+# Lessons learned during the bring-up — read these before changing anything,
+# they're the kind of bug that takes hours to find and seconds to undo:
 #
-# What doesn't:
-#   - TYPE Y:\file fails with "File not found". MS-DOS 4 routes the open
-#     through INT 2Fh AL=0x2E (Extended Open) instead of the AL=0x16 path
-#     FreeDOS uses. We currently alias AL=0x2E to the AL=0x16 handler but
-#     something about the SDA/SFT contract for ExtOpen differs and the
-#     handler reports failure. See tools/tsr.c near case 0x2E.
-#
-# Two big lessons learned during the investigation, documented in tools/tsr.c
-# but worth repeating here so anyone re-reading this script doesn't re-walk
-# the rabbit holes:
 #   1. INSTALL=A:\IFSFUNC.EXE is NOT needed. IFSFUNC is for IBM's separate
 #      IFS subsystem (DEVICE=foo.IFS drivers). Without IFS drivers loaded
 #      it prints "Invalid configuration" (UTIL_ERR_4 in IFSFUNC.SKL) and
 #      leaves the kernel in a half-init state — that was the cause of the
 #      "Bad or missing Command Interpreter" we chased for ages.
+#
 #   2. CDS flags must be `curdir_isnet | curdir_inuse` = 0xC000, NOT just
 #      0x8000. FreeDOS works with isnet alone, MS-DOS 4 silently refuses
 #      to dispatch redirector calls without inuse set. See
 #      references/msdos4/v4.0/src/INC/CURDIR.INC and IFSSESS.ASM.
-#   3. The Qualify Remote File Name handler (INT 2Fh AX=1123h) MUST only
+#
+#   3. The Qualify Remote File Name handler (INT 2Fh AX=1123h) must only
 #      claim Y:-prefixed paths AND copy the canonical name into ES:DI.
 #      Returning CF=0 unconditionally with empty ES:DI worked under
 #      FreeDOS (lenient) but bricked MS-DOS 4's COMMAND.COM load.
 #
+#   4. MS-DOS 4 dispatches several redirector subfunctions FreeDOS doesn't:
+#        AL=0x19 IFS_SEQ_SEARCH_FIRST (FindFirst — required for DIR Y:)
+#        AL=0x2E Extended Open       (issued from AX=6C00h ExtOpen path)
+#        AL=0x2D Get/Set XA          (issued from AH=57h Get/Set
+#                                     Extended Attributes — TYPE calls
+#                                     this immediately after Open to
+#                                     read the file's code page tag.
+#                                     If we don't claim it, the kernel
+#                                     returns "Invalid function" to the
+#                                     caller and TYPE bombs.)
+#      All three are now wired up in tools/tsr.c.
+#
+#   5. The unknown-subfunction default arm CHAINS to prev_int2f rather
+#      than claiming "file not found". Returning errors for subfunctions
+#      we don't implement confused MS-DOS 4 in subtle ways.
+#
 # References cloned at references/msdos4/ (Microsoft v4.0 source, MIT).
+# Useful starting points if you need to revisit:
+#   src/DOS/OPEN.ASM, HANDLE.ASM, ISEARCH.ASM — kernel dispatch points
+#   src/INC/CURDIR.INC                        — CDS structure + flag bits
+#   src/INC/mult.inc                          — INT 2Fh subfunction list
+#   src/CMD/IFSFUNC/                          — IFSFUNC source (NOT needed)
 # ============================================================================
 cat > "$MSDOS4_DIR/config.sys.tmp" <<'EOF'
 LASTDRIVE=Z
-INSTALL=A:\TSR.EXE -q -t 0x81
+INSTALL=A:\TSR.EXE -q 0x81
 EOF
 awk 'BEGIN{ORS="\r\n"} {print}' "$MSDOS4_DIR/config.sys.tmp" > "$MSDOS4_DIR/config.sys"
 rm -f "$MSDOS4_DIR/config.sys.tmp"
@@ -92,6 +101,8 @@ echo === TYPE Y:\HELLO.TXT === >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
 echo === Subfunction call counts === >> A:\OUT.TXT
 A:\TSR_CNT.EXE >> A:\OUT.TXT
+echo === TSR diagnostic dump === >> A:\OUT.TXT
+A:\TSR_DMP.EXE >> A:\OUT.TXT
 echo === DONE === >> A:\OUT.TXT
 EOF
 awk 'BEGIN{ORS="\r\n"} {print}' "$MSDOS4_DIR/autoexec.bat.tmp" > "$MSDOS4_DIR/autoexec.bat"

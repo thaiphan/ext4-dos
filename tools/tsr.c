@@ -59,7 +59,8 @@
 #define DIR_SIZE_OFF        28     /* 4 bytes */
 
 /* SFT offsets (DOS 4+) per RBIL */
-#define SFT_OPEN_MODE_OFF       0x02  /* word */
+#define SFT_REF_COUNT_OFF       0x00  /* word: number of handles referencing */
+#define SFT_OPEN_MODE_OFF       0x02  /* word: open mode (low byte = access) */
 #define SFT_FILE_ATTR_OFF       0x04  /* byte */
 #define SFT_DEVINFO_OFF         0x05  /* word: bit 15 = network */
 #define SFT_FILE_TIME_OFF       0x0D  /* word */
@@ -69,11 +70,8 @@
 #define SFT_FILE_NAME_OFF       0x20  /* 11 bytes 8.3 */
 
 static void (__interrupt __far *prev_int2f)(void);
-static void (__interrupt __far *prev_int21)(void);
 static char __far *g_cds_entry;
 static char __far *g_sda;
-static int         g_msdos4_trace;  /* -t: install INT 21h trace hook for the
-                                       MS-DOS 4 COMMAND.COM EXEC failure */
 
 static struct blockdev *g_bdev;
 static struct ext4_fs   g_fs;
@@ -610,6 +608,15 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             g_ff_capture.last_open_rc = 0;
 
             sft = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+            /* sf_ref_count must be 1 — kernel checks before treating the
+             * SFT as live. MS-DOS 4 doesn't pre-set this for ExtOpen
+             * (AL=0x2E) and the SFT we receive may have stale ref_count
+             * from a previous slot user, so DOS treats the open as
+             * invalid and returns "Invalid function" to the caller. */
+            *(uint16_t __far *)(sft + SFT_REF_COUNT_OFF) = 1u;
+            /* sf_open_mode: keep whatever the kernel pre-set in the low
+             * byte (read/write/share bits) but make sure the high byte is
+             * clean. Kernel pre-set the low byte just before our call. */
             *(uint16_t __far *)(sft + SFT_DEVINFO_OFF) =
                 (uint16_t)(0x8000u | DRIVE_INDEX);
             sft[SFT_FILE_ATTR_OFF] = 0;
@@ -623,6 +630,15 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF) =
                 (uint32_t)g_current_open.inode.size;
             *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = 0;
+
+            /* For AX=6C00h Extended Open dispatch (AL=0x2E), DOS expects
+             * CX = "action taken" on success (1 = opened existing,
+             * 2 = created, 3 = replaced). For TYPE we always opened
+             * an existing file; without this, MS-DOS 4 returns
+             * "Invalid function" to the caller. */
+            if (al == 0x2E) {
+                r.w.cx = 1u;
+            }
 
             r.w.flags &= ~1u;
             return;
@@ -785,6 +801,21 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             r.w.flags &= ~1u;
             return;
 
+        case 0x2D: /* MS-DOS 4 Get/Set Extended Attributes (XA) — dispatched
+                    * by INT 21h AH=57h AL=2..4 (FileTimes XA subfunctions)
+                    * via HANDLE.ASM line 620: `MOV AX,(multNET SHL 8) or 45`.
+                    *
+                    * COMMAND.COM TYPE calls AX=5702h immediately after a
+                    * successful Open to read the file's code-page tag. If
+                    * we don't claim this call (CF=1), the kernel returns
+                    * error_invalid_function to the caller and TYPE prints
+                    * "Invalid function - <filename>". ext4 has no concept
+                    * of DOS code-page extended attributes, so report none
+                    * exist (CX=0 = empty XA list) and succeed. */
+            r.w.cx = 0u;
+            r.w.flags &= ~1u;
+            return;
+
         default:
             /* Unknown AH=11h subfunction. DON'T claim it as ours — the
              * MS-DOS 4 kernel issues several extended subfunctions
@@ -911,217 +942,20 @@ static int mount_ext4(uint8_t drive) {
     return 0;
 }
 
-/* ============================================================================
- * MS-DOS 4 COMMAND.COM-EXEC trace hook (only installed via -t flag).
- *
- * Goal: when SYSINIT calls INT 21h AH=4Bh AL=0 to EXEC COMMAND.COM, capture:
- *   - the filename (DS:DX -> ASCIIZ path)
- *   - the EXEC parameter block (ES:BX -> { env_seg, cmdline, fcb1, fcb2 })
- *   - a snapshot of the MCB chain
- * Dump it directly to text-mode video memory at 0xB800:0 in printable form.
- * The kernel's "Bad or missing Command Interpreter" message appears below
- * (kernel writes via DOS PrintString at the cursor position, which is
- * further down the screen), so a screenshot shows both.
- *
- * Limitation: a Watcom __interrupt handler can only chain forward via
- * _chain_intr. We can't easily observe the EXEC RETURN that way, so we
- * dump pre-call state. That's enough to answer "what's SYSINIT asking for
- * and what does memory look like at that moment".
- * ============================================================================ */
-
-#define VID_SEG  0xB800u
-#define VID_ATTR 0x4Fu  /* bright white on red — visually distinct */
-
-static uint16_t g_vid_pos;  /* offset within video segment */
-
-static void vid_clear_top(int rows) {
-    int i;
-    uint16_t __far *vid = (uint16_t __far *)MK_FP(VID_SEG, 0);
-    for (i = 0; i < rows * 80; i++) vid[i] = ((uint16_t)VID_ATTR << 8) | ' ';
-    g_vid_pos = 0;
-}
-
-static void vid_putc(char c) {
-    uint16_t __far *vid = (uint16_t __far *)MK_FP(VID_SEG, 0);
-    if (c == '\n') {
-        g_vid_pos = (uint16_t)(((g_vid_pos / 80u) + 1u) * 80u);
-        return;
-    }
-    vid[g_vid_pos] = ((uint16_t)VID_ATTR << 8) | (uint8_t)c;
-    g_vid_pos++;
-}
-
-static void vid_puts(const char *s) {
-    while (*s) vid_putc(*s++);
-}
-
-static void vid_puthex16(uint16_t v) {
-    static const char hex[] = "0123456789ABCDEF";
-    vid_putc(hex[(v >> 12) & 0xF]);
-    vid_putc(hex[(v >>  8) & 0xF]);
-    vid_putc(hex[(v >>  4) & 0xF]);
-    vid_putc(hex[(v >>  0) & 0xF]);
-}
-
-static void vid_puthex8(uint8_t v) {
-    static const char hex[] = "0123456789ABCDEF";
-    vid_putc(hex[(v >> 4) & 0xF]);
-    vid_putc(hex[(v >> 0) & 0xF]);
-}
-
-static int g_exec_dumped;       /* fire once — only the FIRST AH=4Bh we see */
-static uint16_t g_int21_count;   /* total INT 21h calls our hook saw */
-static uint16_t g_ah_count[256]; /* per-AH histogram */
-static uint8_t  g_ah_seq[64];    /* call sequence (first 64 AH values) */
-static uint8_t  g_ah_seq_n;
-
-void __interrupt __far my_int21_handler(union INTPACK r) {
-    static const char hex[] = "0123456789ABCDEF";
-
-    /* Histogram + sequence */
-    g_int21_count++;
-    g_ah_count[r.h.ah]++;
-    if (g_ah_seq_n < 64) g_ah_seq[g_ah_seq_n++] = r.h.ah;
-
-    /* Per-call status line at row 24 col 0: total count + last AH + sequence */
-    {
-        uint16_t __far *vid = (uint16_t __far *)MK_FP(VID_SEG, 24u * 80u);
-        uint16_t        n   = g_int21_count;
-        int             i, p = 0;
-        const char     *s   = "I21=";
-        while (*s) vid[p++] = ((uint16_t)0x70 << 8) | *s++;
-        vid[p++] = ((uint16_t)0x70 << 8) | hex[(n >> 12) & 0xF];
-        vid[p++] = ((uint16_t)0x70 << 8) | hex[(n >>  8) & 0xF];
-        vid[p++] = ((uint16_t)0x70 << 8) | hex[(n >>  4) & 0xF];
-        vid[p++] = ((uint16_t)0x70 << 8) | hex[(n >>  0) & 0xF];
-        s = " seq:";
-        while (*s) vid[p++] = ((uint16_t)0x70 << 8) | *s++;
-        /* Show last 32 distinct AHs (with rolling overflow). 2 nibbles each. */
-        for (i = 0; i < g_ah_seq_n && i < 32 && p + 2 < 80; i++) {
-            uint8_t ah = g_ah_seq[i];
-            vid[p++] = ((uint16_t)0x70 << 8) | hex[(ah >> 4) & 0xF];
-            vid[p++] = ((uint16_t)0x70 << 8) | hex[(ah >> 0) & 0xF];
-            if (p < 80) vid[p++] = ((uint16_t)0x70 << 8) | '.';
-        }
-    }
-
-    /* Trap the FIRST OPEN (AH=3Dh) or LOAD/EXEC (AH=4Bh AL=0). Dump
-     * diagnostic state to video memory using ABSOLUTE row positions
-     * (g_vid_pos newline math went wrong on prior attempt). */
-    if (!g_exec_dumped &&
-        ((r.h.ah == 0x4Bu && r.h.al == 0x00u) ||
-         (r.h.ah == 0x3Du))) {
-        uint8_t __far *fname = (uint8_t __far *)MK_FP(r.x.ds, r.w.dx);
-
-        g_exec_dumped = 1;
-        vid_clear_top(20);
-
-        /* Row 0: function + AX/BX/CX/DX */
-        g_vid_pos = 0;
-        vid_puts("TRAP AH="); vid_puthex8(r.h.ah);
-        vid_puts(" AL=");     vid_puthex8(r.h.al);
-        vid_puts(" AX=");     vid_puthex16(r.w.ax);
-        vid_puts(" BX=");     vid_puthex16(r.w.bx);
-        vid_puts(" CX=");     vid_puthex16(r.w.cx);
-        vid_puts(" DX=");     vid_puthex16(r.w.dx);
-
-        /* Row 1: segment regs */
-        g_vid_pos = 80;
-        vid_puts("DS="); vid_puthex16(r.x.ds);
-        vid_puts(" ES="); vid_puthex16(r.x.es);
-        vid_puts(" SI="); vid_puthex16(r.w.si);
-        vid_puts(" DI="); vid_puthex16(r.w.di);
-        vid_puts(" BP="); vid_puthex16(r.x.bp);
-        vid_puts(" PSP="); vid_puthex16((uint16_t)_psp);
-
-        /* Row 2: filename hex dump (first 32 bytes at DS:DX) */
-        g_vid_pos = 160;
-        vid_puts("DS:DX hex: ");
-        {
-            int i;
-            for (i = 0; i < 32; i++) {
-                vid_puthex8(fname[i]);
-                vid_putc(' ');
-            }
-        }
-
-        /* Row 3: filename ASCII (first 32 bytes at DS:DX) */
-        g_vid_pos = 240;
-        vid_puts("DS:DX asc: [");
-        {
-            int i;
-            for (i = 0; i < 64; i++) {
-                uint8_t c = fname[i];
-                if (c == 0) break;
-                vid_putc((c >= 0x20 && c < 0x7F) ? (char)c : '.');
-            }
-        }
-        vid_putc(']');
-
-        /* Rows 4+: MCB chain — start from PSP-1, walk forward */
-        g_vid_pos = 320;
-        vid_puts("MCB chain (from PSP-1):");
-        {
-            extern unsigned _psp;
-            uint16_t cur = (uint16_t)(_psp - 1u);
-            int      row = 5, i, j;
-            for (i = 0; i < 12; i++) {
-                uint8_t  __far *m  = (uint8_t __far *)MK_FP(cur, 0);
-                uint8_t         tag   = m[0];
-                uint16_t        owner = *(uint16_t __far *)(m + 1);
-                uint16_t        size  = *(uint16_t __far *)(m + 3);
-
-                g_vid_pos = (uint16_t)(row * 80);
-                vid_putc(' '); vid_puthex16(cur); vid_putc(' ');
-                vid_putc((char)tag); vid_putc(' ');
-                vid_puts("own="); vid_puthex16(owner); vid_putc(' ');
-                vid_puts("sz=");  vid_puthex16(size);  vid_putc(' ');
-                for (j = 0; j < 8; j++) {
-                    char c = (char)m[8 + j];
-                    if (c == 0 || c < 0x20 || c >= 0x7F) break;
-                    vid_putc(c);
-                }
-                row++;
-                if (tag == 'Z') break;
-                if (tag != 'M') break;
-                cur = (uint16_t)(cur + 1u + size);
-            }
-        }
-    }
-
-    _chain_intr(prev_int21);
-}
-
 int main(int argc, char **argv) {
     uint8_t drive = 0x81;
     char err[100];
     int ai;
 
-    /* Parse args: [-q] [-t] [drive_num].
-     *  -q  = quiet (for CONFIG.SYS INSTALL=)
-     *  -t  = install INT 21h trace hook (MS-DOS 4 COMMAND.COM-EXEC debug)
-     *
-     * Lenient about leading dash count and argv[ai][2]: MS-DOS 4
-     * INSTALL= packs all args into one Ldexec_parm string and Watcom's
-     * argv splitter may not always normalize the way we'd expect. */
+    /* Parse args: [-q] [drive_num]. -q suppresses install banner (used
+     * by CONFIG.SYS INSTALL= so the boot screen stays clean). Lenient
+     * about leading dash/slash since MS-DOS 4 INSTALL= flattens args
+     * differently from a normal exec. */
     for (ai = 1; ai < argc; ai++) {
         const char *a = argv[ai];
         while (*a == '-' || *a == '/') a++;
         if      (a[0] == 'q' || a[0] == 'Q') g_quiet = 1;
-        else if (a[0] == 't' || a[0] == 'T') g_msdos4_trace = 1;
         else if (a[0] >= '0' && a[0] <= '9') drive = (uint8_t)strtoul(a, NULL, 0);
-    }
-    /* Also scan PSP command tail directly — Watcom argv parsing can miss
-     * args in CONFIG.SYS INSTALL= context. PSP+0x80 = length, +0x81 = chars. */
-    {
-        uint8_t  __far *cmd_tail = (uint8_t  __far *)MK_FP(_psp, 0x80);
-        uint8_t         len = cmd_tail[0];
-        uint8_t         i;
-        for (i = 0; i < len && i < 64; i++) {
-            char c = (char)cmd_tail[1 + i];
-            if (c == 'q' || c == 'Q') g_quiet = 1;
-            if (c == 't' || c == 'T') g_msdos4_trace = 1;
-        }
     }
 
     if (hook_cds() != 0) {
@@ -1149,11 +983,6 @@ int main(int argc, char **argv) {
 
     prev_int2f = _dos_getvect(0x2F);
     _dos_setvect(0x2F, my_int2f_handler);
-
-    if (g_msdos4_trace) {
-        prev_int21 = _dos_getvect(0x21);
-        _dos_setvect(0x21, my_int21_handler);
-    }
 
     fflush(stdout);
 

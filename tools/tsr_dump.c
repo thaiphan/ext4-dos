@@ -106,8 +106,29 @@ int main(void) {
     cap = (struct ff_capture __far *)MK_FP(r.w.dx, r.w.cx);
     printf("capture buffer at %04x:%04x\n", r.w.dx, r.w.cx);
 
+    /* Always print Open/Read state even if FindFirst capture is empty —
+     * MS-DOS 4 dispatches FindFirst as AL=0x19 (IFS_SEQ_SEARCH_FIRST)
+     * which doesn't trip the AL=0x1B-only valid flag. */
+    {
+        unsigned j;
+        printf("\nOpen/Read/Close diagnostics (always-on):\n");
+        printf("  Open calls    : %u\n", cap->open_call_count);
+        printf("  Read calls    : %u\n", cap->read_call_count);
+        printf("  Close calls   : %u\n", cap->close_call_count);
+        printf("  last open rc  : %d\n", (int)cap->last_open_rc);
+        printf("  last open path: '");
+        for (j = 0; j < 64 && cap->last_open_path[j]; j++) {
+            uint8_t c = cap->last_open_path[j];
+            putchar((c >= 0x20 && c < 0x7F) ? c : '.');
+        }
+        printf("'\n");
+        printf("  last open inode = %lu, size = %lu\n",
+               (unsigned long)cap->last_open_inode_num,
+               (unsigned long)cap->last_open_size);
+    }
+
     if (!cap->valid) {
-        printf("no FindFirst captured yet (valid=0)\n");
+        printf("(FindFirst capture skipped — valid=0, only Open data above)\n");
         return 0;
     }
 
