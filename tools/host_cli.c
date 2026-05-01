@@ -11,6 +11,7 @@
 #include "ext4/fs.h"
 #include "ext4/inode.h"
 #include "ext4/extent.h"
+#include "ext4/dir.h"
 #include "partition/mbr.h"
 
 static void print_uuid(const uint8_t *u) {
@@ -62,6 +63,18 @@ static const char *mode_kind(uint16_t mode) {
     }
 }
 
+static int list_cb(const struct ext4_dir_entry *e, void *ud) {
+    const char *kind = "?";
+    (void)ud;
+    switch (e->file_type) {
+    case EXT4_FT_REGULAR: kind = "f"; break;
+    case EXT4_FT_DIR:     kind = "d"; break;
+    case EXT4_FT_SYMLINK: kind = "l"; break;
+    }
+    printf("    %s %6u  %s\n", kind, e->inode, e->name);
+    return 0;
+}
+
 static int dump_inode(struct ext4_fs *fs, uint32_t ino) {
     struct ext4_inode inode;
     static uint8_t blk[EXT4_EXT_NODE_BUF];
@@ -82,6 +95,12 @@ static int dump_inode(struct ext4_fs *fs, uint32_t ino) {
 
     if (inode.size == 0) return 0;
 
+    if ((inode.mode & EXT4_S_IFMT) == EXT4_S_IFDIR) {
+        printf("  entries:\n");
+        ext4_dir_iter(fs, &inode, list_cb, NULL);
+        return 0;
+    }
+
     bs = fs->sb.block_size;
     if (bs > sizeof blk) {
         printf("  (block size %u exceeds dump buffer)\n", bs);
@@ -99,7 +118,8 @@ static int dump_inode(struct ext4_fs *fs, uint32_t ino) {
     return 0;
 }
 
-static int inspect_at(struct blockdev *bd, uint64_t partition_lba, uint32_t inode_num) {
+static int inspect_at(struct blockdev *bd, uint64_t partition_lba,
+                      uint32_t inode_num, const char *path) {
     struct ext4_fs fs;
     char err[160];
     int rc;
@@ -120,6 +140,16 @@ static int inspect_at(struct blockdev *bd, uint64_t partition_lba, uint32_t inod
     }
     printf("  v1 status        : supported\n");
 
+    if (path) {
+        inode_num = ext4_path_lookup(&fs, path);
+        if (inode_num == 0) {
+            printf("\npath '%s' not found\n", path);
+            ext4_fs_close(&fs);
+            return 1;
+        }
+        printf("\npath '%s' -> inode %u\n", path, inode_num);
+    }
+
     if (inode_num != 0) {
         dump_inode(&fs, inode_num);
     }
@@ -132,15 +162,20 @@ int main(int argc, char **argv) {
     struct blockdev *bd;
     struct mbr_table mbr;
     uint32_t inode_num = 0;
+    const char *path = NULL;
     int rc;
     int i;
 
     if (argc < 2) {
-        fprintf(stderr, "usage: host_cli <ext4-image-or-disk> [inode-number]\n");
+        fprintf(stderr, "usage: host_cli <ext4-image-or-disk> [inode-number | /path]\n");
         return 1;
     }
     if (argc >= 3) {
-        inode_num = (uint32_t)strtoul(argv[2], NULL, 0);
+        if (argv[2][0] == '/') {
+            path = argv[2];
+        } else {
+            inode_num = (uint32_t)strtoul(argv[2], NULL, 0);
+        }
     }
 
     bd = file_bdev_open(argv[1]);
@@ -162,11 +197,11 @@ int main(int argc, char **argv) {
             const struct mbr_partition *p = &mbr.entries[i];
             if (p->type != MBR_TYPE_LINUX) continue;
             printf("\n=== Partition %d (Linux, LBA %u) ===\n", i, p->start_lba);
-            inspect_at(bd, (uint64_t)p->start_lba, inode_num);
+            inspect_at(bd, (uint64_t)p->start_lba, inode_num, path);
         }
     } else {
         printf("(no MBR signature; treating as bare ext4 filesystem)\n\n");
-        inspect_at(bd, 0, inode_num);
+        inspect_at(bd, 0, inode_num, path);
     }
 
     file_bdev_close(bd);

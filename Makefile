@@ -22,6 +22,7 @@ LIB_SRCS_HOST := \
 	src/ext4/fs.c \
 	src/ext4/inode.c \
 	src/ext4/extent.c \
+	src/ext4/dir.c \
 	src/partition/mbr.c
 
 DOS_CLI_OBJ := \
@@ -32,6 +33,7 @@ DOS_CLI_OBJ := \
 	$(DOS_DIR)/fs.obj \
 	$(DOS_DIR)/inode.obj \
 	$(DOS_DIR)/extent.obj \
+	$(DOS_DIR)/dir.obj \
 	$(DOS_DIR)/mbr.obj
 
 vpath %.c tools src/blockdev src/ext4 src/partition
