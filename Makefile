@@ -36,6 +36,17 @@ DOS_CLI_OBJ := \
 	$(DOS_DIR)/dir.obj \
 	$(DOS_DIR)/mbr.obj
 
+TSR_OBJ := \
+	$(DOS_DIR)/tsr.obj \
+	$(DOS_DIR)/int13_bdev.obj \
+	$(DOS_DIR)/superblock.obj \
+	$(DOS_DIR)/features.obj \
+	$(DOS_DIR)/fs.obj \
+	$(DOS_DIR)/inode.obj \
+	$(DOS_DIR)/extent.obj \
+	$(DOS_DIR)/dir.obj \
+	$(DOS_DIR)/mbr.obj
+
 vpath %.c tools src/blockdev src/ext4 src/partition
 
 .PHONY: all host-build dos-build host-test dos-test fixtures fixture fixture-partitioned clean
@@ -55,7 +66,7 @@ dos-build: $(DOS_DIR)/dos_cli.exe $(DOS_DIR)/tsr.exe $(DOS_DIR)/tsr_chk.exe $(DO
 $(DOS_DIR)/dos_cli.exe: $(DOS_CLI_OBJ)
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
-$(DOS_DIR)/tsr.exe: $(DOS_DIR)/tsr.obj
+$(DOS_DIR)/tsr.exe: $(TSR_OBJ)
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
 $(DOS_DIR)/tsr_chk.exe: $(DOS_DIR)/tsr_check.obj

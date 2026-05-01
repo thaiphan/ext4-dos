@@ -12,8 +12,14 @@ DOS_DIR="build/dos"
 FREEDOS_DIR="tests/freedos"
 SOURCE_IMG="$FREEDOS_DIR/FD14LITE.img"
 TEST_IMG="$FREEDOS_DIR/test.img"
+EXT4_IMG="tests/images/disk.img"
 PARTITION_OFFSET=32256
-WAIT_SECONDS="${WAIT_SECONDS:-25}"
+WAIT_SECONDS="${WAIT_SECONDS:-30}"
+
+if [[ ! -f "$EXT4_IMG" ]]; then
+    echo "ERROR: $EXT4_IMG not found. Run: make fixture-partitioned" >&2
+    exit 1
+fi
 
 if [[ ! -f "$SOURCE_IMG" ]]; then
     echo "ERROR: $SOURCE_IMG not found." >&2
@@ -37,10 +43,8 @@ cp "$SOURCE_IMG" "$TEST_IMG"
 cat > "$FREEDOS_DIR/fdauto-test.bat" <<'EOF'
 @echo off
 SET PATH=C:\FREEDOS\BIN
-echo === BEFORE TSR === > C:\OUT.TXT
-C:\TSR_CHK.EXE >> C:\OUT.TXT
-echo === LOAD TSR === >> C:\OUT.TXT
-C:\TSR.EXE >> C:\OUT.TXT
+echo === LOAD TSR (drive 0x81 = ext4 disk) === > C:\OUT.TXT
+C:\TSR.EXE 0x81 >> C:\OUT.TXT
 echo === AFTER TSR === >> C:\OUT.TXT
 C:\TSR_CHK.EXE >> C:\OUT.TXT
 echo === FindFirst Y: (raw INT 21h) === >> C:\OUT.TXT
@@ -66,6 +70,7 @@ rm -f "$LOG"
 
 dosbox-x -fastlaunch -nopromptfolder -exit \
     -c "imgmount 2 $(pwd)/$TEST_IMG -fs none -t hdd" \
+    -c "imgmount 3 $(pwd)/$EXT4_IMG -fs none -t hdd" \
     -c "boot c:" \
     >"$LOG" 2>&1 &
 BGPID=$!

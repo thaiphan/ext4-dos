@@ -5,6 +5,16 @@
 #include <dos.h>
 #include <i86.h>
 
+#include "blockdev/blockdev.h"
+#include "blockdev/int13_bdev.h"
+#include "ext4/superblock.h"
+#include "ext4/features.h"
+#include "ext4/fs.h"
+#include "ext4/inode.h"
+#include "ext4/extent.h"
+#include "ext4/dir.h"
+#include "partition/mbr.h"
+
 #define EXT4_DOS_MAGIC_PROBE 0xE4D0u
 #define EXT4_DOS_MAGIC_REPLY 0xE4D5u
 #define DRIVE_LETTER 'Y'
@@ -22,6 +32,11 @@
 static void (__interrupt __far *prev_int2f)(void);
 static char __far *g_cds_entry;
 static char __far *g_sda;
+
+static struct blockdev *g_bdev;
+static struct ext4_fs   g_fs;
+static int              g_fs_ready;
+static uint64_t         g_partition_lba;
 
 /* Per-subfunction call counter (indexed by AL & 0x3F).
  * Read back via INT 2Fh AX=11FD, BX=our magic, CL=subfunction; returns
@@ -159,22 +174,84 @@ static int hook_cds(void) {
     return 0;
 }
 
-int main(void) {
+static int mount_ext4(uint8_t drive) {
+    struct mbr_table mbr;
+    int rc;
+    int i;
+
+    g_bdev = int13_bdev_open(drive);
+    if (!g_bdev) {
+        printf("  int13_bdev_open(0x%02x) failed\n", drive);
+        return -1;
+    }
+
+    rc = mbr_read(g_bdev, &mbr);
+    g_partition_lba = 0;
+    if (rc == 0 && mbr.has_signature) {
+        for (i = 0; i < mbr.count; i++) {
+            if (mbr.entries[i].type == MBR_TYPE_LINUX) {
+                g_partition_lba = mbr.entries[i].start_lba;
+                break;
+            }
+        }
+        if (g_partition_lba == 0) {
+            printf("  drive 0x%02x has MBR but no Linux partition\n", drive);
+            return -2;
+        }
+    } else {
+        printf("  drive 0x%02x: no MBR; treating as bare ext4\n", drive);
+    }
+
+    rc = ext4_fs_open(&g_fs, g_bdev, g_partition_lba);
+    if (rc != 0) {
+        printf("  ext4_fs_open failed (rc=%d)\n", rc);
+        return -3;
+    }
+
+    g_fs_ready = 1;
+    printf("  ext4 mounted: drive 0x%02x, partition LBA %lu\n",
+           drive, (unsigned long)g_partition_lba);
+    printf("  volume     : %s\n",
+           g_fs.sb.volume_name[0] ? g_fs.sb.volume_name : "(unset)");
+    printf("  blocks     : %lu (block size %lu)\n",
+           (unsigned long)g_fs.sb.blocks_count,
+           (unsigned long)g_fs.sb.block_size);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    uint8_t drive = 0x81;
+    char err[100];
+
+    if (argc >= 2) drive = (uint8_t)strtoul(argv[1], NULL, 0);
+
     if (hook_cds() != 0) {
         return 1;
     }
 
     g_sda = get_sda();
 
-    prev_int2f = _dos_getvect(0x2F);
-    _dos_setvect(0x2F, my_int2f_handler);
-
-    printf("ext4-dos TSR loaded\n");
+    printf("ext4-dos TSR\n");
     printf("  drive %c: marked as redirector (flag 0x%04x)\n",
            DRIVE_LETTER, CDS_FLAG_REDIRECTED);
     printf("  SDA at %04x:%04x\n", FP_SEG(g_sda), FP_OFF(g_sda));
+
+    if (mount_ext4(drive) == 0) {
+        if (ext4_features_check_supported(&g_fs.sb, err, sizeof err) != 0) {
+            printf("  WARN: ext4 mount has unsupported feature: %s\n", err);
+            printf("        TSR will respond file-not-found for all entries.\n");
+            g_fs_ready = 0;
+        }
+    } else {
+        printf("  WARN: ext4 mount failed; TSR will respond file-not-found.\n");
+    }
+
+    prev_int2f = _dos_getvect(0x2F);
+    _dos_setvect(0x2F, my_int2f_handler);
+
     fflush(stdout);
 
-    _dos_keep(0, 1024);
+    /* Resident size: generous, covers code + ~16 KB of static buffers. */
+    _dos_keep(0, 4096);
     return 0;
 }
