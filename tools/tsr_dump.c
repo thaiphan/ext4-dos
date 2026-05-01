@@ -39,6 +39,19 @@ struct ff_capture {
     uint32_t cap_byte_off_lo;
     uint32_t cap_byte_off_hi;
     uint16_t cap_sector_size;
+#pragma pack(push, 1)
+    struct {
+        uint8_t  used;
+        uint8_t  sattr;
+        int16_t  rc;
+        uint16_t target_index;
+        uint16_t current_index_after;
+        uint8_t  state_found;
+        uint8_t  name_len;
+        char     name[16];
+        uint8_t  pri_path[80];
+    } calls[4];
+#pragma pack(pop)
 };
 
 static void hex_dump(const char *label, const uint8_t __far *p, unsigned len) {
@@ -128,6 +141,45 @@ int main(void) {
            (unsigned long)cap->cap_byte_off_lo);
     printf("  bd->sector_size    : %u\n", cap->cap_sector_size);
     printf("  bdev_read rc       : %d\n", (int)cap->data_bdev_read_rc);
+
+    {
+        int i;
+        printf("\nPer-call FindFirst snapshots:\n");
+        for (i = 0; i < 4; i++) {
+            if (!cap->calls[i].used) continue;
+            printf("  call %d:\n", i + 1);
+            printf("    target_index = %u\n", cap->calls[i].target_index);
+            printf("    sattr        = 0x%02x\n", cap->calls[i].sattr);
+            printf("    rc           = %d\n", (int)cap->calls[i].rc);
+            printf("    current_idx  = %u\n", cap->calls[i].current_index_after);
+            printf("    state.found  = %u\n", cap->calls[i].state_found);
+            if (cap->calls[i].state_found) {
+                int j;
+                int n = (int)(unsigned char)cap->calls[i].name_len;
+                if (n > 16) n = 16;
+                printf("    name_len     = %u\n", (unsigned)(unsigned char)cap->calls[i].name_len);
+                printf("    name bytes   =");
+                for (j = 0; j < 16; j++)
+                    printf(" %02x", (unsigned char)cap->calls[i].name[j]);
+                printf("\n    name ascii   = '");
+                for (j = 0; j < n; j++) {
+                    unsigned char c = (unsigned char)cap->calls[i].name[j];
+                    putchar(isprint(c) ? (char)c : '?');
+                }
+                printf("'\n");
+            }
+            printf("    pri_path     = '");
+            {
+                int j;
+                for (j = 0; j < 80; j++) {
+                    uint8_t c = cap->calls[i].pri_path[j];
+                    if (c == 0) break;
+                    putchar(isprint(c) ? (char)c : '?');
+                }
+                printf("'\n");
+            }
+        }
+    }
 
     return 0;
 }

@@ -102,6 +102,21 @@ struct ff_capture {
     uint32_t cap_byte_off_lo;
     uint32_t cap_byte_off_hi;
     uint16_t cap_sector_size;
+    /* Per-call snapshot of the first 4 FindFirst calls (packed for
+     * cross-translation-unit layout consistency with tsr_dump.exe). */
+#pragma pack(push, 1)
+    struct {
+        uint8_t  used;
+        uint8_t  sattr;
+        int16_t  rc;
+        uint16_t target_index;
+        uint16_t current_index_after;
+        uint8_t  state_found;
+        uint8_t  name_len;
+        char     name[16];
+        uint8_t  pri_path[80];
+    } calls[4];
+#pragma pack(pop)
 };
 static struct ff_capture g_ff_capture;
 
@@ -156,6 +171,8 @@ static int find_iter_cb(const struct ext4_dir_entry *e, void *ud) {
  * fill the SDA SDB + SearchDir buffers. Updates dm_entry to the next index
  * so a subsequent FindNext picks up where this left off. Returns 0 on
  * success, -1 on inode-read failure, -2 on no-such-index. */
+static uint8_t g_ff_call_idx = 0;
+
 static int do_findfirst_or_next(uint16_t entry_index) {
     static struct ext4_inode      root_inode;
     static struct ext4_inode      entry_inode;
@@ -165,6 +182,18 @@ static int do_findfirst_or_next(uint16_t entry_index) {
     uint8_t              name83[11];
     int                  i;
     int                  rc;
+    int                  result = 0;
+    int                  slot;
+
+    slot = (g_ff_call_idx < 4) ? (int)g_ff_call_idx : -1;
+    g_ff_call_idx++;
+    if (slot >= 0) {
+        g_ff_capture.calls[slot].used = 1;
+        g_ff_capture.calls[slot].target_index = entry_index;
+        g_ff_capture.calls[slot].sattr = g_sda[SDA_SATTR_OFF];
+        for (i = 0; i < 80; i++)
+            g_ff_capture.calls[slot].pri_path[i] = g_sda[SDA_PRI_PATH_OFF + i];
+    }
 
     g_ff_capture.flow_entered++;
     if (g_ff_capture.flow_entered == 1) {
@@ -181,7 +210,8 @@ static int do_findfirst_or_next(uint16_t entry_index) {
     g_ff_capture.flow_inode_root_rc = (int16_t)rc;
     if (rc != 0) {
         g_ff_capture.flow_inode_root_fail++;
-        return -1;
+        result = -1;
+        goto done;
     }
     if (g_ff_capture.flow_entered == 1) {
         for (i = 0; i < 32; i++) g_ff_capture.root_iblock[i] = root_inode.i_block[i];
@@ -194,12 +224,14 @@ static int do_findfirst_or_next(uint16_t entry_index) {
     g_ff_capture.flow_dir_iter_returned = (uint16_t)rc;
     if (!state.found) {
         g_ff_capture.flow_state_not_found++;
-        return -2;
+        result = -2;
+        goto done;
     }
 
     if (ext4_inode_read(&g_fs, state.inode, &entry_inode) != 0) {
         g_ff_capture.flow_inode_entry_fail++;
-        return -1;
+        result = -1;
+        goto done;
     }
 
     to_8_3(state.name, state.name_len, name83);
@@ -221,7 +253,22 @@ static int do_findfirst_or_next(uint16_t entry_index) {
     *(uint16_t __far *)(sdb + DM_ENTRY_OFF) = (uint16_t)(entry_index + 1);
 
     g_ff_capture.flow_success++;
-    return 0;
+    result = 0;
+
+done:
+    if (slot >= 0) {
+        g_ff_capture.calls[slot].rc = (int16_t)result;
+        g_ff_capture.calls[slot].current_index_after = state.current_index;
+        g_ff_capture.calls[slot].state_found = (uint8_t)state.found;
+        if (state.found) {
+            uint8_t copy_len = (state.name_len < 15u) ? state.name_len : 15u;
+            for (i = 0; i < copy_len; i++)
+                g_ff_capture.calls[slot].name[i] = state.name[i];
+            g_ff_capture.calls[slot].name[copy_len] = '\0';
+            g_ff_capture.calls[slot].name_len = state.name_len;
+        }
+    }
+    return result;
 }
 
 void __interrupt __far my_int2f_handler(union INTPACK r) {
