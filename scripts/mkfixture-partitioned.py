@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Create a partitioned disk image with one ext4 Linux partition.
+"""Create a partitioned disk image with one ext4 Linux partition, populated
+with the same test files as the bare fixture.
 
 Layout: 1 MiB unused (MBR + alignment), then ext4 partition to end of file.
 Default 64 MiB. Override with SIZE_MB env var.
@@ -9,12 +10,16 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 OUT_DIR = "tests/images"
 OUT_PATH = f"{OUT_DIR}/disk.img"
 SIZE_MB = int(os.environ.get("SIZE_MB", "64"))
 SECTOR_SIZE = 512
 PART_START_LBA = 2048
+
+HELLO_BYTES = b"Hello, ext4-dos!\nThis is a test file used by tools/host_cli.\n"
+NESTED_BYTES = b"Nested file contents.\n"
 
 MKFS_FALLBACKS = [
     "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
@@ -66,20 +71,29 @@ def main() -> None:
     with open(OUT_PATH, "r+b") as f:
         f.write(mbr)
 
-    offset_bytes = PART_START_LBA * SECTOR_SIZE
-    size_1k_blocks = (part_sector_count * SECTOR_SIZE) // 1024
-    subprocess.check_call(
-        [
-            mkfs, "-F", "-b", "1024",
-            "-E", f"offset={offset_bytes}",
-            "-L", "ext4-dos-part",
-            OUT_PATH, str(size_1k_blocks),
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    with tempfile.TemporaryDirectory() as tdir:
+        with open(os.path.join(tdir, "hello.txt"), "wb") as f:
+            f.write(HELLO_BYTES)
+        os.makedirs(os.path.join(tdir, "subdir"), exist_ok=True)
+        with open(os.path.join(tdir, "subdir", "nested.txt"), "wb") as f:
+            f.write(NESTED_BYTES)
+
+        offset_bytes = PART_START_LBA * SECTOR_SIZE
+        size_1k_blocks = (part_sector_count * SECTOR_SIZE) // 1024
+        subprocess.check_call(
+            [
+                mkfs, "-F", "-b", "1024",
+                "-E", f"offset={offset_bytes}",
+                "-L", "ext4-dos-part",
+                "-d", tdir,
+                OUT_PATH, str(size_1k_blocks),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     print(f"Wrote partitioned fixture: {OUT_PATH} "
-          f"({SIZE_MB} MiB, partition at LBA {PART_START_LBA})")
+          f"({SIZE_MB} MiB, partition at LBA {PART_START_LBA}) with /hello.txt + /subdir/nested.txt")
 
 if __name__ == "__main__":
     main()

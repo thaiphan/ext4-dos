@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
-"""Create a bare ext4 fixture (no partition table). Default 16 MiB."""
+"""Create a bare ext4 fixture (no partition table) populated with known files.
+
+Default 16 MiB. Override with SIZE_MB env var.
+
+Files inside the FS:
+  /hello.txt          ASCII contents (canonical test data)
+  /subdir/nested.txt  Smaller ASCII file in a subdirectory
+"""
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 OUT_DIR = "tests/images"
 OUT_PATH = f"{OUT_DIR}/small.img"
 SIZE_MB = int(os.environ.get("SIZE_MB", "16"))
+
+HELLO_BYTES = b"Hello, ext4-dos!\nThis is a test file used by tools/host_cli.\n"
+NESTED_BYTES = b"Nested file contents.\n"
 
 MKFS_FALLBACKS = [
     "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
@@ -37,12 +48,20 @@ def main() -> None:
         os.remove(OUT_PATH)
     with open(OUT_PATH, "wb") as f:
         f.truncate(SIZE_MB * 1024 * 1024)
-    subprocess.check_call(
-        [mkfs, "-F", "-L", "ext4-dos-test", OUT_PATH],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    print(f"Wrote fixture: {OUT_PATH} ({SIZE_MB} MiB)")
+
+    with tempfile.TemporaryDirectory() as tdir:
+        with open(os.path.join(tdir, "hello.txt"), "wb") as f:
+            f.write(HELLO_BYTES)
+        os.makedirs(os.path.join(tdir, "subdir"), exist_ok=True)
+        with open(os.path.join(tdir, "subdir", "nested.txt"), "wb") as f:
+            f.write(NESTED_BYTES)
+
+        subprocess.check_call(
+            [mkfs, "-F", "-L", "ext4-dos-test", "-d", tdir, OUT_PATH],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    print(f"Wrote fixture: {OUT_PATH} ({SIZE_MB} MiB) with /hello.txt + /subdir/nested.txt")
 
 if __name__ == "__main__":
     main()

@@ -19,6 +19,9 @@ LIB_SRCS_HOST := \
 	src/blockdev/file_bdev.c \
 	src/ext4/superblock.c \
 	src/ext4/features.c \
+	src/ext4/fs.c \
+	src/ext4/inode.c \
+	src/ext4/extent.c \
 	src/partition/mbr.c
 
 DOS_CLI_OBJ := \
@@ -26,6 +29,9 @@ DOS_CLI_OBJ := \
 	$(DOS_DIR)/int13_bdev.obj \
 	$(DOS_DIR)/superblock.obj \
 	$(DOS_DIR)/features.obj \
+	$(DOS_DIR)/fs.obj \
+	$(DOS_DIR)/inode.obj \
+	$(DOS_DIR)/extent.obj \
 	$(DOS_DIR)/mbr.obj
 
 vpath %.c tools src/blockdev src/ext4 src/partition
