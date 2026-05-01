@@ -35,10 +35,11 @@ int ext4_features_check_supported(const struct ext4_superblock *sb,
         return 0;
     }
     if (err && err_len) {
-        const size_t n = sizeof INCOMPAT_NAMES / sizeof INCOMPAT_NAMES[0];
+        size_t n = sizeof INCOMPAT_NAMES / sizeof INCOMPAT_NAMES[0];
         const char *name = NULL;
         uint32_t bit = 0;
-        for (size_t i = 0; i < n; i++) {
+        size_t i;
+        for (i = 0; i < n; i++) {
             if (unsupported & INCOMPAT_NAMES[i].bit) {
                 bit = INCOMPAT_NAMES[i].bit;
                 name = INCOMPAT_NAMES[i].name;

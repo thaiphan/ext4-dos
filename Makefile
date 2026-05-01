@@ -7,43 +7,57 @@ CC     ?= cc
 PYTHON ?= python3
 CFLAGS_HOST := -std=c99 -Wall -Wextra -Wpedantic -O2 -Isrc
 
-# 16-bit OpenWatcom DOS cross-compile.
-# Memory model: small (-ms) — separate code/data segments, ≤64K each.
 WCC_ENV := WATCOM=$(WATCOM) INCLUDE=$(WATCOM)/h
+WCC_DOS := $(WCC) -bt=dos -ms -zq -i=$(WATCOM)/h -i=src
 WCL_DOS := $(WCL) -bt=dos -ms -zq
 
 BUILD    := build
 HOST_DIR := $(BUILD)/host
 DOS_DIR  := $(BUILD)/dos
 
-LIB_SRCS := \
+LIB_SRCS_HOST := \
 	src/blockdev/file_bdev.c \
 	src/ext4/superblock.c \
 	src/ext4/features.c \
 	src/partition/mbr.c
 
-.PHONY: all host-build dos-build host-test fixtures fixture fixture-partitioned clean
+DOS_CLI_OBJ := \
+	$(DOS_DIR)/dos_cli.obj \
+	$(DOS_DIR)/int13_bdev.obj \
+	$(DOS_DIR)/superblock.obj \
+	$(DOS_DIR)/features.obj \
+	$(DOS_DIR)/mbr.obj
+
+vpath %.c tools src/blockdev src/ext4 src/partition
+
+.PHONY: all host-build dos-build host-test dos-test fixtures fixture fixture-partitioned clean
 
 all: host-build
 
 host-build: $(HOST_DIR)/host_cli
 
-$(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS) | $(HOST_DIR)
+$(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR):
 	mkdir -p $@
 
-dos-build: $(DOS_DIR)/hello.exe
+dos-build: $(DOS_DIR)/dos_cli.exe
 
-$(DOS_DIR)/hello.exe: tools/dos_hello.c | $(DOS_DIR)
-	$(WCC_ENV) $(WCL_DOS) $< -fo=$(DOS_DIR)/hello.obj -fe=$@
+$(DOS_DIR)/dos_cli.exe: $(DOS_CLI_OBJ)
+	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
+
+$(DOS_DIR)/%.obj: %.c | $(DOS_DIR)
+	$(WCC_ENV) $(WCC_DOS) -fo=$@ $<
 
 $(DOS_DIR):
 	mkdir -p $@
 
 host-test: host-build
 	@echo "host-test: no tests yet"
+
+dos-test: dos-build fixture-partitioned
+	@bash scripts/run-dosbox.sh
 
 fixtures: fixture fixture-partitioned
 fixture:             tests/images/small.img
