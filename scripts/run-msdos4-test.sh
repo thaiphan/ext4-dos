@@ -27,7 +27,7 @@ if [[ ! -f "$EXT4_IMG" ]]; then
     echo "ERROR: $EXT4_IMG not found. Run: make fixture-partitioned" >&2
     exit 1
 fi
-for f in tsr.exe tsr_chk.exe tsr_dir.exe tsr_cnt.exe tsr_dmp.exe; do
+for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe; do
     if [[ ! -x "$DOS_DIR/$f" ]]; then
         echo "ERROR: $DOS_DIR/$f missing. Run: make dos-build" >&2
         exit 1
@@ -84,7 +84,7 @@ cp "$SOURCE_IMG" "$TEST_IMG"
 # ============================================================================
 cat > "$MSDOS4_DIR/config.sys.tmp" <<'EOF'
 LASTDRIVE=Z
-INSTALL=A:\TSR.EXE -q 0x81
+INSTALL=A:\EXT4.EXE -q 0x81
 EOF
 awk 'BEGIN{ORS="\r\n"} {print}' "$MSDOS4_DIR/config.sys.tmp" > "$MSDOS4_DIR/config.sys"
 rm -f "$MSDOS4_DIR/config.sys.tmp"
@@ -92,9 +92,9 @@ rm -f "$MSDOS4_DIR/config.sys.tmp"
 cat > "$MSDOS4_DIR/autoexec.bat.tmp" <<'EOF'
 @echo off
 echo === AFTER TSR === > A:\OUT.TXT
-A:\TSR_CHK.EXE >> A:\OUT.TXT
+A:\EXT4CHK.EXE >> A:\OUT.TXT
 echo === FindFirst Y: === >> A:\OUT.TXT
-A:\TSR_DIR.EXE >> A:\OUT.TXT
+A:\EXT4DIR.EXE >> A:\OUT.TXT
 echo === DIR Y: === >> A:\OUT.TXT
 DIR Y: >> A:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> A:\OUT.TXT
@@ -104,20 +104,20 @@ COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT A:\BOTH.TXT >> A:\OUT.TXT
 echo === TYPE A:\BOTH.TXT (concatenation result) === >> A:\OUT.TXT
 TYPE A:\BOTH.TXT >> A:\OUT.TXT
 echo === Subfunction call counts === >> A:\OUT.TXT
-A:\TSR_CNT.EXE >> A:\OUT.TXT
+A:\EXT4CNT.EXE >> A:\OUT.TXT
 echo === TSR diagnostic dump === >> A:\OUT.TXT
-A:\TSR_DMP.EXE >> A:\OUT.TXT
+A:\EXT4DMP.EXE >> A:\OUT.TXT
 echo === DONE === >> A:\OUT.TXT
 EOF
 awk 'BEGIN{ORS="\r\n"} {print}' "$MSDOS4_DIR/autoexec.bat.tmp" > "$MSDOS4_DIR/autoexec.bat"
 rm -f "$MSDOS4_DIR/autoexec.bat.tmp"
 
 # Floppy is plain FAT12 with no MBR offset; mtools accesses raw image.
-mcopy -i "$TEST_IMG" -o "$DOS_DIR/tsr.exe"     ::TSR.EXE
-mcopy -i "$TEST_IMG" -o "$DOS_DIR/tsr_chk.exe" ::TSR_CHK.EXE
-mcopy -i "$TEST_IMG" -o "$DOS_DIR/tsr_dir.exe" ::TSR_DIR.EXE
-mcopy -i "$TEST_IMG" -o "$DOS_DIR/tsr_cnt.exe" ::TSR_CNT.EXE
-mcopy -i "$TEST_IMG" -o "$DOS_DIR/tsr_dmp.exe" ::TSR_DMP.EXE
+mcopy -i "$TEST_IMG" -o "$DOS_DIR/ext4.exe"    ::EXT4.EXE
+mcopy -i "$TEST_IMG" -o "$DOS_DIR/ext4chk.exe" ::EXT4CHK.EXE
+mcopy -i "$TEST_IMG" -o "$DOS_DIR/ext4dir.exe" ::EXT4DIR.EXE
+mcopy -i "$TEST_IMG" -o "$DOS_DIR/ext4cnt.exe" ::EXT4CNT.EXE
+mcopy -i "$TEST_IMG" -o "$DOS_DIR/ext4dmp.exe" ::EXT4DMP.EXE
 mcopy -i "$TEST_IMG" -o "$MSDOS4_DIR/config.sys"   ::CONFIG.SYS
 mcopy -i "$TEST_IMG" -o "$MSDOS4_DIR/autoexec.bat" ::AUTOEXEC.BAT
 

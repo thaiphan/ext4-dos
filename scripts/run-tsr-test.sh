@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Loads tsr.exe in DOSBox-X, then runs tsr_chk.exe to verify the TSR
+# Loads ext4.exe in DOSBox-X, then runs ext4chk.exe to verify the TSR
 # responds to its install-check protocol.
 set -euo pipefail
 
@@ -9,7 +9,7 @@ if ! command -v dosbox-x >/dev/null 2>&1; then
 fi
 
 DOS_DIR="build/dos"
-for f in tsr.exe tsr_chk.exe; do
+for f in ext4.exe ext4chk.exe; do
     if [[ ! -x "$DOS_DIR/$f" ]]; then
         echo "ERROR: $DOS_DIR/$f not found. Run: make dos-build" >&2
         exit 1
@@ -24,11 +24,11 @@ dosbox-x -fastlaunch -nopromptfolder -exit \
     -c "mount c $(pwd)/$DOS_DIR" \
     -c "c:" \
     -c "echo === BEFORE LOAD === > out.txt" \
-    -c "tsr_chk.exe >> out.txt" \
+    -c "ext4chk.exe >> out.txt" \
     -c "echo === LOADING TSR === >> out.txt" \
-    -c "tsr.exe >> out.txt" \
+    -c "ext4.exe >> out.txt" \
     -c "echo === AFTER LOAD === >> out.txt" \
-    -c "tsr_chk.exe >> out.txt" \
+    -c "ext4chk.exe >> out.txt" \
     >"$LOG" 2>&1
 
 if [[ ! -f "$OUT" ]]; then

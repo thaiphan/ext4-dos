@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs build/dos/dos_cli.exe in DOSBox-X with tests/images/disk.img attached
+# Runs build/dos/ext4cli.exe in DOSBox-X with tests/images/disk.img attached
 # as INT 13h hard disk 0x80. Captures stdout via DOS shell redirection.
 #
 # Usage:
@@ -15,7 +15,7 @@ fi
 
 DOS_DIR="build/dos"
 IMG="tests/images/disk.img"
-EXE="$DOS_DIR/dos_cli.exe"
+EXE="$DOS_DIR/ext4cli.exe"
 
 if [[ ! -x "$EXE" ]]; then
     echo "ERROR: $EXE not found. Run: make dos-build" >&2
@@ -32,9 +32,9 @@ rm -f "$OUT" "$LOG"
 
 INODE="${1:-}"
 if [[ -n "$INODE" ]]; then
-    DOS_CMD="dos_cli.exe 0x80 $INODE > out.txt"
+    DOS_CMD="ext4cli.exe 0x80 $INODE > out.txt"
 else
-    DOS_CMD="dos_cli.exe > out.txt"
+    DOS_CMD="ext4cli.exe > out.txt"
 fi
 
 dosbox-x -fastlaunch -nopromptfolder -exit \
@@ -45,7 +45,7 @@ dosbox-x -fastlaunch -nopromptfolder -exit \
     >"$LOG" 2>&1
 
 if [[ ! -f "$OUT" ]]; then
-    echo "ERROR: dos_cli.exe did not produce output. DOSBox-X log tail:" >&2
+    echo "ERROR: ext4cli.exe did not produce output. DOSBox-X log tail:" >&2
     tail -20 "$LOG" >&2
     exit 1
 fi

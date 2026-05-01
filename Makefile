@@ -76,24 +76,24 @@ $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 $(HOST_DIR):
 	mkdir -p $@
 
-dos-build: $(DOS_DIR)/dos_cli.exe $(DOS_DIR)/tsr.exe $(DOS_DIR)/tsr_chk.exe $(DOS_DIR)/tsr_dir.exe $(DOS_DIR)/tsr_cnt.exe $(DOS_DIR)/tsr_dmp.exe
+dos-build: $(DOS_DIR)/ext4cli.exe $(DOS_DIR)/ext4.exe $(DOS_DIR)/ext4chk.exe $(DOS_DIR)/ext4dir.exe $(DOS_DIR)/ext4cnt.exe $(DOS_DIR)/ext4dmp.exe
 
-$(DOS_DIR)/dos_cli.exe: $(DOS_CLI_OBJ)
+$(DOS_DIR)/ext4cli.exe: $(DOS_CLI_OBJ)
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
-$(DOS_DIR)/tsr.exe: $(TSR_OBJ)
+$(DOS_DIR)/ext4.exe: $(TSR_OBJ)
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
-$(DOS_DIR)/tsr_chk.exe: $(DOS_DIR)/tsr_check.obj
+$(DOS_DIR)/ext4chk.exe: $(DOS_DIR)/tsr_check.obj
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
-$(DOS_DIR)/tsr_dir.exe: $(DOS_DIR)/tsr_dir.obj
+$(DOS_DIR)/ext4dir.exe: $(DOS_DIR)/tsr_dir.obj
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
-$(DOS_DIR)/tsr_cnt.exe: $(DOS_DIR)/tsr_calls.obj
+$(DOS_DIR)/ext4cnt.exe: $(DOS_DIR)/tsr_calls.obj
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
-$(DOS_DIR)/tsr_dmp.exe: $(DOS_DIR)/tsr_dump.obj
+$(DOS_DIR)/ext4dmp.exe: $(DOS_DIR)/tsr_dump.obj
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
 $(DOS_DIR)/%.obj: %.c | $(DOS_DIR)

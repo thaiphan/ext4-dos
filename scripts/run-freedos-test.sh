@@ -28,7 +28,7 @@ if [[ ! -f "$SOURCE_IMG" ]]; then
     exit 1
 fi
 
-for f in tsr.exe tsr_chk.exe tsr_dir.exe tsr_cnt.exe tsr_dmp.exe; do
+for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe; do
     if [[ ! -x "$DOS_DIR/$f" ]]; then
         echo "ERROR: $DOS_DIR/$f missing. Run: make dos-build" >&2
         exit 1
@@ -44,11 +44,11 @@ cat > "$FREEDOS_DIR/fdauto-test.bat" <<'EOF'
 @echo off
 SET PATH=C:\FREEDOS\BIN
 echo === LOAD TSR (drive 0x81 = ext4 disk) === > C:\OUT.TXT
-C:\TSR.EXE 0x81 >> C:\OUT.TXT
+C:\EXT4.EXE 0x81 >> C:\OUT.TXT
 echo === AFTER TSR === >> C:\OUT.TXT
-C:\TSR_CHK.EXE >> C:\OUT.TXT
+C:\EXT4CHK.EXE >> C:\OUT.TXT
 echo === FindFirst Y: (raw INT 21h) === >> C:\OUT.TXT
-C:\TSR_DIR.EXE >> C:\OUT.TXT
+C:\EXT4DIR.EXE >> C:\OUT.TXT
 echo === DIR Y: === >> C:\OUT.TXT
 DIR Y: >> C:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> C:\OUT.TXT
@@ -58,19 +58,19 @@ COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT C:\BOTH.TXT >> C:\OUT.TXT
 echo === TYPE C:\BOTH.TXT (concatenation result) === >> C:\OUT.TXT
 TYPE C:\BOTH.TXT >> C:\OUT.TXT
 echo === Subfunction call counts === >> C:\OUT.TXT
-C:\TSR_CNT.EXE >> C:\OUT.TXT
+C:\EXT4CNT.EXE >> C:\OUT.TXT
 echo === FindFirst capture dump === >> C:\OUT.TXT
-C:\TSR_DMP.EXE >> C:\OUT.TXT
+C:\EXT4DMP.EXE >> C:\OUT.TXT
 echo === DONE === >> C:\OUT.TXT
 fdapm poweroff
 EOF
 
 # Inject everything.
-mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/tsr.exe"     ::TSR.EXE
-mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/tsr_chk.exe" ::TSR_CHK.EXE
-mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/tsr_dir.exe" ::TSR_DIR.EXE
-mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/tsr_cnt.exe" ::TSR_CNT.EXE
-mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/tsr_dmp.exe" ::TSR_DMP.EXE
+mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4.exe"    ::EXT4.EXE
+mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4chk.exe" ::EXT4CHK.EXE
+mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4dir.exe" ::EXT4DIR.EXE
+mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4cnt.exe" ::EXT4CNT.EXE
+mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4dmp.exe" ::EXT4DMP.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$FREEDOS_DIR/fdauto-test.bat" ::FDAUTO.BAT
 
 # Boot in DOSBox-X, then kill after timeout (poweroff doesn't exit DOSBox-X).

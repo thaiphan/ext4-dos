@@ -8,14 +8,16 @@ Targets FreeDOS 1.4 and MS-DOS 4.0. Both verified end-to-end: `DIR Y:` lists ext
 
 Pre-built `.EXE` binaries are attached to each [GitHub release](../../releases). Each is a single-file download:
 
-| Binary       | Purpose |
-|---           |---|
-| `tsr.exe`    | The redirector TSR. Load via `CONFIG.SYS INSTALL=` or from `AUTOEXEC.BAT`. |
-| `dos_cli.exe`| DOS-side ext4 inspector. |
-| `tsr_chk.exe`| Probe whether the TSR is loaded. |
-| `tsr_dir.exe`| Raw INT 21h FindFirst smoke test against the TSR. |
-| `tsr_cnt.exe`| Read per-subfunction call counters from a loaded TSR. |
-| `tsr_dmp.exe`| Dump diagnostic capture state from a loaded TSR. |
+| Binary        | Purpose |
+|---            |---|
+| `ext4.exe`    | The redirector TSR. Load via `CONFIG.SYS INSTALL=` or from `AUTOEXEC.BAT`. |
+| `ext4cli.exe` | DOS-side ext4 inspector (analogous to `dumpe2fs`). |
+| `ext4chk.exe` | Probe whether the TSR is loaded. |
+| `ext4dir.exe` | Raw INT 21h FindFirst smoke test against the TSR. |
+| `ext4cnt.exe` | Read per-subfunction call counters from a loaded TSR. |
+| `ext4dmp.exe` | Dump diagnostic capture state from a loaded TSR. |
+
+The `ext4` prefix marks them as belonging to the ext4 module; future modules (LFN, networking, etc.) will follow the same pattern.
 
 Builds for every push are also available from the [Actions](../../actions) tab under the `dosix-binaries` artifact (auth required).
 
