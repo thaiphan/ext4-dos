@@ -90,13 +90,12 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             return;
 
         case 0x18: /* "FindFirst No Default Drive" / variant */
-        case 0x1B: /* FindFirst */
-            /* No entries yet — proper FindFirst comes in M6c2. */
+        case 0x1B: /* FindFirst — needs SDA-layout diagnostic capture first */
             r.w.ax = DOS_ERR_FILE_NOT_FOUND;
             r.w.flags |= 1u;
             return;
 
-        case 0x1C: /* FindNext (or "Close All Files Of Drive" on some DOS) */
+        case 0x1C: /* FindNext */
             r.w.ax = DOS_ERR_NO_MORE_FILES;
             r.w.flags |= 1u;
             return;
