@@ -220,6 +220,34 @@ static int is_leap_year(int year) {
     return 0;
 }
 
+/* Map an ext4 inode's mode (file type + permission bits) and the FIRST
+ * character of the basename to the DOS attribute byte used in FAT
+ * directory entries and SFT.
+ *
+ * DOS attribute bits:
+ *   0x01  R  read-only       — set when the owner-write bit is clear
+ *   0x02  H  hidden          — set when the basename starts with '.'
+ *                              (Unix dotfile convention; nothing in ext4
+ *                              maps cleanly to DOS-style hidden, but this
+ *                              gives users intuitive results)
+ *   0x04  S  system          — never set (no ext4 equivalent)
+ *   0x08  V  volume label    — never set (we have no FAT-style label)
+ *   0x10  D  directory       — set when ext4 mode is S_IFDIR
+ *   0x20  A  archive         — left clear; we're read-only, so "needs
+ *                              backup since last archive" is meaningless
+ *
+ * Takes the first basename char by value (not a pointer): in INT 2Fh
+ * handler context SS != DS, so passing &stack_local would have the
+ * helper dereference through DS and read random kernel memory. Caller
+ * passes 0 if no basename is available — the H bit just won't compute. */
+static uint8_t ext4_mode_to_dos_attr(uint16_t mode, char basename_first_ch) {
+    uint8_t attr = 0;
+    if ((mode & EXT4_S_IFMT) == EXT4_S_IFDIR) attr |= 0x10u;   /* D */
+    if ((mode & 0x0080u) == 0u)               attr |= 0x01u;   /* R */
+    if (basename_first_ch == '.')             attr |= 0x02u;   /* H */
+    return attr;
+}
+
 /* Convert Unix seconds-since-1970 (UTC) to packed DOS time/date.
  * Returns date<<16 | time (both 16 bits). Returning a value avoids the
  * SS!=DS hazard of writing through caller-supplied pointers in interrupt
@@ -487,7 +515,12 @@ static int do_findfirst_or_next(uint16_t entry_index) {
     /* Fill the 32-byte FAT-style dir entry. */
     for (i = 0; i < 32; i++) dirent[i] = 0;
     for (i = 0; i < 11; i++) dirent[DIR_NAME_OFF + i] = name83[i];
-    dirent[DIR_ATTRIB_OFF] = (state.file_type == EXT4_FT_DIR) ? 0x10u : 0x00u;
+    /* Pass the first basename char by value — see ext4_mode_to_dos_attr
+     * comment. state.name is in DGROUP (static via dir_iter), but the
+     * helper signature avoids the pointer altogether. */
+    dirent[DIR_ATTRIB_OFF] = ext4_mode_to_dos_attr(
+        entry_inode.mode,
+        (state.name_len > 0) ? (char)state.name[0] : 0);
     {
         uint32_t td = unix_to_dos(entry_inode.mtime);
         uint16_t dt = (uint16_t)(td & 0xFFFFul);
@@ -681,7 +714,19 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
              * clean. Kernel pre-set the low byte just before our call. */
             *(uint16_t __far *)(sft + SFT_DEVINFO_OFF) =
                 (uint16_t)(0x8000u | DRIVE_INDEX);
-            sft[SFT_FILE_ATTR_OFF] = 0;
+            /* path_buf is the static dos_to_ext4_path output. Find the
+             * char right after the last '/' — that's the basename's
+             * first character, which the helper takes by value. */
+            {
+                int p = 0, base_idx = 0;
+                while (path_buf[p]) {
+                    if (path_buf[p] == '/') base_idx = p + 1;
+                    p++;
+                }
+                sft[SFT_FILE_ATTR_OFF] = ext4_mode_to_dos_attr(
+                    slot->inode.mode,
+                    path_buf[base_idx]);
+            }
             {
                 uint32_t td = unix_to_dos(slot->inode.mtime);
                 *(uint16_t __far *)(sft + SFT_FILE_TIME_OFF) =
