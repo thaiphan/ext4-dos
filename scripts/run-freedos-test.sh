@@ -51,6 +51,8 @@ echo === FindFirst Y: (raw INT 21h) === >> C:\OUT.TXT
 C:\TSR_DIR.EXE >> C:\OUT.TXT
 echo === DIR Y: === >> C:\OUT.TXT
 DIR Y: >> C:\OUT.TXT
+echo === TYPE Y:\HELLO.TXT === >> C:\OUT.TXT
+TYPE Y:\HELLO.TXT >> C:\OUT.TXT
 echo === Subfunction call counts === >> C:\OUT.TXT
 C:\TSR_CNT.EXE >> C:\OUT.TXT
 echo === FindFirst capture dump === >> C:\OUT.TXT

@@ -49,6 +49,16 @@
 #define DIR_START_OFF       26
 #define DIR_SIZE_OFF        28     /* 4 bytes */
 
+/* SFT offsets (DOS 4+) per RBIL */
+#define SFT_OPEN_MODE_OFF       0x02  /* word */
+#define SFT_FILE_ATTR_OFF       0x04  /* byte */
+#define SFT_DEVINFO_OFF         0x05  /* word: bit 15 = network */
+#define SFT_FILE_TIME_OFF       0x0D  /* word */
+#define SFT_FILE_DATE_OFF       0x0F  /* word */
+#define SFT_FILE_SIZE_OFF       0x11  /* dword */
+#define SFT_FILE_POSITION_OFF   0x15  /* dword */
+#define SFT_FILE_NAME_OFF       0x20  /* 11 bytes 8.3 */
+
 static void (__interrupt __far *prev_int2f)(void);
 static char __far *g_cds_entry;
 static char __far *g_sda;
@@ -57,6 +67,15 @@ static struct blockdev *g_bdev;
 static struct ext4_fs   g_fs;
 static int              g_fs_ready;
 static uint64_t         g_partition_lba;
+
+/* Single-slot open-file state. M6c2 supports one file at a time, which is
+ * sufficient for TYPE / COPY / sequential reads. Multi-open is a polish
+ * milestone (would index a small static array via SFT private fields). */
+static struct {
+    int               used;
+    uint32_t          inode_num;
+    struct ext4_inode inode;
+} g_current_open;
 
 /* Per-subfunction call counter (indexed by AL & 0x3F).
  * Read back via INT 2Fh AX=11FD, BX=our magic, CL=subfunction; returns
@@ -121,6 +140,63 @@ struct ff_capture {
 #pragma pack(pop)
 };
 static struct ff_capture g_ff_capture;
+
+/* Convert DOS path "Y:\HELLO.TXT" (qualified, in SDA+0x9E) to lowercase
+ * ext4 path "/hello.txt". Returns 0 on success, -1 on bad path. */
+static int dos_to_ext4_path(char *out, int out_size) {
+    const char __far *src = (const char __far *)(g_sda + SDA_PRI_PATH_OFF);
+    int j;
+    if (src[0] != DRIVE_LETTER || src[1] != ':') return -1;
+    src += 2;
+    if (out_size < 2) return -1;
+
+    out[0] = '/';
+    j = 1;
+    if (*src == '\\' || *src == '/') src++;
+
+    while (*src && j < out_size - 1) {
+        char c = *src;
+        if (c == '\\') c = '/';
+        else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        out[j++] = c;
+        src++;
+    }
+    out[j] = 0;
+    return 0;
+}
+
+/* Read up to `count` bytes from `inode` starting at byte `offset` into
+ * `out` (far pointer, may be in caller's segment). Returns bytes copied. */
+static int read_file_bytes(const struct ext4_inode *inode, uint32_t offset,
+                           uint16_t count, uint8_t __far *out) {
+    static uint8_t blk[4096];
+    uint32_t bs = g_fs.sb.block_size;
+    uint32_t bytes_done = 0;
+    uint32_t cur, logical_block, in_block, can_take, i;
+
+    if (bs > sizeof blk) return 0;
+
+    while (bytes_done < (uint32_t)count) {
+        cur = offset + bytes_done;
+        if (cur >= (uint32_t)inode->size) break;
+        logical_block = cur / bs;
+        in_block = cur - logical_block * bs;
+        can_take = bs - in_block;
+        if (can_take > (uint32_t)count - bytes_done)
+            can_take = (uint32_t)count - bytes_done;
+        if (cur + can_take > (uint32_t)inode->size)
+            can_take = (uint32_t)inode->size - cur;
+
+        if (ext4_file_read_block(&g_fs, inode, logical_block, blk) != 0) break;
+
+        for (i = 0; i < can_take; i++) {
+            out[bytes_done + i] = blk[in_block + i];
+        }
+        bytes_done += can_take;
+    }
+
+    return (int)bytes_done;
+}
 
 static void to_8_3(const char *name, uint8_t name_len, uint8_t out[11]) {
     int i = 0, j = 0, k;
@@ -370,13 +446,87 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
 
         switch (al) {
         case 0x05: /* ChDir */
-        case 0x06: /* Close File */
         case 0x07: /* Commit File */
         case 0x0A: /* Lock Region */
         case 0x0B: /* Unlock Region */
         case 0x0E: /* Set File Attributes */
             r.w.flags &= ~1u;
             return;
+
+        case 0x06: /* Close File */
+            g_current_open.used = 0;
+            r.w.flags &= ~1u;
+            return;
+
+        case 0x16: { /* Open Existing File */
+            static char path_buf[128];
+            uint8_t __far *sft;
+            uint32_t inode_num;
+            int rc_path;
+
+            if (!g_fs_ready) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            rc_path = dos_to_ext4_path(path_buf, sizeof path_buf);
+            if (rc_path != 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            inode_num = ext4_path_lookup(&g_fs, path_buf);
+            if (inode_num == 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            if (ext4_inode_read(&g_fs, inode_num, &g_current_open.inode) != 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            g_current_open.used      = 1;
+            g_current_open.inode_num = inode_num;
+
+            sft = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+            *(uint16_t __far *)(sft + SFT_DEVINFO_OFF) =
+                (uint16_t)(0x8000u | DRIVE_INDEX);
+            sft[SFT_FILE_ATTR_OFF] = 0;
+            *(uint16_t __far *)(sft + SFT_FILE_TIME_OFF) = 0;
+            *(uint16_t __far *)(sft + SFT_FILE_DATE_OFF) = 0;
+            *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF) =
+                (uint32_t)g_current_open.inode.size;
+            *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = 0;
+
+            r.w.flags &= ~1u;
+            return;
+        }
+
+        case 0x08: { /* Read From File */
+            uint8_t __far *sft;
+            uint8_t __far *user_buf;
+            uint32_t pos;
+            int actual;
+
+            if (!g_current_open.used) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            sft = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+            user_buf = (uint8_t __far *)MK_FP(r.x.ds, r.w.dx);
+            pos = *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF);
+
+            actual = read_file_bytes(&g_current_open.inode, pos,
+                                     r.w.cx, user_buf);
+
+            *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) =
+                pos + (uint32_t)actual;
+            r.w.cx = (uint16_t)actual;
+            r.w.flags &= ~1u;
+            return;
+        }
 
         case 0x0C: /* Get Disk Space */
             /* Plausible v1 placeholder: 64 MB total, all free.

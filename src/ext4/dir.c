@@ -72,8 +72,10 @@ static int lookup_cb(const struct ext4_dir_entry *e, void *ud) {
 
 uint32_t ext4_dir_lookup(struct ext4_fs *fs, const struct ext4_inode *dir,
                          const char *name) {
-    struct lookup_state s;
-    size_t              n = strlen(name);
+    /* Static so &s resolves via DS, not SS. lookup_cb dereferences s via
+     * near pointer — in interrupt-handler context SS != DS. */
+    static struct lookup_state s;
+    size_t                     n = strlen(name);
 
     if (n == 0u || n > 255u) return 0u;
     s.target      = name;
@@ -85,11 +87,12 @@ uint32_t ext4_dir_lookup(struct ext4_fs *fs, const struct ext4_inode *dir,
 
 uint32_t ext4_path_lookup(struct ext4_fs *fs, const char *path) {
     static struct ext4_inode inode;
+    /* Static so the pointer we pass to ext4_dir_lookup resolves via DS. */
+    static char    seg[256];
     uint32_t       cur_ino = 2u; /* root */
     const char    *p = path;
     const char    *seg_start;
     size_t         seg_len;
-    char           seg[256];
 
     while (*p == '/') p++;
 
