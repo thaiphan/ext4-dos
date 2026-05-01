@@ -50,9 +50,15 @@ $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 $(HOST_DIR):
 	mkdir -p $@
 
-dos-build: $(DOS_DIR)/dos_cli.exe
+dos-build: $(DOS_DIR)/dos_cli.exe $(DOS_DIR)/tsr.exe $(DOS_DIR)/tsr_chk.exe
 
 $(DOS_DIR)/dos_cli.exe: $(DOS_CLI_OBJ)
+	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
+
+$(DOS_DIR)/tsr.exe: $(DOS_DIR)/tsr.obj
+	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
+
+$(DOS_DIR)/tsr_chk.exe: $(DOS_DIR)/tsr_check.obj
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
 $(DOS_DIR)/%.obj: %.c | $(DOS_DIR)
@@ -66,6 +72,9 @@ host-test: host-build
 
 dos-test: dos-build fixture-partitioned
 	@bash scripts/run-dosbox.sh
+
+tsr-test: dos-build
+	@bash scripts/run-tsr-test.sh
 
 fixtures: fixture fixture-partitioned
 fixture:             tests/images/small.img
