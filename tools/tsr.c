@@ -10,7 +10,8 @@
 #define DRIVE_LETTER 'Y'
 #define DRIVE_INDEX  ((DRIVE_LETTER) - 'A')
 
-#define DOS_ERR_FILE_NOT_FOUND  0x02
+#define DOS_ERR_FILE_NOT_FOUND  0x02u
+#define DOS_ERR_NO_MORE_FILES   0x12u
 
 #define CDS_FLAG_REDIRECTED 0x8000u
 #define CDS_ENTRY_SIZE      88
@@ -22,18 +23,78 @@ static void (__interrupt __far *prev_int2f)(void);
 static char __far *g_cds_entry;
 static char __far *g_sda;
 
+/* Per-subfunction call counter (indexed by AL & 0x3F).
+ * Read back via INT 2Fh AX=11FD, BX=our magic, CL=subfunction; returns
+ * count in DX, AL=0xFF on success. Useful for tracing what DOS asks for. */
+static uint16_t g_call_counts[64];
+
 void __interrupt __far my_int2f_handler(union INTPACK r) {
+    uint8_t al;
+
+    /* Our install-check protocol */
     if (r.w.ax == 0x1100u && r.w.bx == EXT4_DOS_MAGIC_PROBE) {
         r.h.al = 0xFFu;
         r.w.bx = EXT4_DOS_MAGIC_REPLY;
         return;
     }
 
-    /* Redirector multiplex AH=11h: claim and return file-not-found */
-    if (r.h.ah == 0x11u) {
-        r.w.ax = DOS_ERR_FILE_NOT_FOUND;
-        r.w.flags |= 1u;
+    /* Counter-readback debug protocol: AX=11FD, BX=magic, CL=subfn */
+    if (r.w.ax == 0x11FDu && r.w.bx == EXT4_DOS_MAGIC_PROBE) {
+        r.w.dx = g_call_counts[r.h.cl & 0x3F];
+        r.h.al = 0xFFu;
         return;
+    }
+
+    if (r.h.ah == 0x11u) {
+        al = r.h.al;
+        g_call_counts[al & 0x3F]++;
+
+        switch (al) {
+        case 0x05: /* ChDir */
+        case 0x06: /* Close File */
+        case 0x07: /* Commit File */
+        case 0x0A: /* Lock Region */
+        case 0x0B: /* Unlock Region */
+        case 0x0E: /* Set File Attributes */
+            r.w.flags &= ~1u;
+            return;
+
+        case 0x0C: /* Get Disk Space */
+            /* Plausible v1 placeholder: 64 MB total, all free.
+             * total = AX * BX * CX = 16384 * 8 * 512 = 64 MiB. */
+            r.w.ax = 16384u; /* total clusters */
+            r.w.bx = 8u;     /* sectors per cluster */
+            r.w.cx = 512u;   /* bytes per sector */
+            r.w.dx = 16384u; /* free clusters */
+            r.w.flags &= ~1u;
+            return;
+
+        case 0x23: /* Qualify Remote File Name */
+            /* Pass-through: tell DOS the path it gave us is fine as-is. */
+            r.w.flags &= ~1u;
+            return;
+
+        case 0x18: /* "FindFirst No Default Drive" / variant */
+        case 0x1B: /* FindFirst */
+            /* No entries yet — proper FindFirst comes in M6c2. */
+            r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+            r.w.flags |= 1u;
+            return;
+
+        case 0x1C: /* FindNext (or "Close All Files Of Drive" on some DOS) */
+            r.w.ax = DOS_ERR_NO_MORE_FILES;
+            r.w.flags |= 1u;
+            return;
+
+        case 0x1D: /* "FindClose" / etc. — be lenient */
+            r.w.flags &= ~1u;
+            return;
+
+        default:
+            r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+            r.w.flags |= 1u;
+            return;
+        }
     }
 
     _chain_intr(prev_int2f);
