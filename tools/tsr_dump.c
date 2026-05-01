@@ -54,6 +54,16 @@ struct ff_capture {
         uint8_t  searchdir_after[32];
     } calls[4];
 #pragma pack(pop)
+    uint16_t open_call_count;
+    uint16_t read_call_count;
+    uint16_t close_call_count;
+    int16_t  last_open_rc;
+    uint8_t  last_open_path[64];
+    uint32_t last_open_inode_num;
+    uint32_t last_open_size;
+    uint32_t last_read_pos;
+    uint16_t last_read_count;
+    int16_t  last_read_actual;
 };
 
 static void hex_dump(const char *label, const uint8_t __far *p, unsigned len) {
@@ -201,6 +211,28 @@ int main(void) {
             }
         }
     }
+
+    printf("\nOpen/Read/Close diagnostics:\n");
+    printf("  Open calls    : %u\n", cap->open_call_count);
+    printf("  Read calls    : %u\n", cap->read_call_count);
+    printf("  Close calls   : %u\n", cap->close_call_count);
+    printf("  last open rc  : %d\n", (int)cap->last_open_rc);
+    printf("  last open path: '");
+    {
+        int j;
+        for (j = 0; j < 64; j++) {
+            uint8_t c = cap->last_open_path[j];
+            if (c == 0) break;
+            putchar(isprint(c) ? (char)c : '?');
+        }
+    }
+    printf("'\n");
+    printf("  last open inode = %lu, size = %lu\n",
+           (unsigned long)cap->last_open_inode_num,
+           (unsigned long)cap->last_open_size);
+    printf("  last read pos = %lu, requested = %u, actual = %d\n",
+           (unsigned long)cap->last_read_pos,
+           cap->last_read_count, (int)cap->last_read_actual);
 
     return 0;
 }

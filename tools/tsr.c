@@ -30,6 +30,7 @@
 #define CDS_OFF_BACKSLASH   0x4F
 
 /* SDA field offsets per FreeDOS kernel.asm.  Should match MS-DOS 4-7. */
+#define SDA_DTA_OFF         0x0C   /* DWORD far ptr to user's DTA / Read buffer */
 #define SDA_PRI_PATH_OFF    0x9E   /* qualified pattern (128 bytes) */
 #define SDA_TMP_DM_OFF      0x19E  /* sda_tmp_dm: 21-byte SDB header */
 #define SDA_SEARCH_DIR_OFF  0x1B3  /* SearchDir: 32-byte FAT dir entry */
@@ -138,6 +139,17 @@ struct ff_capture {
         uint8_t  searchdir_after[32];
     } calls[4];
 #pragma pack(pop)
+    /* Open/Read/Close diagnostics */
+    uint16_t open_call_count;
+    uint16_t read_call_count;
+    uint16_t close_call_count;
+    int16_t  last_open_rc;
+    uint8_t  last_open_path[64];
+    uint32_t last_open_inode_num;
+    uint32_t last_open_size;
+    uint32_t last_read_pos;
+    uint16_t last_read_count;
+    int16_t  last_read_actual;
 };
 static struct ff_capture g_ff_capture;
 
@@ -454,6 +466,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             return;
 
         case 0x06: /* Close File */
+            g_ff_capture.close_call_count++;
             g_current_open.used = 0;
             r.w.flags &= ~1u;
             return;
@@ -463,31 +476,42 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             uint8_t __far *sft;
             uint32_t inode_num;
             int rc_path;
+            int dbg_i;
 
+            g_ff_capture.open_call_count++;
             if (!g_fs_ready) {
+                g_ff_capture.last_open_rc = -100;
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;
                 r.w.flags |= 1u;
                 return;
             }
             rc_path = dos_to_ext4_path(path_buf, sizeof path_buf);
+            for (dbg_i = 0; dbg_i < 64; dbg_i++)
+                g_ff_capture.last_open_path[dbg_i] = (uint8_t)path_buf[dbg_i];
             if (rc_path != 0) {
+                g_ff_capture.last_open_rc = -101;
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;
                 r.w.flags |= 1u;
                 return;
             }
             inode_num = ext4_path_lookup(&g_fs, path_buf);
+            g_ff_capture.last_open_inode_num = inode_num;
             if (inode_num == 0) {
+                g_ff_capture.last_open_rc = -102;
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;
                 r.w.flags |= 1u;
                 return;
             }
             if (ext4_inode_read(&g_fs, inode_num, &g_current_open.inode) != 0) {
+                g_ff_capture.last_open_rc = -103;
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;
                 r.w.flags |= 1u;
                 return;
             }
             g_current_open.used      = 1;
             g_current_open.inode_num = inode_num;
+            g_ff_capture.last_open_size = (uint32_t)g_current_open.inode.size;
+            g_ff_capture.last_open_rc = 0;
 
             sft = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
             *(uint16_t __far *)(sft + SFT_DEVINFO_OFF) =
@@ -506,20 +530,29 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
         case 0x08: { /* Read From File */
             uint8_t __far *sft;
             uint8_t __far *user_buf;
+            uint16_t buf_seg, buf_off;
             uint32_t pos;
             int actual;
 
+            g_ff_capture.read_call_count++;
             if (!g_current_open.used) {
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;
                 r.w.flags |= 1u;
                 return;
             }
             sft = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
-            user_buf = (uint8_t __far *)MK_FP(r.x.ds, r.w.dx);
+            /* User read buffer is at SDA+0x0C (DWORD), set by DOS in
+             * DosRdWrSft just before calling us. NOT DS:DX. */
+            buf_off = *(uint16_t __far *)(g_sda + SDA_DTA_OFF);
+            buf_seg = *(uint16_t __far *)(g_sda + SDA_DTA_OFF + 2);
+            user_buf = (uint8_t __far *)MK_FP(buf_seg, buf_off);
             pos = *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF);
+            g_ff_capture.last_read_pos = pos;
+            g_ff_capture.last_read_count = r.w.cx;
 
             actual = read_file_bytes(&g_current_open.inode, pos,
                                      r.w.cx, user_buf);
+            g_ff_capture.last_read_actual = (int16_t)actual;
 
             *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) =
                 pos + (uint32_t)actual;
