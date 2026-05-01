@@ -2,11 +2,22 @@
 
 A 16-bit DOS TSR that exposes an ext4 partition as a drive letter, so DOS programs (`DIR`, `TYPE`, file managers, etc.) can read it the same way they read a FAT drive.
 
-Targets FreeDOS 1.4 primarily; MS-DOS 4 as a compatibility target.
+Targets FreeDOS 1.4 and MS-DOS 4.0. Both verified end-to-end: `DIR Y:` lists ext4 entries with real timestamps and free space, `TYPE Y:\HELLO.TXT` reads file content. Read-only for v1; write support is explicitly a separate later project.
 
-## Status
+## Download
 
-Pre-alpha. Nothing works yet.
+Pre-built `.EXE` binaries are attached to each [GitHub release](../../releases). Each is a single-file download:
+
+| Binary       | Purpose |
+|---           |---|
+| `tsr.exe`    | The redirector TSR. Load via `CONFIG.SYS INSTALL=` or from `AUTOEXEC.BAT`. |
+| `dos_cli.exe`| DOS-side ext4 inspector. |
+| `tsr_chk.exe`| Probe whether the TSR is loaded. |
+| `tsr_dir.exe`| Raw INT 21h FindFirst smoke test against the TSR. |
+| `tsr_cnt.exe`| Read per-subfunction call counters from a loaded TSR. |
+| `tsr_dmp.exe`| Dump diagnostic capture state from a loaded TSR. |
+
+Builds for every push are also available from the [Actions](../../actions) tab under the `dosix-binaries` artifact (auth required).
 
 ## Why
 

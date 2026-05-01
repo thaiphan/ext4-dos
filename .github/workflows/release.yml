@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # needed to create the GitHub release
+
+jobs:
+  build-and-release:
+    name: Build and publish release artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            mtools \
+            python3 \
+            xvfb \
+            dosbox-x
+
+      - name: Install OpenWatcom
+        uses: open-watcom/setup-watcom@v0
+        with:
+          version: "2.0"
+
+      - name: Build host CLI
+        run: make host-build
+
+      - name: Build DOS binaries
+        run: |
+          export WATCOM="${WATCOM:-$WATCOM_2_0}"
+          make dos-build
+
+      - name: Run regression tests before publishing
+        run: |
+          make fixtures
+          xvfb-run -a make freedos-test
+          xvfb-run -a make msdos4-test
+        timeout-minutes: 10
+
+      - name: Stage release artifacts
+        id: stage
+        run: |
+          mkdir -p release
+          cp build/dos/*.exe release/
+          ls -la release/
+          echo "files=release/*.exe" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true

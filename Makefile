@@ -1,7 +1,22 @@
 WATCOM ?= /Users/thai/.local/opt/watcom
-WCC    := $(WATCOM)/armo64/wcc
-WLINK  := $(WATCOM)/armo64/wlink
-WCL    := $(WATCOM)/armo64/wcl
+
+# OpenWatcom binary subdirectory varies per host. Override WATCOM_BIN
+# explicitly if your install isn't at one of the autodetected paths.
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_S),Darwin)
+    ifeq ($(UNAME_M),arm64)
+        WATCOM_BIN ?= $(WATCOM)/armo64
+    else
+        WATCOM_BIN ?= $(WATCOM)/bino64
+    endif
+else
+    WATCOM_BIN ?= $(WATCOM)/binl64
+endif
+
+WCC    := $(WATCOM_BIN)/wcc
+WLINK  := $(WATCOM_BIN)/wlink
+WCL    := $(WATCOM_BIN)/wcl
 
 CC     ?= cc
 PYTHON ?= python3

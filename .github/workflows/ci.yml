@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            mtools \
+            python3 \
+            xvfb
+
+      - name: Install DOSBox-X
+        run: |
+          sudo apt-get install -y dosbox-x
+          dosbox-x --version || dosbox-x -version || true
+
+      - name: Install OpenWatcom
+        uses: open-watcom/setup-watcom@v0
+        with:
+          version: "2.0"
+
+      - name: Build host CLI
+        run: make host-build
+
+      - name: Build DOS binaries
+        run: |
+          export WATCOM="${WATCOM:-$WATCOM_2_0}"
+          make dos-build
+
+      - name: Generate test fixtures
+        run: make fixtures
+
+      - name: FreeDOS integration test
+        run: xvfb-run -a make freedos-test
+        timeout-minutes: 5
+
+      - name: MS-DOS 4 integration test
+        run: xvfb-run -a make msdos4-test
+        timeout-minutes: 5
+
+      - name: Upload DOS binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dosix-binaries
+          path: build/dos/*.exe
+          if-no-files-found: error
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            tests/freedos/*.log
+            tests/msdos4/*.log
+          if-no-files-found: ignore
