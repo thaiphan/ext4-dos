@@ -2,11 +2,15 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "blockdev/blockdev.h"
 #include "blockdev/int13_bdev.h"
 #include "ext4/superblock.h"
 #include "ext4/features.h"
+#include "ext4/fs.h"
+#include "ext4/inode.h"
+#include "ext4/extent.h"
 #include "partition/mbr.h"
 
 static void print_uuid(const uint8_t *u) {
@@ -17,57 +21,121 @@ static void print_uuid(const uint8_t *u) {
     }
 }
 
-static void print_summary(const struct ext4_superblock *sb) {
-    printf("  volume     : %s\n", sb->volume_name[0] ? sb->volume_name : "(unset)");
-    printf("  uuid       : ");
-    print_uuid(sb->uuid);
-    printf("\n");
-    printf("  block size : %lu\n", (unsigned long)sb->block_size);
-    printf("  blocks     : %lu\n", (unsigned long)sb->blocks_count);
-    printf("  inodes     : %lu\n", (unsigned long)sb->inodes_count);
-    printf("  inode size : %u\n", sb->inode_size);
-    printf("  state      : 0x%04x%s\n", sb->state, (sb->state & 1) ? " (clean)" : "");
-    printf("  feat_incompat : 0x%08lx\n", (unsigned long)sb->feature_incompat);
+static void print_hex_dump(const uint8_t *data, uint32_t len) {
+    uint32_t i;
+    uint32_t j;
+    for (i = 0; i < len; i += 16) {
+        printf("    %04lx: ", (unsigned long)i);
+        for (j = 0; j < 16 && i + j < len; j++) {
+            printf("%02x ", data[i + j]);
+        }
+        for (; j < 16; j++) printf("   ");
+        printf(" |");
+        for (j = 0; j < 16 && i + j < len; j++) {
+            uint8_t c = data[i + j];
+            putchar(isprint(c) ? c : '.');
+        }
+        printf("|\n");
+    }
 }
 
-static int inspect_at(struct blockdev *bd, uint32_t partition_lba) {
-    static uint8_t buf[1024];
-    struct ext4_superblock sb;
+static const char *mode_kind(uint16_t mode) {
+    switch (mode & EXT4_S_IFMT) {
+    case EXT4_S_IFREG: return "regular";
+    case EXT4_S_IFDIR: return "directory";
+    case EXT4_S_IFLNK: return "symlink";
+    default:           return "other";
+    }
+}
+
+static int dump_inode(struct ext4_fs *fs, uint32_t ino) {
+    static uint8_t blk[EXT4_EXT_NODE_BUF];
+    struct ext4_inode inode;
+    uint32_t bs;
+    uint32_t dump_len;
+    int rc;
+
+    printf("\nInode %lu:\n", (unsigned long)ino);
+    rc = ext4_inode_read(fs, ino, &inode);
+    if (rc) {
+        printf("  read failed (%d)\n", rc);
+        return -1;
+    }
+    printf("  kind   : %s (mode 0%o)\n", mode_kind(inode.mode), inode.mode & 0xFFF);
+    printf("  size   : %lu bytes\n", (unsigned long)inode.size);
+    printf("  flags  : 0x%lx\n", (unsigned long)inode.flags);
+
+    if (inode.size == 0) return 0;
+    bs = fs->sb.block_size;
+    if (bs > sizeof blk) {
+        printf("  (block size too large)\n");
+        return 0;
+    }
+    rc = ext4_file_read_block(fs, &inode, 0, blk);
+    if (rc) {
+        printf("  read block 0 failed (%d)\n", rc);
+        return -1;
+    }
+    dump_len = (uint32_t)((inode.size < (uint64_t)bs) ? inode.size : bs);
+    if (dump_len > 256) dump_len = 256;
+    printf("  first block (%lu bytes shown):\n", (unsigned long)dump_len);
+    print_hex_dump(blk, dump_len);
+    return 0;
+}
+
+/* File-scope static so we don't put a ~4 KB struct on the DOS stack
+ * (default OpenWatcom small-model stack is ~4 KB; would overflow). */
+static struct ext4_fs g_fs;
+
+static void inspect_at(struct blockdev *bd, uint64_t partition_lba, uint32_t inode_num) {
+    struct ext4_fs *fs = &g_fs;
     char err[100];
     int rc;
 
-    rc = bdev_read(bd, (uint64_t)partition_lba + 2, 2, buf);
+    rc = ext4_fs_open(fs, bd, partition_lba);
     if (rc) {
-        printf("  read superblock failed (%d)\n", rc);
-        return -1;
+        printf("  fs_open failed (%d)\n", rc);
+        return;
     }
-    if (ext4_superblock_parse(buf, &sb) != 0) {
-        printf("  not ext4 (magic 0x%04x)\n", sb.magic);
-        return -1;
-    }
-    printf("ext4 detected\n");
-    print_summary(&sb);
 
-    if (ext4_features_check_supported(&sb, err, sizeof err) != 0) {
+    printf("ext4 detected\n");
+    printf("  volume     : %s\n",
+           fs->sb.volume_name[0] ? fs->sb.volume_name : "(unset)");
+    printf("  uuid       : ");
+    print_uuid(fs->sb.uuid);
+    printf("\n");
+    printf("  block size : %lu\n", (unsigned long)fs->sb.block_size);
+    printf("  blocks     : %lu\n", (unsigned long)fs->sb.blocks_count);
+    printf("  inodes     : %lu\n", (unsigned long)fs->sb.inodes_count);
+    printf("  feat_inc   : 0x%08lx\n", (unsigned long)fs->sb.feature_incompat);
+
+    if (ext4_features_check_supported(&fs->sb, err, sizeof err) != 0) {
         printf("  v1 status  : REFUSED -- %s\n", err);
-        return 1;
+        ext4_fs_close(fs);
+        return;
     }
     printf("  v1 status  : supported\n");
-    return 0;
+
+    if (inode_num != 0) {
+        dump_inode(fs, inode_num);
+    }
+
+    ext4_fs_close(fs);
 }
 
 int main(int argc, char **argv) {
     uint8_t drive = 0x80;
+    uint32_t inode_num = 0;
     struct blockdev *bd;
     struct mbr_table mbr;
     int rc;
     int i;
 
-    if (argc >= 2) {
-        drive = (uint8_t)strtoul(argv[1], NULL, 0);
-    }
+    if (argc >= 2) drive = (uint8_t)strtoul(argv[1], NULL, 0);
+    if (argc >= 3) inode_num = (uint32_t)strtoul(argv[2], NULL, 0);
 
     printf("ext4-dos cli (DOS, drive 0x%02x)\n", drive);
+    fflush(stdout);
 
     bd = int13_bdev_open(drive);
     if (!bd) {
@@ -89,11 +157,11 @@ int main(int argc, char **argv) {
             if (p->type != MBR_TYPE_LINUX) continue;
             printf("\n=== Partition %d (Linux, LBA %lu) ===\n", i,
                    (unsigned long)p->start_lba);
-            inspect_at(bd, p->start_lba);
+            inspect_at(bd, (uint64_t)p->start_lba, inode_num);
         }
     } else {
         printf("(no MBR; treating drive 0x%02x as bare ext4)\n\n", drive);
-        inspect_at(bd, 0);
+        inspect_at(bd, 0, inode_num);
     }
 
     int13_bdev_close(bd);
