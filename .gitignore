@@ -1,0 +1,32 @@
+# Build outputs
+*.o
+*.obj
+*.exe
+*.com
+*.lib
+*.err
+*.lst
+*.map
+*.tmp
+build/
+dist/
+
+# Vendored references (clones of lwext4 / grub for reading; not committed)
+references/
+
+# Test fixture images (regenerable from scripts/)
+tests/images/*.img
+tests/images/*.ext4
+tests/images/*.raw
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Claude Code (local user settings)
+.claude/settings.local.json
