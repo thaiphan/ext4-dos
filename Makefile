@@ -3,7 +3,8 @@ WCC    := $(WATCOM)/armo64/wcc
 WLINK  := $(WATCOM)/armo64/wlink
 WCL    := $(WATCOM)/armo64/wcl
 
-CC ?= cc
+CC     ?= cc
+PYTHON ?= python3
 CFLAGS_HOST := -std=c99 -Wall -Wextra -Wpedantic -O2 -Isrc
 
 BUILD    := build
@@ -38,11 +39,11 @@ fixtures: fixture fixture-partitioned
 fixture:             tests/images/small.img
 fixture-partitioned: tests/images/disk.img
 
-tests/images/small.img: scripts/mkfixture.sh
-	bash $<
+tests/images/small.img: scripts/mkfixture.py
+	$(PYTHON) $<
 
 tests/images/disk.img: scripts/mkfixture-partitioned.py
-	python3 $<
+	$(PYTHON) $<
 
 clean:
 	rm -rf $(BUILD)

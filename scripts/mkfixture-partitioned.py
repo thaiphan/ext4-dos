@@ -2,7 +2,7 @@
 """Create a partitioned disk image with one ext4 Linux partition.
 
 Layout: 1 MiB unused (MBR + alignment), then ext4 partition to end of file.
-Default size 64 MiB. Override with SIZE_MB env var.
+Default 64 MiB. Override with SIZE_MB env var.
 """
 import os
 import shutil
@@ -14,22 +14,27 @@ OUT_DIR = "tests/images"
 OUT_PATH = f"{OUT_DIR}/disk.img"
 SIZE_MB = int(os.environ.get("SIZE_MB", "64"))
 SECTOR_SIZE = 512
-PART_START_LBA = 2048  # 1 MiB alignment, standard
+PART_START_LBA = 2048
 
-MKFS_CANDIDATES = [
+MKFS_FALLBACKS = [
     "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
     "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4",
 ]
 
 def find_mkfs() -> str:
-    for c in MKFS_CANDIDATES:
-        if os.access(c, os.X_OK):
-            return c
     found = shutil.which("mkfs.ext4")
     if found:
         return found
-    print("ERROR: mkfs.ext4 not found. Install: brew install e2fsprogs",
-          file=sys.stderr)
+    for c in MKFS_FALLBACKS:
+        if os.access(c, os.X_OK):
+            return c
+    print("ERROR: mkfs.ext4 not found.", file=sys.stderr)
+    print("  macOS:     brew install e2fsprogs", file=sys.stderr)
+    print("  Debian:    apt install e2fsprogs", file=sys.stderr)
+    print("  Fedora:    dnf install e2fsprogs", file=sys.stderr)
+    print("  Arch:      pacman -S e2fsprogs", file=sys.stderr)
+    print("  MSYS2:     pacman -S e2fsprogs", file=sys.stderr)
+    print("  WSL2:      apt install e2fsprogs", file=sys.stderr)
     sys.exit(1)
 
 def main() -> None:
@@ -45,7 +50,6 @@ def main() -> None:
     with open(OUT_PATH, "wb") as f:
         f.truncate(total_bytes)
 
-    # MBR with one Linux partition.
     mbr = bytearray(512)
     entry = struct.pack(
         "<BBBBBBBBII",
@@ -62,7 +66,6 @@ def main() -> None:
     with open(OUT_PATH, "r+b") as f:
         f.write(mbr)
 
-    # mkfs.ext4 inside the partition.
     offset_bytes = PART_START_LBA * SECTOR_SIZE
     size_1k_blocks = (part_sector_count * SECTOR_SIZE) // 1024
     subprocess.check_call(
