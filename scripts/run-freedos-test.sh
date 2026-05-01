@@ -28,7 +28,7 @@ if [[ ! -f "$SOURCE_IMG" ]]; then
     exit 1
 fi
 
-for f in tsr.exe tsr_chk.exe tsr_dir.exe tsr_cnt.exe; do
+for f in tsr.exe tsr_chk.exe tsr_dir.exe tsr_cnt.exe tsr_dmp.exe; do
     if [[ ! -x "$DOS_DIR/$f" ]]; then
         echo "ERROR: $DOS_DIR/$f missing. Run: make dos-build" >&2
         exit 1
@@ -53,6 +53,8 @@ echo === DIR Y: === >> C:\OUT.TXT
 DIR Y: >> C:\OUT.TXT
 echo === Subfunction call counts === >> C:\OUT.TXT
 C:\TSR_CNT.EXE >> C:\OUT.TXT
+echo === FindFirst capture dump === >> C:\OUT.TXT
+C:\TSR_DMP.EXE >> C:\OUT.TXT
 echo === DONE === >> C:\OUT.TXT
 fdapm poweroff
 EOF
@@ -62,6 +64,7 @@ mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/tsr.exe"     ::TSR.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/tsr_chk.exe" ::TSR_CHK.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/tsr_dir.exe" ::TSR_DIR.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/tsr_cnt.exe" ::TSR_CNT.EXE
+mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/tsr_dmp.exe" ::TSR_DMP.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$FREEDOS_DIR/fdauto-test.bat" ::FDAUTO.BAT
 
 # Boot in DOSBox-X, then kill after timeout (poweroff doesn't exit DOSBox-X).

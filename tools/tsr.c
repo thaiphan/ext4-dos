@@ -43,6 +43,20 @@ static uint64_t         g_partition_lba;
  * count in DX, AL=0xFF on success. Useful for tracing what DOS asks for. */
 static uint16_t g_call_counts[64];
 
+/* Diagnostic snapshot of the FIRST FindFirst (AL=1B) call DOS makes us.
+ * Probed via INT 2Fh AX=11FC, BX=our magic; reply: AL=0xFF, DX:CX = far
+ * pointer to this struct. Used to figure out the SDA/DTA layout DOS uses. */
+struct ff_capture {
+    uint8_t  valid;
+    uint16_t ax, bx, cx, dx;
+    uint16_t si, di, bp;
+    uint16_t ds, es, flags;
+    uint8_t  sda_bytes[256];
+    uint8_t  es_di_bytes[64];
+    uint8_t  ds_si_bytes[64];
+};
+static struct ff_capture g_ff_capture;
+
 void __interrupt __far my_int2f_handler(union INTPACK r) {
     uint8_t al;
 
@@ -60,9 +74,46 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
         return;
     }
 
+    /* Capture-pointer probe: AX=11FC, BX=magic; returns DX:CX -> g_ff_capture. */
+    if (r.w.ax == 0x11FCu && r.w.bx == EXT4_DOS_MAGIC_PROBE) {
+        r.w.dx = FP_SEG((void __far *)&g_ff_capture);
+        r.w.cx = FP_OFF((void __far *)&g_ff_capture);
+        r.h.al = 0xFFu;
+        return;
+    }
+
     if (r.h.ah == 0x11u) {
         al = r.h.al;
         g_call_counts[al & 0x3F]++;
+
+        /* Snapshot the first FindFirst call DOS sends us. */
+        if (al == 0x1Bu && !g_ff_capture.valid) {
+            uint8_t __far *src;
+            int i;
+
+            g_ff_capture.ax    = r.w.ax;
+            g_ff_capture.bx    = r.w.bx;
+            g_ff_capture.cx    = r.w.cx;
+            g_ff_capture.dx    = r.w.dx;
+            g_ff_capture.si    = r.w.si;
+            g_ff_capture.di    = r.w.di;
+            g_ff_capture.bp    = r.x.bp;
+            g_ff_capture.ds    = r.x.ds;
+            g_ff_capture.es    = r.x.es;
+            g_ff_capture.flags = r.w.flags;
+
+            for (i = 0; i < 256; i++) {
+                g_ff_capture.sda_bytes[i] = ((uint8_t __far *)g_sda)[i];
+            }
+
+            src = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+            for (i = 0; i < 64; i++) g_ff_capture.es_di_bytes[i] = src[i];
+
+            src = (uint8_t __far *)MK_FP(r.x.ds, r.w.si);
+            for (i = 0; i < 64; i++) g_ff_capture.ds_si_bytes[i] = src[i];
+
+            g_ff_capture.valid = 1u;
+        }
 
         switch (al) {
         case 0x05: /* ChDir */
