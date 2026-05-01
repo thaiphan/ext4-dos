@@ -17,7 +17,10 @@ int ext4_inode_read(struct ext4_fs *fs, uint32_t ino, struct ext4_inode *out) {
     uint32_t       sector_size;
     uint32_t       end_byte;
     uint32_t       sectors_to_read;
-    uint8_t        buf[1024];
+    /* Static so this lives in DGROUP — the bdev_read path stores
+     * its segment as DS, which is wrong for stack locals when called
+     * from an interrupt context (SS != DS). */
+    static uint8_t buf[1024];
     const uint8_t *raw;
     uint32_t       size_lo;
     uint32_t       size_hi;

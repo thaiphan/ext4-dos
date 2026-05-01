@@ -8,6 +8,9 @@
 int ext4_dir_iter(struct ext4_fs *fs, const struct ext4_inode *dir,
                   ext4_dir_cb cb, void *userdata) {
     static uint8_t blk[EXT4_EXT_NODE_BUF];
+    /* Static so &e resolves via DS even when called from a TSR's interrupt
+     * handler where SS != DS. The callback reads e via near pointer. */
+    static struct ext4_dir_entry e;
     uint32_t bs;
     uint64_t total_size;
     uint32_t blocks;
@@ -37,7 +40,6 @@ int ext4_dir_iter(struct ext4_fs *fs, const struct ext4_inode *dir,
 
             if (inode_no != 0u && name_len > 0u
                     && (uint32_t)name_len + 8u <= rec_len) {
-                struct ext4_dir_entry e;
                 e.inode     = inode_no;
                 e.file_type = file_type;
                 e.name_len  = name_len;

@@ -14,6 +14,31 @@ struct ff_capture {
     uint8_t  sda_bytes[256];
     uint8_t  es_di_bytes[64];
     uint8_t  ds_si_bytes[64];
+    uint16_t flow_entered;
+    uint16_t flow_inode_root_fail;
+    int16_t  flow_inode_root_rc;
+    uint16_t flow_dir_iter_returned;
+    uint16_t flow_state_not_found;
+    uint16_t flow_inode_entry_fail;
+    uint16_t flow_success;
+    uint8_t  fs_ready_at_call;
+    uint32_t fs_bgd_count;
+    uint16_t fs_bgd_size;
+    uint32_t fs_blocks_per_group;
+    uint32_t fs_inodes_per_group;
+    uint16_t fs_inode_size;
+    uint32_t fs_block_size;
+    uint8_t  root_iblock[32];
+    int16_t  ext_lookup_rc;
+    uint32_t ext_lookup_phys_lo;
+    uint32_t ext_lookup_phys_hi;
+    int16_t  data_bdev_read_rc;
+    uint32_t data_sector_lo;
+    uint32_t cap_partition_lba_lo;
+    uint32_t cap_partition_lba_hi;
+    uint32_t cap_byte_off_lo;
+    uint32_t cap_byte_off_hi;
+    uint16_t cap_sector_size;
 };
 
 static void hex_dump(const char *label, const uint8_t __far *p, unsigned len) {
@@ -63,6 +88,46 @@ int main(void) {
     hex_dump("SDA[0..255]", cap->sda_bytes, 256);
     hex_dump("ES:DI[0..63] (likely DTA)", cap->es_di_bytes, 64);
     hex_dump("DS:SI[0..63] (likely pattern)", cap->ds_si_bytes, 64);
+
+    printf("\nFindFirst flow counters:\n");
+    printf("  entered            : %u\n", cap->flow_entered);
+    printf("  inode_read root    : rc=%d, fail count %u\n",
+           (int)cap->flow_inode_root_rc, cap->flow_inode_root_fail);
+    printf("  dir_iter rc        : %u\n", cap->flow_dir_iter_returned);
+    printf("  state.found = 0    : %u times\n", cap->flow_state_not_found);
+    printf("  inode_read entry   : %s (fail count %u)\n",
+           cap->flow_inode_entry_fail ? "FAIL" : "ok", cap->flow_inode_entry_fail);
+    printf("  success            : %u\n", cap->flow_success);
+
+    printf("\ng_fs state snapshot at first FindFirst:\n");
+    printf("  g_fs_ready         : %u\n", cap->fs_ready_at_call);
+    printf("  bgd_count          : %lu\n", (unsigned long)cap->fs_bgd_count);
+    printf("  bgd_size           : %u\n", cap->fs_bgd_size);
+    printf("  blocks_per_group   : %lu\n", (unsigned long)cap->fs_blocks_per_group);
+    printf("  inodes_per_group   : %lu\n", (unsigned long)cap->fs_inodes_per_group);
+    printf("  inode_size         : %u\n", cap->fs_inode_size);
+    printf("  block_size         : %lu\n", (unsigned long)cap->fs_block_size);
+
+    hex_dump("\nroot_inode.i_block first 32 bytes (header + first extent)",
+             cap->root_iblock, 32);
+
+    printf("\nDirect probe of root data block 0:\n");
+    printf("  extent_lookup rc   : %d\n", (int)cap->ext_lookup_rc);
+    printf("  phys block         : %lu (hi=%lu)\n",
+           (unsigned long)cap->ext_lookup_phys_lo,
+           (unsigned long)cap->ext_lookup_phys_hi);
+    printf("  computed sector    : %lu (0x%08lx)\n",
+           (unsigned long)cap->data_sector_lo, (unsigned long)cap->data_sector_lo);
+    printf("  partition_lba      : lo=%lu hi=%lu\n",
+           (unsigned long)cap->cap_partition_lba_lo,
+           (unsigned long)cap->cap_partition_lba_hi);
+    printf("  byte_off           : lo=%lu hi=%lu (0x%08lx %08lx)\n",
+           (unsigned long)cap->cap_byte_off_lo,
+           (unsigned long)cap->cap_byte_off_hi,
+           (unsigned long)cap->cap_byte_off_hi,
+           (unsigned long)cap->cap_byte_off_lo);
+    printf("  bd->sector_size    : %u\n", cap->cap_sector_size);
+    printf("  bdev_read rc       : %d\n", (int)cap->data_bdev_read_rc);
 
     return 0;
 }

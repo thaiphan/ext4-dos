@@ -29,6 +29,26 @@
 #define CDS_OFF_FLAGS       0x43
 #define CDS_OFF_BACKSLASH   0x4F
 
+/* SDA field offsets per FreeDOS kernel.asm.  Should match MS-DOS 4-7. */
+#define SDA_PRI_PATH_OFF    0x9E   /* qualified pattern (128 bytes) */
+#define SDA_TMP_DM_OFF      0x19E  /* sda_tmp_dm: 21-byte SDB header */
+#define SDA_SEARCH_DIR_OFF  0x1B3  /* SearchDir: 32-byte FAT dir entry */
+#define SDA_SATTR_OFF       0x24D  /* attribute mask byte */
+
+/* dmatch (sda_tmp_dm) layout — see hdr/dirmatch.h */
+#define DM_DRIVE_OFF        0
+#define DM_NAME_PAT_OFF     1      /* 11 bytes */
+#define DM_ATTR_SRCH_OFF    12
+#define DM_ENTRY_OFF        13     /* 2 bytes */
+
+/* struct dirent layout — see hdr/fat.h */
+#define DIR_NAME_OFF        0      /* 11 bytes (8.3 padded) */
+#define DIR_ATTRIB_OFF      11
+#define DIR_TIME_OFF        22
+#define DIR_DATE_OFF        24
+#define DIR_START_OFF       26
+#define DIR_SIZE_OFF        28     /* 4 bytes */
+
 static void (__interrupt __far *prev_int2f)(void);
 static char __far *g_cds_entry;
 static char __far *g_sda;
@@ -54,8 +74,155 @@ struct ff_capture {
     uint8_t  sda_bytes[256];
     uint8_t  es_di_bytes[64];
     uint8_t  ds_si_bytes[64];
+    /* Flow counters for do_findfirst_or_next */
+    uint16_t flow_entered;
+    uint16_t flow_inode_root_fail;
+    int16_t  flow_inode_root_rc;
+    uint16_t flow_dir_iter_returned;
+    uint16_t flow_state_not_found;
+    uint16_t flow_inode_entry_fail;
+    uint16_t flow_success;
+    /* Snapshot of g_fs key fields at FindFirst time */
+    uint8_t  fs_ready_at_call;
+    uint32_t fs_bgd_count;
+    uint16_t fs_bgd_size;
+    uint32_t fs_blocks_per_group;
+    uint32_t fs_inodes_per_group;
+    uint16_t fs_inode_size;
+    uint32_t fs_block_size;
+    /* Capture root_inode.i_block (first 16 bytes — extent header) */
+    uint8_t  root_iblock[32];
+    int16_t  ext_lookup_rc;
+    uint32_t ext_lookup_phys_lo;
+    uint32_t ext_lookup_phys_hi;
+    int16_t  data_bdev_read_rc;
+    uint32_t data_sector_lo;
+    uint32_t cap_partition_lba_lo;
+    uint32_t cap_partition_lba_hi;
+    uint32_t cap_byte_off_lo;
+    uint32_t cap_byte_off_hi;
+    uint16_t cap_sector_size;
 };
 static struct ff_capture g_ff_capture;
+
+static void to_8_3(const char *name, uint8_t name_len, uint8_t out[11]) {
+    int i = 0, j = 0, k;
+    for (k = 0; k < 11; k++) out[k] = ' ';
+    while (i < name_len && j < 8 && name[i] != '.') {
+        uint8_t c = (uint8_t)name[i++];
+        if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+        out[j++] = c;
+    }
+    while (i < name_len && name[i] != '.') i++;
+    if (i < name_len && name[i] == '.') i++;
+    j = 8;
+    while (i < name_len && j < 11) {
+        uint8_t c = (uint8_t)name[i++];
+        if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+        out[j++] = c;
+    }
+}
+
+struct find_iter_state {
+    uint16_t target_index;
+    uint16_t current_index;
+    int      found;
+    uint8_t  name_len;
+    char     name[256];
+    uint32_t inode;
+    uint8_t  file_type;
+};
+
+static int find_iter_cb(const struct ext4_dir_entry *e, void *ud) {
+    struct find_iter_state *s = (struct find_iter_state *)ud;
+    /* Skip . and .. — FAT root convention */
+    if (e->name_len == 1 && e->name[0] == '.') return 0;
+    if (e->name_len == 2 && e->name[0] == '.' && e->name[1] == '.') return 0;
+
+    if (s->current_index == s->target_index) {
+        s->name_len  = e->name_len;
+        memcpy(s->name, e->name, e->name_len);
+        s->name[e->name_len] = '\0';
+        s->inode     = e->inode;
+        s->file_type = e->file_type;
+        s->found     = 1;
+        return 1;
+    }
+    s->current_index++;
+    return 0;
+}
+
+/* Find the entry at `entry_index` (skipping . / ..) in the ext4 root and
+ * fill the SDA SDB + SearchDir buffers. Updates dm_entry to the next index
+ * so a subsequent FindNext picks up where this left off. Returns 0 on
+ * success, -1 on inode-read failure, -2 on no-such-index. */
+static int do_findfirst_or_next(uint16_t entry_index) {
+    static struct ext4_inode      root_inode;
+    static struct ext4_inode      entry_inode;
+    static struct find_iter_state state;
+    uint8_t      __far *sdb;
+    uint8_t      __far *dirent;
+    uint8_t              name83[11];
+    int                  i;
+    int                  rc;
+
+    g_ff_capture.flow_entered++;
+    if (g_ff_capture.flow_entered == 1) {
+        g_ff_capture.fs_ready_at_call    = (uint8_t)g_fs_ready;
+        g_ff_capture.fs_bgd_count        = g_fs.bgd_count;
+        g_ff_capture.fs_bgd_size         = g_fs.bgd_size;
+        g_ff_capture.fs_blocks_per_group = g_fs.sb.blocks_per_group;
+        g_ff_capture.fs_inodes_per_group = g_fs.sb.inodes_per_group;
+        g_ff_capture.fs_inode_size       = g_fs.sb.inode_size;
+        g_ff_capture.fs_block_size       = g_fs.sb.block_size;
+    }
+
+    rc = ext4_inode_read(&g_fs, 2, &root_inode);
+    g_ff_capture.flow_inode_root_rc = (int16_t)rc;
+    if (rc != 0) {
+        g_ff_capture.flow_inode_root_fail++;
+        return -1;
+    }
+    if (g_ff_capture.flow_entered == 1) {
+        for (i = 0; i < 32; i++) g_ff_capture.root_iblock[i] = root_inode.i_block[i];
+    }
+
+    state.target_index  = entry_index;
+    state.current_index = 0;
+    state.found         = 0;
+    rc = ext4_dir_iter(&g_fs, &root_inode, find_iter_cb, &state);
+    g_ff_capture.flow_dir_iter_returned = (uint16_t)rc;
+    if (!state.found) {
+        g_ff_capture.flow_state_not_found++;
+        return -2;
+    }
+
+    if (ext4_inode_read(&g_fs, state.inode, &entry_inode) != 0) {
+        g_ff_capture.flow_inode_entry_fail++;
+        return -1;
+    }
+
+    to_8_3(state.name, state.name_len, name83);
+
+    sdb    = (uint8_t __far *)(g_sda + SDA_TMP_DM_OFF);
+    dirent = (uint8_t __far *)(g_sda + SDA_SEARCH_DIR_OFF);
+
+    /* Fill the 32-byte FAT-style dir entry. */
+    for (i = 0; i < 32; i++) dirent[i] = 0;
+    for (i = 0; i < 11; i++) dirent[DIR_NAME_OFF + i] = name83[i];
+    dirent[DIR_ATTRIB_OFF] = (state.file_type == EXT4_FT_DIR) ? 0x10u : 0x00u;
+    /* time/date/start_cluster left zero for v1 */
+    *(uint32_t __far *)(dirent + DIR_SIZE_OFF) = (uint32_t)entry_inode.size;
+
+    /* Update SDB header. dm_drive needs bit 7 (network) so FreeDOS routes
+     * subsequent FindNext via REM_FINDNEXT instead of dos_findnext. */
+    sdb[DM_DRIVE_OFF]      = (uint8_t)(DRIVE_INDEX | 0x80u);
+    sdb[DM_ATTR_SRCH_OFF]  = g_sda[SDA_SATTR_OFF];
+    *(uint16_t __far *)(sdb + DM_ENTRY_OFF) = (uint16_t)(entry_index + 1);
+
+    g_ff_capture.flow_success++;
+    return 0;
+}
 
 void __interrupt __far my_int2f_handler(union INTPACK r) {
     uint8_t al;
@@ -140,16 +307,39 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             r.w.flags &= ~1u;
             return;
 
-        case 0x18: /* "FindFirst No Default Drive" / variant */
-        case 0x1B: /* FindFirst — needs SDA-layout diagnostic capture first */
-            r.w.ax = DOS_ERR_FILE_NOT_FOUND;
-            r.w.flags |= 1u;
+        case 0x18: /* FindFirst-alt (older DOS) */
+        case 0x1B:  /* FindFirst */
+            if (!g_fs_ready) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            if (do_findfirst_or_next(0) != 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            r.w.flags &= ~1u;
             return;
 
-        case 0x1C: /* FindNext */
-            r.w.ax = DOS_ERR_NO_MORE_FILES;
-            r.w.flags |= 1u;
+        case 0x1C: { /* FindNext */
+            uint16_t entry_index;
+            uint8_t __far *sdb;
+            if (!g_fs_ready) {
+                r.w.ax = DOS_ERR_NO_MORE_FILES;
+                r.w.flags |= 1u;
+                return;
+            }
+            sdb = (uint8_t __far *)(g_sda + SDA_TMP_DM_OFF);
+            entry_index = *(uint16_t __far *)(sdb + DM_ENTRY_OFF);
+            if (do_findfirst_or_next(entry_index) != 0) {
+                r.w.ax = DOS_ERR_NO_MORE_FILES;
+                r.w.flags |= 1u;
+                return;
+            }
+            r.w.flags &= ~1u;
             return;
+        }
 
         case 0x1D: /* "FindClose" / etc. — be lenient */
             r.w.flags &= ~1u;

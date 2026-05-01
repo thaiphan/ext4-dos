@@ -33,7 +33,10 @@ struct int13_ctx {
 
 static int int13_read(struct blockdev *bd, uint64_t lba, uint32_t count, void *buf) {
     struct int13_ctx *c = (struct int13_ctx *)bd->ctx;
-    struct dap dap;
+    /* Static so the DAP lives in DGROUP. INT 13h reads DS:SI, and inside an
+     * interrupt handler SS != DS — a stack-local DAP would be unreachable
+     * via DS-relative addressing. */
+    static struct dap dap;
     void __far *fbuf;
 
     if (count == 0 || count > 127) return BDEV_ERR_RANGE;
