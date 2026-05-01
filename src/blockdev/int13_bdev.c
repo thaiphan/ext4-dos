@@ -1,6 +1,6 @@
 #include "int13_bdev.h"
+#include <stddef.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <i86.h>
 
 #pragma pack(push, 1)
@@ -55,25 +55,28 @@ static int int13_read(struct blockdev *bd, uint64_t lba, uint32_t count, void *b
     return BDEV_OK;
 }
 
+/* Static singletons — TSR resident memory must live in DGROUP, not in
+ * the malloc heap. The heap can extend past `_dos_keep`'s paragraph
+ * count, in which case DOS reclaims those bytes after we go resident
+ * and our blockdev struct gets overwritten (sector_size becomes 0,
+ * function pointers garbage). The TSR mounts exactly one ext4 disk,
+ * so a single static instance is sufficient. */
+static struct int13_ctx g_ctx;
+static struct blockdev  g_bd;
+static int              g_open;
+
 struct blockdev *int13_bdev_open(uint8_t drive) {
-    struct int13_ctx *c;
-    struct blockdev *bd;
-
-    c = (struct int13_ctx *)malloc(sizeof *c);
-    if (!c) return NULL;
-    c->drive = drive;
-
-    bd = (struct blockdev *)malloc(sizeof *bd);
-    if (!bd) { free(c); return NULL; }
-    bd->read_sectors  = int13_read;
-    bd->sector_size   = 512;
-    bd->total_sectors = 0;
-    bd->ctx           = c;
-    return bd;
+    if (g_open) return NULL;
+    g_ctx.drive       = drive;
+    g_bd.read_sectors = int13_read;
+    g_bd.sector_size  = 512;
+    g_bd.total_sectors = 0;
+    g_bd.ctx          = &g_ctx;
+    g_open            = 1;
+    return &g_bd;
 }
 
 void int13_bdev_close(struct blockdev *bd) {
     if (!bd) return;
-    free(bd->ctx);
-    free(bd);
+    g_open = 0;
 }

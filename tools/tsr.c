@@ -68,6 +68,7 @@ static struct blockdev *g_bdev;
 static struct ext4_fs   g_fs;
 static int              g_fs_ready;
 static uint64_t         g_partition_lba;
+static int              g_quiet;  /* -q: suppress install banner (for CONFIG.SYS INSTALL=) */
 
 /* Single-slot open-file state. M6c2 supports one file at a time, which is
  * sufficient for TYPE / COPY / sequential reads. Multi-open is a polish
@@ -779,17 +780,21 @@ static int hook_cds(void) {
 
     lastdrive = *(uint8_t __far *)(lol + 0x21);
 
-    printf("  LOL    : %04x:%04x\n", FP_SEG(lol), FP_OFF(lol));
-    printf("  CDS arr: %04x:%04x\n", cds_seg, cds_off);
-    printf("  LASTDRIVE byte at LOL+0x21 = %u\n", (unsigned)lastdrive);
+    if (!g_quiet) {
+        printf("  LOL    : %04x:%04x\n", FP_SEG(lol), FP_OFF(lol));
+        printf("  CDS arr: %04x:%04x\n", cds_seg, cds_off);
+        printf("  LASTDRIVE byte at LOL+0x21 = %u\n", (unsigned)lastdrive);
+    }
 
     if ((unsigned)lastdrive <= DRIVE_INDEX) {
         printf("  WARN: LASTDRIVE byte too low; trying %c: anyway\n", DRIVE_LETTER);
     }
 
     cds = cds_array + (unsigned)DRIVE_INDEX * CDS_ENTRY_SIZE;
-    printf("  %c:CDS  : %04x:%04x  (slot %u)\n",
-           DRIVE_LETTER, FP_SEG(cds), FP_OFF(cds), DRIVE_INDEX);
+    if (!g_quiet) {
+        printf("  %c:CDS  : %04x:%04x  (slot %u)\n",
+               DRIVE_LETTER, FP_SEG(cds), FP_OFF(cds), DRIVE_INDEX);
+    }
 
     for (i = 0; i < 67; i++) cds[CDS_OFF_PATH + i] = 0;
     cds[CDS_OFF_PATH + 0] = DRIVE_LETTER;
@@ -839,21 +844,31 @@ static int mount_ext4(uint8_t drive) {
     }
 
     g_fs_ready = 1;
-    printf("  ext4 mounted: drive 0x%02x, partition LBA %lu\n",
-           drive, (unsigned long)g_partition_lba);
-    printf("  volume     : %s\n",
-           g_fs.sb.volume_name[0] ? g_fs.sb.volume_name : "(unset)");
-    printf("  blocks     : %lu (block size %lu)\n",
-           (unsigned long)g_fs.sb.blocks_count,
-           (unsigned long)g_fs.sb.block_size);
+    if (!g_quiet) {
+        printf("  ext4 mounted: drive 0x%02x, partition LBA %lu\n",
+               drive, (unsigned long)g_partition_lba);
+        printf("  volume     : %s\n",
+               g_fs.sb.volume_name[0] ? g_fs.sb.volume_name : "(unset)");
+        printf("  blocks     : %lu (block size %lu)\n",
+               (unsigned long)g_fs.sb.blocks_count,
+               (unsigned long)g_fs.sb.block_size);
+    }
     return 0;
 }
 
 int main(int argc, char **argv) {
     uint8_t drive = 0x81;
     char err[100];
+    int ai;
 
-    if (argc >= 2) drive = (uint8_t)strtoul(argv[1], NULL, 0);
+    /* Parse args: [-q] [drive_num].  -q = quiet (for CONFIG.SYS INSTALL=). */
+    for (ai = 1; ai < argc; ai++) {
+        if (argv[ai][0] == '-' && argv[ai][1] == 'q' && argv[ai][2] == 0) {
+            g_quiet = 1;
+        } else {
+            drive = (uint8_t)strtoul(argv[ai], NULL, 0);
+        }
+    }
 
     if (hook_cds() != 0) {
         return 1;
@@ -861,10 +876,12 @@ int main(int argc, char **argv) {
 
     g_sda = get_sda();
 
-    printf("ext4-dos TSR\n");
-    printf("  drive %c: marked as redirector (flag 0x%04x)\n",
-           DRIVE_LETTER, CDS_FLAG_REDIRECTED);
-    printf("  SDA at %04x:%04x\n", FP_SEG(g_sda), FP_OFF(g_sda));
+    if (!g_quiet) {
+        printf("ext4-dos TSR\n");
+        printf("  drive %c: marked as redirector (flag 0x%04x)\n",
+               DRIVE_LETTER, CDS_FLAG_REDIRECTED);
+        printf("  SDA at %04x:%04x\n", FP_SEG(g_sda), FP_OFF(g_sda));
+    }
 
     if (mount_ext4(drive) == 0) {
         if (ext4_features_check_supported(&g_fs.sb, err, sizeof err) != 0) {
@@ -881,9 +898,32 @@ int main(int argc, char **argv) {
 
     fflush(stdout);
 
-    /* Resident size: ~32 KB. Covers our 20 KB binary + static buffers.
-     * MS-DOS 4 INSTALL= boot path runs out of memory for COMMAND.COM if
-     * we ask for more, since boot-time available conv memory is tight. */
-    _dos_keep(0, 2048);
+    /* DO NOT hard-code a paragraph count here. Read the MCB and keep
+     * ALL of our allocation.
+     *
+     * Why: in OpenWatcom small model the loaded image is code (~22 KB) +
+     * static buffers (block cache, inode buf, extent node buf, dir block
+     * buf, fs context) totaling well past 32 KB. Hard-coding _dos_keep
+     * to anything less than our actual size silently truncates BSS, so
+     * static structs at the high end of our segment (e.g. the singleton
+     * blockdev / int13_ctx in src/blockdev/int13_bdev.c) land in the
+     * area DOS reclaims. After install they get overwritten by whatever
+     * DOS allocates next, which manifests as:
+     *   - bd->sector_size == 0  → ext4_inode_read returns rc=-4
+     *   - FindFirst returns "file not found" for every path
+     *   - DIR Y: prints volume header and zero entries
+     *   - TYPE Y:\HELLO.TXT silently produces no output
+     * Mount itself succeeds at install time (banner shows real volume
+     * + block count) because corruption only happens AFTER _dos_keep,
+     * which makes this bug devious to diagnose.
+     *
+     * The MCB header sits one paragraph below our PSP; offset 3 holds
+     * the allocated paragraph count DOS actually gave us at EXEC time.
+     * Use that as the authoritative size — never a guess. */
+    {
+        uint8_t  __far *mcb       = (uint8_t  __far *)MK_FP(_psp - 1, 0);
+        uint16_t __far *mcb_paras = (uint16_t __far *)(mcb + 3);
+        _dos_keep(0, *mcb_paras);
+    }
     return 0;
 }
