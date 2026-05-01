@@ -881,7 +881,9 @@ int main(int argc, char **argv) {
 
     fflush(stdout);
 
-    /* Resident size: generous, covers code + ~16 KB of static buffers. */
-    _dos_keep(0, 4096);
+    /* Resident size: ~32 KB. Covers our 20 KB binary + static buffers.
+     * MS-DOS 4 INSTALL= boot path runs out of memory for COMMAND.COM if
+     * we ask for more, since boot-time available conv memory is tight. */
+    _dos_keep(0, 2048);
     return 0;
 }

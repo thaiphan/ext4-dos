@@ -22,6 +22,11 @@ tests/images/*.raw
 # FreeDOS test image + cached download (large, fetched on demand)
 tests/freedos/
 
+# MS-DOS 4 working copies — keep the source image, ignore the rest
+tests/msdos4/*
+!tests/msdos4/msdos4-source.img
+!tests/msdos4/README.md
+
 # macOS
 .DS_Store
 
