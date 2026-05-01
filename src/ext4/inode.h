@@ -16,6 +16,7 @@ struct ext4_inode {
     uint16_t mode;
     uint64_t size;          /* size_lo combined with size_hi */
     uint32_t flags;
+    uint32_t mtime;         /* modification time (Unix seconds since 1970) */
     uint8_t  i_block[60];   /* extents header + entries, or block pointers */
 };
 

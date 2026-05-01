@@ -55,6 +55,7 @@ int ext4_inode_read(struct ext4_fs *fs, uint32_t ino, struct ext4_inode *out) {
     raw = buf + offset_in_sector;
     out->mode  = le16(raw + 0x00);
     out->flags = le32(raw + 0x20);
+    out->mtime = le32(raw + 0x10);
     memcpy(out->i_block, raw + 0x28, 60);
 
     size_lo = le32(raw + 0x04);

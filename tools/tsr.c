@@ -150,8 +150,79 @@ struct ff_capture {
     uint32_t last_read_pos;
     uint16_t last_read_count;
     int16_t  last_read_actual;
+    uint32_t entry_inode_mtime;
+    uint16_t entry_inode_dos_time;
+    uint16_t entry_inode_dos_date;
+    uint32_t utd_initial_days;
+    uint16_t utd_year_iters;
+    uint32_t utd_days_after_year_loop;
+    uint16_t utd_final_year;
 };
 static struct ff_capture g_ff_capture;
+
+static int is_leap_year(int year) {
+    if (year % 400 == 0) return 1;
+    if (year % 100 == 0) return 0;
+    if (year %   4 == 0) return 1;
+    return 0;
+}
+
+/* Convert Unix seconds-since-1970 (UTC) to packed DOS time/date.
+ * Returns date<<16 | time (both 16 bits). Returning a value avoids the
+ * SS!=DS hazard of writing through caller-supplied pointers in interrupt
+ * context — caller would otherwise pass &stack_local. */
+static uint32_t unix_to_dos(uint32_t unix_secs) {
+    uint16_t dos_time_local, dos_date_local;
+    uint16_t *dos_time = &dos_time_local;
+    uint16_t *dos_date = &dos_date_local;
+    static const uint8_t dim[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    uint32_t days = unix_secs / 86400ul;
+    uint32_t s    = unix_secs % 86400ul;
+    int      year  = 1970;
+    int      month = 1;
+    int      day;
+    int      yd, md;
+    uint8_t  hour, mn, sc;
+    uint16_t iters = 0;
+
+    g_ff_capture.utd_initial_days = days;
+
+    while (1) {
+        yd = is_leap_year(year) ? 366 : 365;
+        if (days < (uint32_t)yd) break;
+        days -= (uint32_t)yd;
+        year++;
+        iters++;
+        if (iters > 200) break;  /* safety */
+    }
+    g_ff_capture.utd_year_iters = iters;
+    g_ff_capture.utd_days_after_year_loop = days;
+    g_ff_capture.utd_final_year = (uint16_t)year;
+    while (1) {
+        md = (int)dim[month - 1];
+        if (month == 2 && is_leap_year(year)) md = 29;
+        if (days < (uint32_t)md) break;
+        days -= (uint32_t)md;
+        month++;
+    }
+    day = (int)days + 1;
+
+    hour = (uint8_t)(s / 3600u);
+    mn   = (uint8_t)((s / 60u) % 60u);
+    sc   = (uint8_t)(s % 60u);
+
+    if (year < 1980) {
+        *dos_date = 0x0021u; /* 1980-01-01 — DOS minimum */
+    } else {
+        *dos_date = (uint16_t)((((uint16_t)(year - 1980)) << 9)
+                               | (((uint16_t)month) << 5)
+                               | (uint16_t)day);
+    }
+    *dos_time = (uint16_t)(((uint16_t)hour << 11)
+                           | ((uint16_t)mn << 5)
+                           | (uint16_t)(sc / 2u));
+    return ((uint32_t)*dos_date << 16) | (uint32_t)*dos_time;
+}
 
 /* Convert DOS path "Y:\HELLO.TXT" (qualified, in SDA+0x9E) to lowercase
  * ext4 path "/hello.txt". Returns 0 on success, -1 on bad path. */
@@ -364,7 +435,18 @@ static int do_findfirst_or_next(uint16_t entry_index) {
     for (i = 0; i < 32; i++) dirent[i] = 0;
     for (i = 0; i < 11; i++) dirent[DIR_NAME_OFF + i] = name83[i];
     dirent[DIR_ATTRIB_OFF] = (state.file_type == EXT4_FT_DIR) ? 0x10u : 0x00u;
-    /* time/date/start_cluster left zero for v1 */
+    {
+        uint32_t td = unix_to_dos(entry_inode.mtime);
+        uint16_t dt = (uint16_t)(td & 0xFFFFul);
+        uint16_t dd = (uint16_t)(td >> 16);
+        *(uint16_t __far *)(dirent + DIR_TIME_OFF) = dt;
+        *(uint16_t __far *)(dirent + DIR_DATE_OFF) = dd;
+        if (slot == 0) {
+            g_ff_capture.entry_inode_mtime    = entry_inode.mtime;
+            g_ff_capture.entry_inode_dos_time = dt;
+            g_ff_capture.entry_inode_dos_date = dd;
+        }
+    }
     *(uint32_t __far *)(dirent + DIR_SIZE_OFF) = (uint32_t)entry_inode.size;
 
     /* Update SDB header. dm_drive needs bit 7 (network) so FreeDOS routes
@@ -517,8 +599,13 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             *(uint16_t __far *)(sft + SFT_DEVINFO_OFF) =
                 (uint16_t)(0x8000u | DRIVE_INDEX);
             sft[SFT_FILE_ATTR_OFF] = 0;
-            *(uint16_t __far *)(sft + SFT_FILE_TIME_OFF) = 0;
-            *(uint16_t __far *)(sft + SFT_FILE_DATE_OFF) = 0;
+            {
+                uint32_t td = unix_to_dos(g_current_open.inode.mtime);
+                *(uint16_t __far *)(sft + SFT_FILE_TIME_OFF) =
+                    (uint16_t)(td & 0xFFFFul);
+                *(uint16_t __far *)(sft + SFT_FILE_DATE_OFF) =
+                    (uint16_t)(td >> 16);
+            }
             *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF) =
                 (uint32_t)g_current_open.inode.size;
             *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = 0;
@@ -561,15 +648,42 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             return;
         }
 
-        case 0x0C: /* Get Disk Space */
-            /* Plausible v1 placeholder: 64 MB total, all free.
-             * total = AX * BX * CX = 16384 * 8 * 512 = 64 MiB. */
-            r.w.ax = 16384u; /* total clusters */
-            r.w.bx = 8u;     /* sectors per cluster */
-            r.w.cx = 512u;   /* bytes per sector */
-            r.w.dx = 16384u; /* free clusters */
+        case 0x0C: { /* Get Disk Space — real values from ext4 superblock */
+            uint32_t blocks_total;
+            uint32_t blocks_free;
+            uint32_t bs;
+            uint16_t spc;
+
+            if (!g_fs_ready) {
+                r.w.ax = 1u;   r.w.bx = 1u;
+                r.w.cx = 512u; r.w.dx = 0u;
+                r.w.flags &= ~1u;
+                return;
+            }
+
+            bs = g_fs.sb.block_size;
+            blocks_total = (uint32_t)g_fs.sb.blocks_count;
+            blocks_free  = (uint32_t)g_fs.sb.free_blocks_count;
+            spc = (uint16_t)(bs / 512u);
+            if (spc == 0u) spc = 1u;
+            /* DOS uses 16-bit cluster counts; cap. Real-world disks > 32 MB
+             * with 1 KB blocks need cluster scaling; v1 just truncates. */
+            if (blocks_total > 0xFFFFul) blocks_total = 0xFFFFul;
+            if (blocks_free  > 0xFFFFul) blocks_free  = 0xFFFFul;
+
+            /* Per FreeDOS dosfns.c (rg[0..3] = AX, BX, CX, DX):
+             *   AX = sectors per cluster
+             *   BX = total clusters
+             *   CX = bytes per sector
+             *   DX = free clusters
+             * (Some RBIL sources order these differently — empirical.) */
+            r.w.ax = spc;                    /* sectors/cluster */
+            r.w.bx = (uint16_t)blocks_total; /* total clusters */
+            r.w.cx = 512u;                   /* bytes/sector */
+            r.w.dx = (uint16_t)blocks_free;  /* free clusters */
             r.w.flags &= ~1u;
             return;
+        }
 
         case 0x23: /* Qualify Remote File Name */
             /* Pass-through: tell DOS the path it gave us is fine as-is. */

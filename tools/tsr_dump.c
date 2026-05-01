@@ -64,6 +64,13 @@ struct ff_capture {
     uint32_t last_read_pos;
     uint16_t last_read_count;
     int16_t  last_read_actual;
+    uint32_t entry_inode_mtime;
+    uint16_t entry_inode_dos_time;
+    uint16_t entry_inode_dos_date;
+    uint32_t utd_initial_days;
+    uint16_t utd_year_iters;
+    uint32_t utd_days_after_year_loop;
+    uint16_t utd_final_year;
 };
 
 static void hex_dump(const char *label, const uint8_t __far *p, unsigned len) {
@@ -233,6 +240,21 @@ int main(void) {
     printf("  last read pos = %lu, requested = %u, actual = %d\n",
            (unsigned long)cap->last_read_pos,
            cap->last_read_count, (int)cap->last_read_actual);
+
+    printf("\nEntry-1 mtime conversion:\n");
+    printf("  raw mtime    = 0x%08lx (%lu)\n",
+           (unsigned long)cap->entry_inode_mtime,
+           (unsigned long)cap->entry_inode_mtime);
+    printf("  DOS time     = 0x%04x\n", cap->entry_inode_dos_time);
+    printf("  DOS date     = 0x%04x  (year=%u, month=%u, day=%u)\n",
+           cap->entry_inode_dos_date,
+           (unsigned)((cap->entry_inode_dos_date >> 9) + 1980u),
+           (unsigned)((cap->entry_inode_dos_date >> 5) & 0x0Fu),
+           (unsigned)(cap->entry_inode_dos_date & 0x1Fu));
+    printf("  utd initial days   = %lu\n", (unsigned long)cap->utd_initial_days);
+    printf("  utd year iters     = %u\n", cap->utd_year_iters);
+    printf("  utd days after loop= %lu\n", (unsigned long)cap->utd_days_after_year_loop);
+    printf("  utd final year     = %u\n", cap->utd_final_year);
 
     return 0;
 }
