@@ -10,15 +10,19 @@ BUILD    := build
 HOST_DIR := $(BUILD)/host
 DOS_DIR  := $(BUILD)/dos
 
-EXT4_SRCS := src/ext4/superblock.c
+LIB_SRCS := \
+	src/blockdev/file_bdev.c \
+	src/ext4/superblock.c \
+	src/ext4/features.c \
+	src/partition/mbr.c
 
-.PHONY: all host-build dos-build host-test fixture clean
+.PHONY: all host-build dos-build host-test fixtures fixture fixture-partitioned clean
 
 all: host-build
 
 host-build: $(HOST_DIR)/host_cli
 
-$(HOST_DIR)/host_cli: tools/host_cli.c $(EXT4_SRCS) | $(HOST_DIR)
+$(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR):
@@ -30,10 +34,15 @@ dos-build:
 host-test: host-build
 	@echo "host-test: no tests yet"
 
-fixture: tests/images/small.img
+fixtures: fixture fixture-partitioned
+fixture:             tests/images/small.img
+fixture-partitioned: tests/images/disk.img
 
 tests/images/small.img: scripts/mkfixture.sh
 	bash $<
+
+tests/images/disk.img: scripts/mkfixture-partitioned.py
+	python3 $<
 
 clean:
 	rm -rf $(BUILD)

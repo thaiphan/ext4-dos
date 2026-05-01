@@ -1,16 +1,6 @@
 #include "superblock.h"
+#include "../util/endian.h"
 #include <string.h>
-
-static uint16_t le16(const uint8_t *p) {
-    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-
-static uint32_t le32(const uint8_t *p) {
-    return (uint32_t)p[0]
-         | ((uint32_t)p[1] << 8)
-         | ((uint32_t)p[2] << 16)
-         | ((uint32_t)p[3] << 24);
-}
 
 int ext4_superblock_parse(const uint8_t *buf, struct ext4_superblock *sb) {
     sb->magic = le16(buf + 0x38);
