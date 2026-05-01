@@ -38,53 +38,44 @@ mkdir -p "$MSDOS4_DIR"
 cp "$SOURCE_IMG" "$TEST_IMG"
 
 # ============================================================================
-# MS-DOS 4 status: PARTIAL — install verified, full DIR/TYPE blocked.
+# MS-DOS 4 status: install + DIR Y: working, TYPE Y: still blocked.
 # ============================================================================
 # What works:
-#   - Our TSR installs cleanly via CONFIG.SYS INSTALL= (visible diagnostic
-#     output shows LOL/CDS hookup, ext4 mount, redirector flag set on Y:).
-#   - The INT 2Fh AH=11h redirector pathway is the SAME mechanism as DOS 3+
-#     and FreeDOS use — kernel dispatches through whatever ISR sits at INT 2Fh.
+#   - TSR installs via CONFIG.SYS INSTALL=A:\TSR.EXE.
+#   - DIR Y: lists ext4 entries with timestamps and free-space (uses
+#     IFS_SEQ_SEARCH_FIRST = INT 2Fh AL=0x19, the MS-DOS-4-specific variant
+#     of FindFirst).
+#   - Boot proceeds cleanly to A> prompt.
 #
-# What doesn't work:
-#   - After CONFIG.SYS finishes, MS-DOS 4 fails to load COMMAND.COM with
-#     "Bad or missing Command Interpreter" (BADCOM at SYSINIT1.ASM:847).
-#     This is BADCOM not BADMEM, so the EXEC of COMMAND.COM fails (not a
-#     simple memory shortage). Root cause not isolated; we suspect MCB
-#     chain layout interaction between our resident block and SYSINIT's
-#     COMMAND.COM EXEC. Same failure with keep size 2048, 3072, 4096
-#     paragraphs and full MCB-fitted sizes.
+# What doesn't:
+#   - TYPE Y:\file fails with "File not found". MS-DOS 4 routes the open
+#     through INT 2Fh AL=0x2E (Extended Open) instead of the AL=0x16 path
+#     FreeDOS uses. We currently alias AL=0x2E to the AL=0x16 handler but
+#     something about the SDA/SFT contract for ExtOpen differs and the
+#     handler reports failure. See tools/tsr.c near case 0x2E.
 #
-# Rabbit holes ALREADY EXPLORED — don't repeat without reading first:
-#   1. IFSFUNC.EXE: it is NOT needed. IFSFUNC is for IBM's separate IFS
-#      subsystem (DEVICE=foo.IFS drivers). Without IFS drivers loaded, it
-#      prints UTIL_ERR_4 = "Invalid configuration" (see
-#      references/msdos4/v4.0/src/CMD/IFSFUNC/IFSFUNC.SKL line 48 +
-#      IFSINIT.ASM line 1321). Loading it created the misleading
-#      "Invalid configuration" message we chased for hours.
-#   2. SHELL=A:\COMMAND.COM A:\ /P /E:512 — directive parses fine and lets
-#      MS-DOS 4 boot WITHOUT our TSR, but doesn't fix the BADCOM after our
-#      TSR installs.
-#   3. AUTOEXEC.BAT loading the TSR (vs CONFIG.SYS INSTALL=) — separate
-#      MS-DOS 4 bug: _dos_keep from a batch context corrupts COMMAND.COM's
-#      batch-position tracking and stalls at "Insert disk with batch file".
-#      COMMAND /C sub-shell wrapper doesn't help — corruption propagates
-#      to the parent.
-#   4. Freeing our environment block before _dos_keep — REGRESSED FreeDOS
-#      (broke FindFirst). The fix that actually helped was using the MCB-
-#      reported allocation size in _dos_keep instead of a hard-coded
-#      paragraph count; see tools/tsr.c.
+# Two big lessons learned during the investigation, documented in tools/tsr.c
+# but worth repeating here so anyone re-reading this script doesn't re-walk
+# the rabbit holes:
+#   1. INSTALL=A:\IFSFUNC.EXE is NOT needed. IFSFUNC is for IBM's separate
+#      IFS subsystem (DEVICE=foo.IFS drivers). Without IFS drivers loaded
+#      it prints "Invalid configuration" (UTIL_ERR_4 in IFSFUNC.SKL) and
+#      leaves the kernel in a half-init state — that was the cause of the
+#      "Bad or missing Command Interpreter" we chased for ages.
+#   2. CDS flags must be `curdir_isnet | curdir_inuse` = 0xC000, NOT just
+#      0x8000. FreeDOS works with isnet alone, MS-DOS 4 silently refuses
+#      to dispatch redirector calls without inuse set. See
+#      references/msdos4/v4.0/src/INC/CURDIR.INC and IFSSESS.ASM.
+#   3. The Qualify Remote File Name handler (INT 2Fh AX=1123h) MUST only
+#      claim Y:-prefixed paths AND copy the canonical name into ES:DI.
+#      Returning CF=0 unconditionally with empty ES:DI worked under
+#      FreeDOS (lenient) but bricked MS-DOS 4's COMMAND.COM load.
 #
-# Next step IF revisiting MS-DOS 4: build DOSBox-X with --enable-debug,
-# breakpoint SYSINIT1.ASM:847 and backtrace to see whether OPEN, LSEEK, or
-# EXEC fails, then inspect MCB chain at the moment of failure.
-#
-# The redirector itself is proven correct under FreeDOS — the issue here is
-# DOS-internals plumbing, not ext4 logic.
+# References cloned at references/msdos4/ (Microsoft v4.0 source, MIT).
 # ============================================================================
 cat > "$MSDOS4_DIR/config.sys.tmp" <<'EOF'
 LASTDRIVE=Z
-INSTALL=A:\TSR.EXE -q 0x81
+INSTALL=A:\TSR.EXE -q -t 0x81
 EOF
 awk 'BEGIN{ORS="\r\n"} {print}' "$MSDOS4_DIR/config.sys.tmp" > "$MSDOS4_DIR/config.sys"
 rm -f "$MSDOS4_DIR/config.sys.tmp"

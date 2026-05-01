@@ -102,9 +102,6 @@ freedos-test: dos-build
 msdos4-test: dos-build
 	@bash scripts/run-msdos4-test.sh
 
-msdos4-debug: dos-build
-	@bash scripts/run-msdos4-debug.sh
-
 fixtures: fixture fixture-partitioned
 fixture:             tests/images/small.img
 fixture-partitioned: tests/images/disk.img

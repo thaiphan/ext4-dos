@@ -23,7 +23,15 @@
 #define DOS_ERR_FILE_NOT_FOUND  0x02u
 #define DOS_ERR_NO_MORE_FILES   0x12u
 
-#define CDS_FLAG_REDIRECTED 0x8000u
+/* Both bits must be set for MS-DOS 4 to dispatch file ops through INT 2Fh
+ * AH=11h on this drive. 0x8000 = curdir_isnet (network/IFS drive), 0x4000 =
+ * curdir_inuse (slot is live). FreeDOS works with just 0x8000 but MS-DOS 4
+ * silently treats isnet-without-inuse as "drive not present", so DIR Y:
+ * etc. fall back to the local FAT path and the kernel never calls our
+ * redirector. See references/msdos4/v4.0/src/CMD/IFSFUNC/IFSSESS.ASM
+ * (`MOV [SI.curdir_flags], curdir_isnet + curdir_inuse`) and
+ * references/msdos4/v4.0/src/INC/CURDIR.INC for the bit definitions. */
+#define CDS_FLAG_REDIRECTED 0xC000u
 #define CDS_ENTRY_SIZE      88
 #define CDS_OFF_PATH        0x00
 #define CDS_OFF_FLAGS       0x43
@@ -61,8 +69,11 @@
 #define SFT_FILE_NAME_OFF       0x20  /* 11 bytes 8.3 */
 
 static void (__interrupt __far *prev_int2f)(void);
+static void (__interrupt __far *prev_int21)(void);
 static char __far *g_cds_entry;
 static char __far *g_sda;
+static int         g_msdos4_trace;  /* -t: install INT 21h trace hook for the
+                                       MS-DOS 4 COMMAND.COM EXEC failure */
 
 static struct blockdev *g_bdev;
 static struct ext4_fs   g_fs;
@@ -554,7 +565,9 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             r.w.flags &= ~1u;
             return;
 
-        case 0x16: { /* Open Existing File */
+        case 0x15: /* MS-DOS 4 IFS_OPEN — handle-based open */
+        case 0x2E: /* MS-DOS 4 Extended Open (issued from FT.IFS_extopen path) */
+        case 0x16: { /* Open Existing File (IFS_SEQ_OPEN) */
             static char path_buf[128];
             uint8_t __far *sft;
             uint32_t inode_num;
@@ -686,12 +699,47 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             return;
         }
 
-        case 0x23: /* Qualify Remote File Name */
-            /* Pass-through: tell DOS the path it gave us is fine as-is. */
-            r.w.flags &= ~1u;
+        case 0x23: /* Qualify Remote File Name (INT 2Fh AX=1123h)
+                    *   DS:SI = ASCIIZ path to qualify
+                    *   ES:DI = 67-byte output buffer for canonical name
+                    *   Return CF=0 + canonical name in ES:DI if we own this
+                    *   path, CF=1 to let DOS qualify locally.
+                    *
+                    * Two failure modes we hit getting this right:
+                    *  - CF=0 unconditionally: FreeDOS shrugs, MS-DOS 4
+                    *    takes the empty ES:DI buffer literally and the
+                    *    subsequent OPEN of "garbage" fails — SYSINIT bails
+                    *    with "Bad or missing Command Interpreter".
+                    *  - CF=0 only for Y: paths but not writing ES:DI:
+                    *    same garbage-buffer problem for Y: lookups
+                    *    ("Invalid drive specification" from COMMAND.COM).
+                    * Fix: only claim Y:-prefixed paths AND copy them into
+                    * ES:DI verbatim (ours is already canonical). */
+            {
+                uint8_t __far *src = (uint8_t __far *)MK_FP(r.x.ds, r.w.si);
+                uint8_t        c0  = src[0];
+                /* Case-insensitive Y: match. */
+                if (c0 >= 'a' && c0 <= 'z') c0 = (uint8_t)(c0 - 0x20);
+                if (c0 == DRIVE_LETTER && src[1] == ':') {
+                    uint8_t __far *dst = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+                    int             i;
+                    /* Force the drive letter to uppercase canonical 'Y:'. */
+                    dst[0] = DRIVE_LETTER;
+                    dst[1] = ':';
+                    for (i = 2; i < 67; i++) {
+                        dst[i] = src[i];
+                        if (src[i] == 0) break;
+                    }
+                    r.w.flags &= ~1u;
+                } else {
+                    /* Not for us — leave qualification to DOS. */
+                    r.w.flags |= 1u;
+                }
+            }
             return;
 
         case 0x18: /* FindFirst-alt (older DOS) */
+        case 0x19: /* MS-DOS 4 IFS_SEQ_SEARCH_FIRST — sequential variant */
         case 0x1B:  /* FindFirst */
             if (!g_fs_ready) {
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;
@@ -713,6 +761,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             r.w.flags &= ~1u;
             return;
 
+        case 0x1A: /* MS-DOS 4 IFS_SEQ_SEARCH_NEXT — sequential variant */
         case 0x1C: { /* FindNext */
             uint16_t entry_index;
             uint8_t __far *sdb;
@@ -856,17 +905,216 @@ static int mount_ext4(uint8_t drive) {
     return 0;
 }
 
+/* ============================================================================
+ * MS-DOS 4 COMMAND.COM-EXEC trace hook (only installed via -t flag).
+ *
+ * Goal: when SYSINIT calls INT 21h AH=4Bh AL=0 to EXEC COMMAND.COM, capture:
+ *   - the filename (DS:DX -> ASCIIZ path)
+ *   - the EXEC parameter block (ES:BX -> { env_seg, cmdline, fcb1, fcb2 })
+ *   - a snapshot of the MCB chain
+ * Dump it directly to text-mode video memory at 0xB800:0 in printable form.
+ * The kernel's "Bad or missing Command Interpreter" message appears below
+ * (kernel writes via DOS PrintString at the cursor position, which is
+ * further down the screen), so a screenshot shows both.
+ *
+ * Limitation: a Watcom __interrupt handler can only chain forward via
+ * _chain_intr. We can't easily observe the EXEC RETURN that way, so we
+ * dump pre-call state. That's enough to answer "what's SYSINIT asking for
+ * and what does memory look like at that moment".
+ * ============================================================================ */
+
+#define VID_SEG  0xB800u
+#define VID_ATTR 0x4Fu  /* bright white on red — visually distinct */
+
+static uint16_t g_vid_pos;  /* offset within video segment */
+
+static void vid_clear_top(int rows) {
+    int i;
+    uint16_t __far *vid = (uint16_t __far *)MK_FP(VID_SEG, 0);
+    for (i = 0; i < rows * 80; i++) vid[i] = ((uint16_t)VID_ATTR << 8) | ' ';
+    g_vid_pos = 0;
+}
+
+static void vid_putc(char c) {
+    uint16_t __far *vid = (uint16_t __far *)MK_FP(VID_SEG, 0);
+    if (c == '\n') {
+        g_vid_pos = (uint16_t)(((g_vid_pos / 80u) + 1u) * 80u);
+        return;
+    }
+    vid[g_vid_pos] = ((uint16_t)VID_ATTR << 8) | (uint8_t)c;
+    g_vid_pos++;
+}
+
+static void vid_puts(const char *s) {
+    while (*s) vid_putc(*s++);
+}
+
+static void vid_puthex16(uint16_t v) {
+    static const char hex[] = "0123456789ABCDEF";
+    vid_putc(hex[(v >> 12) & 0xF]);
+    vid_putc(hex[(v >>  8) & 0xF]);
+    vid_putc(hex[(v >>  4) & 0xF]);
+    vid_putc(hex[(v >>  0) & 0xF]);
+}
+
+static void vid_puthex8(uint8_t v) {
+    static const char hex[] = "0123456789ABCDEF";
+    vid_putc(hex[(v >> 4) & 0xF]);
+    vid_putc(hex[(v >> 0) & 0xF]);
+}
+
+static int g_exec_dumped;       /* fire once — only the FIRST AH=4Bh we see */
+static uint16_t g_int21_count;   /* total INT 21h calls our hook saw */
+static uint16_t g_ah_count[256]; /* per-AH histogram */
+static uint8_t  g_ah_seq[64];    /* call sequence (first 64 AH values) */
+static uint8_t  g_ah_seq_n;
+
+void __interrupt __far my_int21_handler(union INTPACK r) {
+    static const char hex[] = "0123456789ABCDEF";
+
+    /* Histogram + sequence */
+    g_int21_count++;
+    g_ah_count[r.h.ah]++;
+    if (g_ah_seq_n < 64) g_ah_seq[g_ah_seq_n++] = r.h.ah;
+
+    /* Per-call status line at row 24 col 0: total count + last AH + sequence */
+    {
+        uint16_t __far *vid = (uint16_t __far *)MK_FP(VID_SEG, 24u * 80u);
+        uint16_t        n   = g_int21_count;
+        int             i, p = 0;
+        const char     *s   = "I21=";
+        while (*s) vid[p++] = ((uint16_t)0x70 << 8) | *s++;
+        vid[p++] = ((uint16_t)0x70 << 8) | hex[(n >> 12) & 0xF];
+        vid[p++] = ((uint16_t)0x70 << 8) | hex[(n >>  8) & 0xF];
+        vid[p++] = ((uint16_t)0x70 << 8) | hex[(n >>  4) & 0xF];
+        vid[p++] = ((uint16_t)0x70 << 8) | hex[(n >>  0) & 0xF];
+        s = " seq:";
+        while (*s) vid[p++] = ((uint16_t)0x70 << 8) | *s++;
+        /* Show last 32 distinct AHs (with rolling overflow). 2 nibbles each. */
+        for (i = 0; i < g_ah_seq_n && i < 32 && p + 2 < 80; i++) {
+            uint8_t ah = g_ah_seq[i];
+            vid[p++] = ((uint16_t)0x70 << 8) | hex[(ah >> 4) & 0xF];
+            vid[p++] = ((uint16_t)0x70 << 8) | hex[(ah >> 0) & 0xF];
+            if (p < 80) vid[p++] = ((uint16_t)0x70 << 8) | '.';
+        }
+    }
+
+    /* Trap the FIRST OPEN (AH=3Dh) or LOAD/EXEC (AH=4Bh AL=0). Dump
+     * diagnostic state to video memory using ABSOLUTE row positions
+     * (g_vid_pos newline math went wrong on prior attempt). */
+    if (!g_exec_dumped &&
+        ((r.h.ah == 0x4Bu && r.h.al == 0x00u) ||
+         (r.h.ah == 0x3Du))) {
+        uint8_t __far *fname = (uint8_t __far *)MK_FP(r.x.ds, r.w.dx);
+
+        g_exec_dumped = 1;
+        vid_clear_top(20);
+
+        /* Row 0: function + AX/BX/CX/DX */
+        g_vid_pos = 0;
+        vid_puts("TRAP AH="); vid_puthex8(r.h.ah);
+        vid_puts(" AL=");     vid_puthex8(r.h.al);
+        vid_puts(" AX=");     vid_puthex16(r.w.ax);
+        vid_puts(" BX=");     vid_puthex16(r.w.bx);
+        vid_puts(" CX=");     vid_puthex16(r.w.cx);
+        vid_puts(" DX=");     vid_puthex16(r.w.dx);
+
+        /* Row 1: segment regs */
+        g_vid_pos = 80;
+        vid_puts("DS="); vid_puthex16(r.x.ds);
+        vid_puts(" ES="); vid_puthex16(r.x.es);
+        vid_puts(" SI="); vid_puthex16(r.w.si);
+        vid_puts(" DI="); vid_puthex16(r.w.di);
+        vid_puts(" BP="); vid_puthex16(r.x.bp);
+        vid_puts(" PSP="); vid_puthex16((uint16_t)_psp);
+
+        /* Row 2: filename hex dump (first 32 bytes at DS:DX) */
+        g_vid_pos = 160;
+        vid_puts("DS:DX hex: ");
+        {
+            int i;
+            for (i = 0; i < 32; i++) {
+                vid_puthex8(fname[i]);
+                vid_putc(' ');
+            }
+        }
+
+        /* Row 3: filename ASCII (first 32 bytes at DS:DX) */
+        g_vid_pos = 240;
+        vid_puts("DS:DX asc: [");
+        {
+            int i;
+            for (i = 0; i < 64; i++) {
+                uint8_t c = fname[i];
+                if (c == 0) break;
+                vid_putc((c >= 0x20 && c < 0x7F) ? (char)c : '.');
+            }
+        }
+        vid_putc(']');
+
+        /* Rows 4+: MCB chain — start from PSP-1, walk forward */
+        g_vid_pos = 320;
+        vid_puts("MCB chain (from PSP-1):");
+        {
+            extern unsigned _psp;
+            uint16_t cur = (uint16_t)(_psp - 1u);
+            int      row = 5, i, j;
+            for (i = 0; i < 12; i++) {
+                uint8_t  __far *m  = (uint8_t __far *)MK_FP(cur, 0);
+                uint8_t         tag   = m[0];
+                uint16_t        owner = *(uint16_t __far *)(m + 1);
+                uint16_t        size  = *(uint16_t __far *)(m + 3);
+
+                g_vid_pos = (uint16_t)(row * 80);
+                vid_putc(' '); vid_puthex16(cur); vid_putc(' ');
+                vid_putc((char)tag); vid_putc(' ');
+                vid_puts("own="); vid_puthex16(owner); vid_putc(' ');
+                vid_puts("sz=");  vid_puthex16(size);  vid_putc(' ');
+                for (j = 0; j < 8; j++) {
+                    char c = (char)m[8 + j];
+                    if (c == 0 || c < 0x20 || c >= 0x7F) break;
+                    vid_putc(c);
+                }
+                row++;
+                if (tag == 'Z') break;
+                if (tag != 'M') break;
+                cur = (uint16_t)(cur + 1u + size);
+            }
+        }
+    }
+
+    _chain_intr(prev_int21);
+}
+
 int main(int argc, char **argv) {
     uint8_t drive = 0x81;
     char err[100];
     int ai;
 
-    /* Parse args: [-q] [drive_num].  -q = quiet (for CONFIG.SYS INSTALL=). */
+    /* Parse args: [-q] [-t] [drive_num].
+     *  -q  = quiet (for CONFIG.SYS INSTALL=)
+     *  -t  = install INT 21h trace hook (MS-DOS 4 COMMAND.COM-EXEC debug)
+     *
+     * Lenient about leading dash count and argv[ai][2]: MS-DOS 4
+     * INSTALL= packs all args into one Ldexec_parm string and Watcom's
+     * argv splitter may not always normalize the way we'd expect. */
     for (ai = 1; ai < argc; ai++) {
-        if (argv[ai][0] == '-' && argv[ai][1] == 'q' && argv[ai][2] == 0) {
-            g_quiet = 1;
-        } else {
-            drive = (uint8_t)strtoul(argv[ai], NULL, 0);
+        const char *a = argv[ai];
+        while (*a == '-' || *a == '/') a++;
+        if      (a[0] == 'q' || a[0] == 'Q') g_quiet = 1;
+        else if (a[0] == 't' || a[0] == 'T') g_msdos4_trace = 1;
+        else if (a[0] >= '0' && a[0] <= '9') drive = (uint8_t)strtoul(a, NULL, 0);
+    }
+    /* Also scan PSP command tail directly — Watcom argv parsing can miss
+     * args in CONFIG.SYS INSTALL= context. PSP+0x80 = length, +0x81 = chars. */
+    {
+        uint8_t  __far *cmd_tail = (uint8_t  __far *)MK_FP(_psp, 0x80);
+        uint8_t         len = cmd_tail[0];
+        uint8_t         i;
+        for (i = 0; i < len && i < 64; i++) {
+            char c = (char)cmd_tail[1 + i];
+            if (c == 'q' || c == 'Q') g_quiet = 1;
+            if (c == 't' || c == 'T') g_msdos4_trace = 1;
         }
     }
 
@@ -895,6 +1143,11 @@ int main(int argc, char **argv) {
 
     prev_int2f = _dos_getvect(0x2F);
     _dos_setvect(0x2F, my_int2f_handler);
+
+    if (g_msdos4_trace) {
+        prev_int21 = _dos_getvect(0x21);
+        _dos_setvect(0x21, my_int21_handler);
+    }
 
     fflush(stdout);
 
