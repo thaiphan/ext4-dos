@@ -53,6 +53,10 @@ echo === DIR Y: === >> C:\OUT.TXT
 DIR Y: >> C:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> C:\OUT.TXT
 TYPE Y:\HELLO.TXT >> C:\OUT.TXT
+echo === Multi-file: COPY HELLO+NESTED to BOTH.TXT === >> C:\OUT.TXT
+COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT C:\BOTH.TXT >> C:\OUT.TXT
+echo === TYPE C:\BOTH.TXT (concatenation result) === >> C:\OUT.TXT
+TYPE C:\BOTH.TXT >> C:\OUT.TXT
 echo === Subfunction call counts === >> C:\OUT.TXT
 C:\TSR_CNT.EXE >> C:\OUT.TXT
 echo === FindFirst capture dump === >> C:\OUT.TXT

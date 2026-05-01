@@ -79,14 +79,57 @@ static int              g_fs_ready;
 static uint64_t         g_partition_lba;
 static int              g_quiet;  /* -q: suppress install banner (for CONFIG.SYS INSTALL=) */
 
-/* Single-slot open-file state. M6c2 supports one file at a time, which is
- * sufficient for TYPE / COPY / sequential reads. Multi-open is a polish
- * milestone (would index a small static array via SFT private fields). */
-static struct {
-    int               used;
-    uint32_t          inode_num;
-    struct ext4_inode inode;
-} g_current_open;
+/* Open-file slot table.
+ *
+ * DOS passes us the SFT (system file table entry) pointer in ES:DI on every
+ * Open / Read / Close call. The SFT is the kernel's per-handle bookkeeping
+ * struct — it stays at the same address for the lifetime of an open file
+ * (a different file uses a different SFT entry). We use the (seg, off) of
+ * the SFT as our key into this slot table.
+ *
+ * 8 slots is plenty for typical DOS workloads: COPY uses 2, a compiler
+ * compiling a single file with a couple of #includes uses ~5, etc. The
+ * default DOS FILES=8 limit is the same.
+ *
+ * Lookup is O(N) linear search — at N=8 the search is faster than a hash
+ * computation, and it keeps the code straightforward in an interrupt
+ * context where SS!=DS pitfalls are easy to fall into. */
+#define MAX_OPEN_SLOTS 8
+
+static struct open_slot {
+    uint8_t            used;
+    uint16_t           sft_seg;     /* identity: matches caller's ES on Read/Close */
+    uint16_t           sft_off;     /*           matches caller's DI on Read/Close */
+    uint32_t           inode_num;
+    struct ext4_inode  inode;
+} g_open[MAX_OPEN_SLOTS];
+
+/* Find the slot whose SFT pointer matches (sft_seg:sft_off). Returns
+ * a pointer into g_open, or NULL. */
+static struct open_slot *find_open_slot(uint16_t sft_seg, uint16_t sft_off) {
+    int i;
+    for (i = 0; i < MAX_OPEN_SLOTS; i++) {
+        if (g_open[i].used &&
+            g_open[i].sft_seg == sft_seg &&
+            g_open[i].sft_off == sft_off) {
+            return &g_open[i];
+        }
+    }
+    return (struct open_slot *)0;
+}
+
+/* Allocate a fresh slot for (sft_seg:sft_off). If a slot is already
+ * associated with that SFT pointer (stale state from a previous open
+ * we never saw closed), reuse it. Otherwise pick the first free slot. */
+static struct open_slot *alloc_open_slot(uint16_t sft_seg, uint16_t sft_off) {
+    int i;
+    struct open_slot *existing = find_open_slot(sft_seg, sft_off);
+    if (existing) return existing;
+    for (i = 0; i < MAX_OPEN_SLOTS; i++) {
+        if (!g_open[i].used) return &g_open[i];
+    }
+    return (struct open_slot *)0;
+}
 
 /* Per-subfunction call counter (indexed by AL & 0x3F).
  * Read back via INT 2Fh AX=11FD, BX=our magic, CL=subfunction; returns
@@ -557,11 +600,17 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             r.w.flags &= ~1u;
             return;
 
-        case 0x06: /* Close File */
+        case 0x06: { /* Close File */
+            struct open_slot *slot;
             g_ff_capture.close_call_count++;
-            g_current_open.used = 0;
+            slot = find_open_slot(r.x.es, r.w.di);
+            if (slot) slot->used = 0;
+            /* If no slot matched, the SFT wasn't ours — be lenient and
+             * return success anyway. DOS may close handles in bulk
+             * during process termination. */
             r.w.flags &= ~1u;
             return;
+        }
 
         case 0x15: /* MS-DOS 4 IFS_OPEN — handle-based open */
         case 0x2E: /* MS-DOS 4 Extended Open (issued from FT.IFS_extopen path) */
@@ -571,6 +620,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             uint32_t inode_num;
             int rc_path;
             int dbg_i;
+            struct open_slot *slot;
 
             g_ff_capture.open_call_count++;
             if (!g_fs_ready) {
@@ -596,15 +646,27 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                 r.w.flags |= 1u;
                 return;
             }
-            if (ext4_inode_read(&g_fs, inode_num, &g_current_open.inode) != 0) {
+
+            slot = alloc_open_slot(r.x.es, r.w.di);
+            if (!slot) {
+                /* All MAX_OPEN_SLOTS in use. Return "too many open files"
+                 * (DOS error 4) so callers see a sensible error. */
+                g_ff_capture.last_open_rc = -104;
+                r.w.ax = 4u;            /* ERROR_TOO_MANY_OPEN_FILES */
+                r.w.flags |= 1u;
+                return;
+            }
+            if (ext4_inode_read(&g_fs, inode_num, &slot->inode) != 0) {
                 g_ff_capture.last_open_rc = -103;
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;
                 r.w.flags |= 1u;
                 return;
             }
-            g_current_open.used      = 1;
-            g_current_open.inode_num = inode_num;
-            g_ff_capture.last_open_size = (uint32_t)g_current_open.inode.size;
+            slot->used      = 1;
+            slot->sft_seg   = r.x.es;
+            slot->sft_off   = r.w.di;
+            slot->inode_num = inode_num;
+            g_ff_capture.last_open_size = (uint32_t)slot->inode.size;
             g_ff_capture.last_open_rc = 0;
 
             sft = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
@@ -621,14 +683,14 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                 (uint16_t)(0x8000u | DRIVE_INDEX);
             sft[SFT_FILE_ATTR_OFF] = 0;
             {
-                uint32_t td = unix_to_dos(g_current_open.inode.mtime);
+                uint32_t td = unix_to_dos(slot->inode.mtime);
                 *(uint16_t __far *)(sft + SFT_FILE_TIME_OFF) =
                     (uint16_t)(td & 0xFFFFul);
                 *(uint16_t __far *)(sft + SFT_FILE_DATE_OFF) =
                     (uint16_t)(td >> 16);
             }
             *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF) =
-                (uint32_t)g_current_open.inode.size;
+                (uint32_t)slot->inode.size;
             *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = 0;
 
             /* For AX=6C00h Extended Open dispatch (AL=0x2E), DOS expects
@@ -650,9 +712,11 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             uint16_t buf_seg, buf_off;
             uint32_t pos;
             int actual;
+            struct open_slot *slot;
 
             g_ff_capture.read_call_count++;
-            if (!g_current_open.used) {
+            slot = find_open_slot(r.x.es, r.w.di);
+            if (!slot) {
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;
                 r.w.flags |= 1u;
                 return;
@@ -667,8 +731,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             g_ff_capture.last_read_pos = pos;
             g_ff_capture.last_read_count = r.w.cx;
 
-            actual = read_file_bytes(&g_current_open.inode, pos,
-                                     r.w.cx, user_buf);
+            actual = read_file_bytes(&slot->inode, pos, r.w.cx, user_buf);
             g_ff_capture.last_read_actual = (int16_t)actual;
 
             *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) =

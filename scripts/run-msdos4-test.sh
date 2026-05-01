@@ -99,6 +99,10 @@ echo === DIR Y: === >> A:\OUT.TXT
 DIR Y: >> A:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
+echo === Multi-file: COPY HELLO+NESTED to BOTH.TXT === >> A:\OUT.TXT
+COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT A:\BOTH.TXT >> A:\OUT.TXT
+echo === TYPE A:\BOTH.TXT (concatenation result) === >> A:\OUT.TXT
+TYPE A:\BOTH.TXT >> A:\OUT.TXT
 echo === Subfunction call counts === >> A:\OUT.TXT
 A:\TSR_CNT.EXE >> A:\OUT.TXT
 echo === TSR diagnostic dump === >> A:\OUT.TXT
