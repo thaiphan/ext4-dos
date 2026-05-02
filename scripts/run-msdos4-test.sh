@@ -147,28 +147,27 @@ echo === Remove directory: RD Y:\NEWDIR === >> A:\OUT.TXT
 RD Y:\NEWDIR >> A:\OUT.TXT
 echo === DIR Y: (NEWDIR must be gone, TARGET extended to 2048) === >> A:\OUT.TXT
 DIR Y: >> A:\OUT.TXT
-REM SKIP(MSDOS4): TYPE Y:\VERY~876.TXT and Y:\VERY~EB7.TXT -- 8.3 alias TYPE
-REM produces empty output AND corrupts COMMAND.COM's EXEC path so every
-REM subsequent A:\*.EXE fails with "Cannot execute".  Open (alias-resolved)
-REM and Read paths look clean against SS!=DS audit -- root cause not yet
-REM found.  FreeDOS exercises the alias roundtrip and passes.
+echo === TYPE Y:\VERY~876.TXT (8.3 alias roundtrip) === >> A:\OUT.TXT
+TYPE Y:\VERY~876.TXT >> A:\OUT.TXT
+echo === TYPE Y:\VERY~EB7.TXT (8.3 alias roundtrip) === >> A:\OUT.TXT
+TYPE Y:\VERY~EB7.TXT >> A:\OUT.TXT
 echo === Verify g_fs.sb integrity (canary) === >> A:\OUT.TXT
 A:\EXT4CHK.EXE /V >> A:\OUT.TXT
 echo === Subfunction call counts === >> A:\OUT.TXT
 A:\EXT4CNT.EXE >> A:\OUT.TXT
 echo === FindFirst capture dump === >> A:\OUT.TXT
 A:\EXT4DMP.EXE >> A:\OUT.TXT
-REM SKIP(MSDOS4): AUTO-DETECT path (uninstall then load via `EXT4.EXE` with no
-REM args) loads the TSR successfully -- DIR D: works and the install message
-REM lists "drive D: marked as redirector".  But every A:\*.EXE after that
-REM second install fails with "Cannot execute", including the FDAPM POWEROFF
-REM that shuts down the test.  FreeDOS exercises the auto-detect path and
-REM passes; the difference is some MS-DOS 4-specific memory or state
-REM interaction with a second TSR install in the same session.
+REM Uninstall must be last -- after this Y: drive is gone.
 echo === Uninstall: EXT4 -U === >> A:\OUT.TXT
 A:\EXT4.EXE -u >> A:\OUT.TXT
 echo --- Re-check (should report not-installed) --- >> A:\OUT.TXT
 A:\EXT4CHK.EXE >> A:\OUT.TXT
+echo === AUTO-DETECT (no args) === >> A:\OUT.TXT
+A:\EXT4.EXE >> A:\OUT.TXT
+echo --- Re-check (auto-detect should land on D: = first free slot) --- >> A:\OUT.TXT
+A:\EXT4CHK.EXE >> A:\OUT.TXT
+DIR D: >> A:\OUT.TXT
+A:\EXT4.EXE -u >> A:\OUT.TXT
 echo === DONE === >> A:\OUT.TXT
 A:\FDAPM.COM POWEROFF
 EOF
@@ -226,10 +225,17 @@ if ! grep -q "Hello, ext4-dos!" <<<"$OUT"; then
     echo "FAIL: TYPE Y:\\HELLO.TXT didn't return file content" >&2
     fail=1
 fi
-# SKIP(MSDOS4): 8.3 alias TYPE assertions — alias TYPE is currently in the
-# BAT-level SKIP because it corrupts EXEC.  FreeDOS covers the alias path.
+# 8.3 alias TYPE roundtrip (now passes — was masked by SFT-leak EXEC corruption).
+if ! grep -q "long-named file ONE" <<<"$OUT"; then
+    echo "FAIL: TYPE Y:\\VERY~876.TXT (8.3 alias) didn't return file content" >&2
+    fail=1
+fi
+if ! grep -q "long-named file TWO" <<<"$OUT"; then
+    echo "FAIL: TYPE Y:\\VERY~EB7.TXT (8.3 alias) didn't return file content" >&2
+    fail=1
+fi
 # SKIP(MSDOS4): NEWCOPY content / NEWBIG size / RENAMED size — depend on
-# COPY-to-Y file creation, refused by MS-DOS 4 COMMAND.COM.
+# COPY-to-Y file creation, refused by MS-DOS 4 COMMAND.COM (architectural).
 # MD Y:\NEWDIR — check it appears in the subsequent DIR Y: listing.
 if ! grep -F -A12 'DIR Y: (NEWDIR must appear)' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
     echo "FAIL: Y:\\NEWDIR not visible in DIR Y: after MD" >&2
@@ -270,17 +276,17 @@ if ! grep -F -A12 'DIR Y: (NEWDIR must be gone' <<<"$OUT" | grep -qE "TARGET[[:s
     echo "FAIL: TARGET.TXT not 2048 bytes in DIR Y: after extend" >&2
     fail=1
 fi
-# Static-snapshot check: g_safe_free_blocks_count_lo is captured ONCE at TSR
-# install time (CONFIG.SYS INSTALL=); without an auto-detect re-install
-# (SKIP'd above), DIR Y: keeps reporting the original value.  The actual
-# block consumption from the EXT4WR extend is verified by e2fsck below.
+# Dynamic free-space check: extend consumed exactly one block (1024 bytes).
+# The first DIR Y: reads the install-time snapshot; the last DIR D: comes from
+# the auto-detect re-install which captured a fresh snapshot reflecting the
+# write.  So FINAL == INIT - 1024.
 INIT_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | head -1 | sed 's/ bytes free//' | tr -d ',' || true)
 FINAL_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | tail -1 | sed 's/ bytes free//' | tr -d ',' || true)
 if [[ -z "${INIT_FREE:-}" || -z "${FINAL_FREE:-}" ]]; then
     echo "FAIL: couldn't parse 'bytes free' lines from DIR output" >&2
     fail=1
-elif (( FINAL_FREE != INIT_FREE )); then
-    echo "FAIL: 'bytes free' snapshot drifted (init=${INIT_FREE} final=${FINAL_FREE}) — install-time snapshot should be stable" >&2
+elif (( FINAL_FREE != INIT_FREE - 1024 )); then
+    echo "FAIL: 'bytes free' wrong (expected $((INIT_FREE - 1024)), got ${FINAL_FREE}) — extend may not be consuming a fs block" >&2
     fail=1
 fi
 if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then

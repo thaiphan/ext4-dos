@@ -1306,12 +1306,27 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
 
         case 0x06: { /* Close File */
             struct open_slot *slot;
+            uint8_t __far    *sft;
             g_ff_capture.close_call_count++;
             slot = find_open_slot(r.x.es, r.w.di);
             if (slot) slot->used = 0;
-            /* If no slot matched, the SFT wasn't ours — be lenient and
-             * return success anyway. DOS may close handles in bulk
-             * during process termination. */
+            /* For network/redirector SFTs, neither MS-DOS 4 (CLOSE.ASM:noshare)
+             * nor FreeDOS (dosfns.c:721) decrements sf_ref_count for us — they
+             * just call REM_CLOSE and return.  We must zero ref_count here
+             * ourselves so the SFT entry is released back to the pool.
+             * Without this, every TYPE Y:\... leaks one SFT slot; after FILES=
+             * worth of opens the pool fills up, EXEC fails with error 4
+             * ("too many open files") which COMMAND.COM maps to the catch-all
+             * "Cannot execute" message.  The leak was masked on FreeDOS by
+             * its higher default FILES= but consistently broke MS-DOS 4 after
+             * the 4th open in a session.
+             * If no slot matched, the SFT wasn't ours — leave ref_count alone
+             * and return success (DOS may close handles in bulk during process
+             * termination). */
+            if (slot) {
+                sft = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+                *(uint16_t __far *)(sft + SFT_REF_COUNT_OFF) = 0u;
+            }
             r.w.flags &= ~1u;
             return;
         }
