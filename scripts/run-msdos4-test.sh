@@ -11,7 +11,8 @@ DOS_DIR="build/dos"
 MSDOS4_DIR="tests/msdos4"
 SOURCE_IMG="${MSDOS4_SRC:-tests/msdos4/msdos4-source.img}"
 TEST_IMG="$MSDOS4_DIR/test.img"
-EXT4_IMG="tests/images/disk.img"
+EXT4_SRC_IMG="tests/images/disk.img"
+EXT4_IMG="$MSDOS4_DIR/test-ext4.img"   # working copy — writes don't mutate the source
 WAIT_SECONDS="${WAIT_SECONDS:-30}"
 
 if ! command -v dosbox-x >/dev/null 2>&1; then
@@ -23,8 +24,8 @@ if [[ ! -f "$SOURCE_IMG" ]]; then
     echo "  Set MSDOS4_SRC=<path> to override." >&2
     exit 1
 fi
-if [[ ! -f "$EXT4_IMG" ]]; then
-    echo "ERROR: $EXT4_IMG not found. Run: make fixture-partitioned" >&2
+if [[ ! -f "$EXT4_SRC_IMG" ]]; then
+    echo "ERROR: $EXT4_SRC_IMG not found. Run: make fixture-partitioned" >&2
     exit 1
 fi
 for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe; do
@@ -36,6 +37,7 @@ done
 
 mkdir -p "$MSDOS4_DIR"
 cp "$SOURCE_IMG" "$TEST_IMG"
+cp "$EXT4_SRC_IMG" "$EXT4_IMG"
 
 # ============================================================================
 # MS-DOS 4 status: full DIR + TYPE working end-to-end.
