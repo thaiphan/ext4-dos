@@ -780,6 +780,33 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
         return;
     }
 
+    /* Uninstall probe — AX=11FB, BX=magic. Restores the prev INT 2Fh
+     * vector, clears the CDS flags so DOS stops dispatching to drive Y:,
+     * and returns our resident PSP segment in SI so the caller can free
+     * the memory via INT 21h AH=49h. The actual MCB free has to happen
+     * from outside our handler (we'd be running in the freed memory
+     * otherwise), so the user-side `ext4 -u` command does both halves:
+     * it issues this probe and then frees PSP+env from its own context.
+     * Returns AL=0xFF on success, AL=0 if a different handler is now
+     * head of the INT 2Fh chain (someone hooked after us — refusing to
+     * unhook prevents trampling another TSR's vector). */
+    if (r.w.ax == 0x11FBu && r.w.bx == EXT4_DOS_MAGIC_PROBE) {
+        void (__interrupt __far *current_2f)(void) = _dos_getvect(0x2F);
+        if (FP_SEG(current_2f) != FP_SEG(my_int2f_handler) ||
+            FP_OFF(current_2f) != FP_OFF(my_int2f_handler)) {
+            r.h.al = 0;
+            r.w.flags |= 1u;
+            return;
+        }
+        _dos_setvect(0x2F, prev_int2f);
+        if (g_cds_entry) {
+            *(uint16_t __far *)(g_cds_entry + CDS_OFF_FLAGS) = 0;
+        }
+        r.w.si = _psp;
+        r.h.al = 0xFFu;
+        return;
+    }
+
     /* Snapshot probe — AX=11EF, BX=magic. Returns lo16 of the
      * install-time `_DATA`-segment snapshots; AL=0xFF on success.
      * Used by ext4chk /V together with the canary above. */
@@ -1350,20 +1377,94 @@ static int mount_ext4(uint8_t drive) {
     return 0;
 }
 
+/* Issue the uninstall probe to a resident TSR and free its memory.
+ * Returns 0 on success, non-zero with a printed reason on failure.
+ *
+ * Sequence: probe to confirm install -> probe AX=11FB to restore the
+ * INT 2Fh vector and clear our CDS flag (the resident does this part
+ * because vector restore is naturally atomic from inside the handler) ->
+ * read the resident's env-block segment from PSP+0x2C -> free both
+ * blocks via INT 21h AH=49h. The two AH=49h calls have to happen from
+ * outside the resident — we'd be unmapping our own code if we tried to
+ * free from the handler. */
+static int do_uninstall(void) {
+    union REGS  r;
+    struct SREGS s;
+    uint16_t resident_psp;
+    uint16_t env_seg;
+
+    /* Confirm install. */
+    r.w.ax = 0x1100u;
+    r.w.bx = EXT4_DOS_MAGIC_PROBE;
+    int86(0x2F, &r, &r);
+    if (r.h.al != 0xFFu || r.w.bx != EXT4_DOS_MAGIC_REPLY) {
+        printf("ext4-dos not installed\n");
+        return 1;
+    }
+
+    /* Tell resident to unhook itself. Returns SI = its PSP segment. */
+    r.w.ax = 0x11FBu;
+    r.w.bx = EXT4_DOS_MAGIC_PROBE;
+    int86(0x2F, &r, &r);
+    if (r.h.al != 0xFFu) {
+        printf("ext4-dos refused to unhook (another TSR is now on top of\n"
+               "the INT 2Fh chain — unload that one first, then retry)\n");
+        return 2;
+    }
+    resident_psp = r.w.si;
+
+    /* Env block segment lives at resident PSP+0x2C (DOS PSP convention).
+     * If it's zero, the env was already freed at exec time. */
+    env_seg = *(uint16_t __far *)MK_FP(resident_psp, 0x2C);
+
+    /* Free env block first (it may be a separate MCB). */
+    if (env_seg != 0u) {
+        r.h.ah = 0x49u;
+        segread(&s);
+        s.es = env_seg;
+        intdosx(&r, &r, &s);
+        /* Don't fail on env-free errors — env may have been auto-freed. */
+    }
+
+    /* Free resident's main MCB (the PSP segment). After this returns,
+     * the resident's code/data is officially free DOS memory. */
+    r.h.ah = 0x49u;
+    segread(&s);
+    s.es = resident_psp;
+    intdosx(&r, &r, &s);
+    if (r.x.cflag) {
+        printf("ext4-dos unhooked but freeing resident memory failed "
+               "(AX=%04x). Drive Y: is no longer redirected, but the "
+               "memory is still allocated. A reboot will clean it up.\n",
+               r.w.ax);
+        return 3;
+    }
+
+    printf("ext4-dos uninstalled\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     uint8_t drive = 0x81;
     char err[100];
     int ai;
+    int uninstall = 0;
 
-    /* Parse args: [-q] [drive_num]. -q suppresses install banner (used
-     * by CONFIG.SYS INSTALL= so the boot screen stays clean). Lenient
-     * about leading dash/slash since MS-DOS 4 INSTALL= flattens args
-     * differently from a normal exec. */
+    /* Parse args: [-q] [-u] [drive_num].
+     *   -q : suppress install banner (used by CONFIG.SYS INSTALL=)
+     *   -u : uninstall mode — unhook a resident copy and free its memory
+     * Lenient about leading dash/slash since MS-DOS 4 INSTALL= flattens
+     * args differently from a normal exec. */
     for (ai = 1; ai < argc; ai++) {
         const char *a = argv[ai];
         while (*a == '-' || *a == '/') a++;
         if      (a[0] == 'q' || a[0] == 'Q') g_quiet = 1;
+        else if (a[0] == 'u' || a[0] == 'U') uninstall = 1;
         else if (a[0] >= '0' && a[0] <= '9') drive = (uint8_t)strtoul(a, NULL, 0);
+    }
+
+    if (uninstall) {
+        return do_uninstall();
     }
 
     if (hook_cds() != 0) {

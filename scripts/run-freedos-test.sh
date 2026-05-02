@@ -76,6 +76,11 @@ echo === Subfunction call counts === >> C:\OUT.TXT
 C:\EXT4CNT.EXE >> C:\OUT.TXT
 echo === FindFirst capture dump === >> C:\OUT.TXT
 C:\EXT4DMP.EXE >> C:\OUT.TXT
+REM Uninstall must be last — after this Y: drive is gone.
+echo === Uninstall: EXT4 -U === >> C:\OUT.TXT
+C:\EXT4.EXE -u >> C:\OUT.TXT
+echo --- Re-check (should report not-installed) --- >> C:\OUT.TXT
+C:\EXT4CHK.EXE >> C:\OUT.TXT
 echo === DONE === >> C:\OUT.TXT
 fdapm poweroff
 EOF
@@ -149,6 +154,16 @@ fi
 # Read-only enforcement: HELLO.TXT must survive the DEL attempt.
 if ! grep -A2 "HELLO.TXT must still be there" <<<"$OUT" | grep -q "HELLO"; then
     echo "FAIL: read-only enforcement may have allowed DEL Y:\\HELLO.TXT" >&2
+    fail=1
+fi
+# Uninstall: TSR should report success and the post-uninstall ext4chk
+# should report TSR-not-detected.
+if ! grep -q "ext4-dos uninstalled" <<<"$OUT"; then
+    echo "FAIL: ext4 -u didn't report uninstalled" >&2
+    fail=1
+fi
+if ! grep -A4 "Re-check" <<<"$OUT" | grep -q "TSR not detected"; then
+    echo "FAIL: TSR still detected after ext4 -u" >&2
     fail=1
 fi
 exit $fail

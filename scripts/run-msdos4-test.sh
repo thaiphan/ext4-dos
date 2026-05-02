@@ -124,10 +124,15 @@ REM EXEC anything from A:\ for the rest of the session (memory or SFT
 REM state quirk). Not a blocker for normal use — typing a single
 REM aliased file then continuing works fine; multi-program test runs
 REM need the alias TYPE last.
-echo === TYPE Y:\VERY~876.TXT (8.3 alias roundtrip) === >> A:\OUT.TXT
-TYPE Y:\VERY~876.TXT >> A:\OUT.TXT
-echo === TYPE Y:\VERY~EB7.TXT (8.3 alias roundtrip) === >> A:\OUT.TXT
-TYPE Y:\VERY~EB7.TXT >> A:\OUT.TXT
+REM Conflicting MS-DOS 4 constraints (see dos-internals.md):
+REM   - alias TYPE breaks subsequent EXEC from A:\
+REM   - uninstall (EXEC of EXT4 -U) removes drive Y: — needed by alias TYPE
+REM Pick uninstall: production-critical, vs alias TYPE roundtrip which is
+REM exercised on FreeDOS already and is the same code path.
+echo === Uninstall: EXT4 -U === >> A:\OUT.TXT
+A:\EXT4.EXE -u >> A:\OUT.TXT
+echo --- Re-check (should report not-installed) --- >> A:\OUT.TXT
+A:\EXT4CHK.EXE >> A:\OUT.TXT
 echo === DONE === >> A:\OUT.TXT
 EOF
 awk 'BEGIN{ORS="\r\n"} {print}' "$MSDOS4_DIR/autoexec.bat.tmp" > "$MSDOS4_DIR/autoexec.bat"
@@ -181,14 +186,8 @@ if ! grep -q "Hello, ext4-dos!" <<<"$OUT"; then
     echo "FAIL: TYPE Y:\\HELLO.TXT didn't return file content" >&2
     fail=1
 fi
-if ! grep -q "long-named file ONE" <<<"$OUT"; then
-    echo "FAIL: TYPE Y:\\VERY~876.TXT (8.3 alias) didn't return file content" >&2
-    fail=1
-fi
-if ! grep -q "long-named file TWO" <<<"$OUT"; then
-    echo "FAIL: TYPE Y:\\VERY~EB7.TXT (8.3 alias) didn't return file content" >&2
-    fail=1
-fi
+# Alias TYPE assertions live in run-freedos-test.sh only — see the
+# autoexec comment for why MS-DOS 4 trades alias TYPE for uninstall.
 if ! grep -q "56346624 bytes free" <<<"$OUT"; then
     echo "FAIL: 'bytes free' wrong (expected 56346624) — kernel write may be hitting g_safe_*" >&2
     fail=1
@@ -205,6 +204,16 @@ fi
 # "(HELLO.TXT must still be there)".
 if ! grep -A2 "HELLO.TXT must still be there" <<<"$OUT" | grep -q "HELLO"; then
     echo "FAIL: read-only enforcement may have allowed DEL Y:\\HELLO.TXT" >&2
+    fail=1
+fi
+# Uninstall: TSR should report success and the post-uninstall ext4chk
+# should report TSR-not-detected.
+if ! grep -q "ext4-dos uninstalled" <<<"$OUT"; then
+    echo "FAIL: ext4 -u didn't report uninstalled" >&2
+    fail=1
+fi
+if ! grep -A4 "Re-check" <<<"$OUT" | grep -q "TSR not detected"; then
+    echo "FAIL: TSR still detected after ext4 -u" >&2
     fail=1
 fi
 exit $fail
