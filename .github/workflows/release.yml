@@ -49,13 +49,21 @@ jobs:
         id: stage
         run: |
           mkdir -p release
-          cp build/dos/*.exe release/
+          cp build/dos/ext4.exe release/
+          zip release/ext4-devtools.zip \
+            build/dos/ext4cli.exe \
+            build/dos/ext4chk.exe \
+            build/dos/ext4dir.exe \
+            build/dos/ext4cnt.exe \
+            build/dos/ext4dmp.exe \
+            build/dos/ext4wr.exe
           ls -la release/
-          echo "files=release/*.exe" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/*.exe
+          files: |
+            release/ext4.exe
+            release/ext4-devtools.zip
           generate_release_notes: true
           fail_on_unmatched_files: true

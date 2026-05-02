@@ -2368,6 +2368,30 @@ int main(int argc, char **argv) {
             const char *f = a + 1;
             if      (f[0] == 'q' || f[0] == 'Q') g_quiet = 1;
             else if (f[0] == 'u' || f[0] == 'U') uninstall = 1;
+            else if (f[0] == 'h' || f[0] == 'H' || f[0] == '?') {
+                printf("ext4-dos TSR -- mounts an ext4 partition as a DOS drive\n"
+                       "\n"
+                       "Usage: EXT4 [options] [drive_num] [X:]\n"
+                       "\n"
+                       "  drive_num   BIOS hard-disk number (e.g. 0x81).\n"
+                       "              If omitted, scans 0x80..0x83 for the\n"
+                       "              first ext4 partition.\n"
+                       "  X:          Drive letter to mount under (e.g. Z:).\n"
+                       "              If omitted, auto-picks the first free\n"
+                       "              CDS slot (D: or later).\n"
+                       "\n"
+                       "Options:\n"
+                       "  -q          Suppress install banner (for CONFIG.SYS\n"
+                       "              INSTALL= lines).\n"
+                       "  -u          Uninstall the TSR.\n"
+                       "  -h, /?      Show this help.\n"
+                       "\n"
+                       "Examples:\n"
+                       "  EXT4             Auto-detect disk and drive letter.\n"
+                       "  EXT4 0x81 E:     Use second hard disk, mount as E:.\n"
+                       "  EXT4 -u          Uninstall.\n");
+                return 0;
+            }
         } else if (a[0] >= '0' && a[0] <= '9') {
             drive = (uint8_t)strtoul(a, NULL, 0);
             drive_specified = 1;

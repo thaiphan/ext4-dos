@@ -111,36 +111,60 @@ echo === FindFirst Y: (raw INT 21h) === >> A:\OUT.TXT
 A:\EXT4DIR.EXE >> A:\OUT.TXT
 echo === DIR Y: === >> A:\OUT.TXT
 DIR Y: >> A:\OUT.TXT
+REM SKIP(MSDOS4): DIR Y:\*.TXT wildcard returns no entries on MS-DOS 4 -- our
+REM FindFirst pattern-matching path doesn't engage here.  Tracked separately;
+REM FreeDOS exercises the same path and works.  Leaving the call so a future
+REM fix can be verified against the same OUT.TXT layout.
 echo === DIR Y:\*.TXT (wildcard) === >> A:\OUT.TXT
 DIR Y:\*.TXT >> A:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
-REM SKIP(MSDOS4): ext4wr, file creation via COPY, multi-block COPY — any file-create write to Y: via
-REM our redirector corrupts MS-DOS 4's EXEC path (Cannot execute A:\*.EXE for
-REM the rest of the session). Same root class as the 8.3 alias TYPE quirk.
-REM Confirmed empirically; root cause not fully diagnosed. FreeDOS covers all.
+REM SKIP(MSDOS4): COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT A:\BOTH.TXT --
+REM MS-DOS 4 COPY opens the remote file (AL=0x2E) but never calls our AL=0x08
+REM REM_READ; it uses some other read path we don't claim.  BOTH.TXT comes out
+REM empty.  Same applies to the multi-block COPY Y:\TARGET.TXT A:\NEWBIG.TXT.
+echo === Write test: Y:\TARGET.TXT before === >> A:\OUT.TXT
+TYPE Y:\TARGET.TXT >> A:\OUT.TXT
+echo --- run ext4wr (in-place B + extend C) --- >> A:\OUT.TXT
+A:\EXT4WR.EXE >> A:\OUT.TXT
+echo === Y:\TARGET.TXT after write (expect 'B'*1024 + 'C'*1024) === >> A:\OUT.TXT
+TYPE Y:\TARGET.TXT >> A:\OUT.TXT
+REM SKIP(MSDOS4): DIR Y:\TARGET.TXT shows volume header only on MS-DOS 4 --
+REM single-file DIR doesn't list the entry.  Verify size via the normal DIR Y:
+REM listing further down instead.
+REM SKIP(MSDOS4): COPY A:\... Y:\... (file creation on Y: via COPY) -- MS-DOS 4
+REM COMMAND.COM refuses writes to remote drives at the OS level (returns
+REM "0 File(s) copied"), so NEWCOPY.TXT/NEWBIG.TXT/RENAMED.TXT/DEL all hit
+REM that wall.  File creation on Y: is reachable only via direct INT 21h
+REM (which is what ext4wr does).
 echo === Make directory: MD Y:\NEWDIR === >> A:\OUT.TXT
 MD Y:\NEWDIR >> A:\OUT.TXT
 REM Under MS-DOS 4, DIR Y:\NEWDIR lists the *contents* of NEWDIR,
-REM not NEWDIR itself in Y:\. Use DIR Y: so the entry is visible.
-echo === DIR Y: after MD (NEWDIR must appear) === >> A:\OUT.TXT
+REM not NEWDIR itself in Y:\.  Use DIR Y: so the entry is visible.
+echo === DIR Y: (NEWDIR must appear) === >> A:\OUT.TXT
 DIR Y: >> A:\OUT.TXT
-echo === DEL/RD must still FAIL (no unlink/rmdir yet) === >> A:\OUT.TXT
-echo --- DEL Y:\HELLO.TXT --- >> A:\OUT.TXT
-DEL Y:\HELLO.TXT >> A:\OUT.TXT
-echo --- RD Y:\NEWDIR --- >> A:\OUT.TXT
+echo === Remove directory: RD Y:\NEWDIR === >> A:\OUT.TXT
 RD Y:\NEWDIR >> A:\OUT.TXT
-echo --- (HELLO.TXT must still be there) --- >> A:\OUT.TXT
-DIR Y:\HELLO.TXT >> A:\OUT.TXT
-REM SKIP(MSDOS4): 8.3 alias roundtrip omitted — TYPE via alias breaks
-REM subsequent A:\ EXEC (same MS-DOS 4 quirk; covered by FreeDOS test).
+echo === DIR Y: (NEWDIR must be gone, TARGET extended to 2048) === >> A:\OUT.TXT
+DIR Y: >> A:\OUT.TXT
+REM SKIP(MSDOS4): TYPE Y:\VERY~876.TXT and Y:\VERY~EB7.TXT -- 8.3 alias TYPE
+REM produces empty output AND corrupts COMMAND.COM's EXEC path so every
+REM subsequent A:\*.EXE fails with "Cannot execute".  Open (alias-resolved)
+REM and Read paths look clean against SS!=DS audit -- root cause not yet
+REM found.  FreeDOS exercises the alias roundtrip and passes.
 echo === Verify g_fs.sb integrity (canary) === >> A:\OUT.TXT
 A:\EXT4CHK.EXE /V >> A:\OUT.TXT
 echo === Subfunction call counts === >> A:\OUT.TXT
 A:\EXT4CNT.EXE >> A:\OUT.TXT
-echo === TSR diagnostic dump === >> A:\OUT.TXT
+echo === FindFirst capture dump === >> A:\OUT.TXT
 A:\EXT4DMP.EXE >> A:\OUT.TXT
-REM SKIP(MSDOS4): auto-detect omitted — loaded via CONFIG.SYS INSTALL=.
+REM SKIP(MSDOS4): AUTO-DETECT path (uninstall then load via `EXT4.EXE` with no
+REM args) loads the TSR successfully -- DIR D: works and the install message
+REM lists "drive D: marked as redirector".  But every A:\*.EXE after that
+REM second install fails with "Cannot execute", including the FDAPM POWEROFF
+REM that shuts down the test.  FreeDOS exercises the auto-detect path and
+REM passes; the difference is some MS-DOS 4-specific memory or state
+REM interaction with a second TSR install in the same session.
 echo === Uninstall: EXT4 -U === >> A:\OUT.TXT
 A:\EXT4.EXE -u >> A:\OUT.TXT
 echo --- Re-check (should report not-installed) --- >> A:\OUT.TXT
@@ -195,38 +219,77 @@ if [[ -z "$OUT" ]]; then
 fi
 echo "$OUT"
 
-# Assertions — mirror run-freedos-test.sh; skips noted inline.
+# Assertions — mirror run-freedos-test.sh; remaining MS-DOS 4 sync gaps are
+# marked SKIP(MSDOS4) inline with the reason.
 fail=0
 if ! grep -q "Hello, ext4-dos!" <<<"$OUT"; then
     echo "FAIL: TYPE Y:\\HELLO.TXT didn't return file content" >&2
     fail=1
 fi
-# SKIP(MSDOS4): long-name alias roundtrip — see BAT comment.
-# SKIP(MSDOS4): writes are skipped, so free space won't change; just verify
-# the DIR output produced a valid "bytes free" line (mkfs-version-agnostic).
-if ! grep -qE '[0-9]+ bytes free' <<<"$OUT"; then
-    echo "FAIL: 'bytes free' not found in DIR output" >&2
+# SKIP(MSDOS4): 8.3 alias TYPE assertions — alias TYPE is currently in the
+# BAT-level SKIP because it corrupts EXEC.  FreeDOS covers the alias path.
+# SKIP(MSDOS4): NEWCOPY content / NEWBIG size / RENAMED size — depend on
+# COPY-to-Y file creation, refused by MS-DOS 4 COMMAND.COM.
+# MD Y:\NEWDIR — check it appears in the subsequent DIR Y: listing.
+if ! grep -F -A12 'DIR Y: (NEWDIR must appear)' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
+    echo "FAIL: Y:\\NEWDIR not visible in DIR Y: after MD" >&2
+    fail=1
+fi
+# RD Y:\NEWDIR — must be absent from the subsequent DIR Y: listing.
+if grep -F -A12 'DIR Y: (NEWDIR must be gone' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
+    echo "FAIL: Y:\\NEWDIR still visible after RD" >&2
+    fail=1
+fi
+# Write test: ext4wr reports both writes, and the post-write TYPE shows
+# 'B' followed by 'C' (no 'A' left).  DOS TYPE doesn't emit a trailing
+# newline so the next echo line concatenates; pattern-match for 100+
+# consecutive each of 'B' and 'C', and no 'A'.
+if ! grep -q "In-place wrote 1024 bytes" <<<"$OUT"; then
+    echo "FAIL: ext4wr didn't report in-place 1024 bytes written" >&2
+    fail=1
+fi
+if ! grep -q "Extend wrote 1024 bytes" <<<"$OUT"; then
+    echo "FAIL: ext4wr didn't report extend 1024 bytes written" >&2
+    fail=1
+fi
+WRITE_AFTER=$(grep -F -A1 'Y:\TARGET.TXT after write (expect' <<<"$OUT" | tail -1)
+if ! grep -qE 'B{100}' <<<"$WRITE_AFTER"; then
+    echo "FAIL: TARGET.TXT after write missing 100+ consecutive 'B' bytes" >&2
+    fail=1
+fi
+if ! grep -qE 'C{100}' <<<"$WRITE_AFTER"; then
+    echo "FAIL: TARGET.TXT after write missing 100+ consecutive 'C' bytes (extend not applied)" >&2
+    fail=1
+fi
+if grep -qE 'A{100}' <<<"$WRITE_AFTER"; then
+    echo "FAIL: TARGET.TXT after write still has 100+ consecutive 'A' bytes" >&2
+    fail=1
+fi
+# DIR Y: after writes must show TARGET sized 2048 (the extend bumped it).
+if ! grep -F -A12 'DIR Y: (NEWDIR must be gone' <<<"$OUT" | grep -qE "TARGET[[:space:]]+TXT[[:space:]]+2[,]?048"; then
+    echo "FAIL: TARGET.TXT not 2048 bytes in DIR Y: after extend" >&2
+    fail=1
+fi
+# Static-snapshot check: g_safe_free_blocks_count_lo is captured ONCE at TSR
+# install time (CONFIG.SYS INSTALL=); without an auto-detect re-install
+# (SKIP'd above), DIR Y: keeps reporting the original value.  The actual
+# block consumption from the EXT4WR extend is verified by e2fsck below.
+INIT_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | head -1 | sed 's/ bytes free//' | tr -d ',' || true)
+FINAL_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | tail -1 | sed 's/ bytes free//' | tr -d ',' || true)
+if [[ -z "${INIT_FREE:-}" || -z "${FINAL_FREE:-}" ]]; then
+    echo "FAIL: couldn't parse 'bytes free' lines from DIR output" >&2
+    fail=1
+elif (( FINAL_FREE != INIT_FREE )); then
+    echo "FAIL: 'bytes free' snapshot drifted (init=${INIT_FREE} final=${FINAL_FREE}) — install-time snapshot should be stable" >&2
     fail=1
 fi
 if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
     echo "FAIL: g_fs.sb integrity canary tripped" >&2
     fail=1
 fi
-# SKIP(MSDOS4): write test, file creation via COPY, multi-block COPY assertions
-# — any file-create write to Y: corrupts MS-DOS 4's EXEC path; all covered by
-# FreeDOS test.
-# MD Y:\NEWDIR — check it appears in the subsequent DIR Y: listing.
-if ! grep -F -A12 'DIR Y: after MD' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
-    echo "FAIL: Y:\\NEWDIR not visible in DIR Y: after MD" >&2
-    fail=1
-fi
-# Read-only enforcement: HELLO.TXT must survive DEL.
-if ! grep -A2 "HELLO.TXT must still be there" <<<"$OUT" | grep -q "HELLO"; then
-    echo "FAIL: read-only enforcement may have allowed DEL Y:\\HELLO.TXT" >&2
-    fail=1
-fi
-# SKIP(MSDOS4): wildcard DIR assertion — format differs; covered by FreeDOS.
-# Uninstall.
+# SKIP(MSDOS4): wildcard DIR Y:\*.TXT assertion — call returns no entries;
+# pattern-matching path doesn't engage.  Tracked separately.
+# Uninstall + auto-detect (mirrors FreeDOS).
 if ! grep -q "ext4-dos uninstalled" <<<"$OUT"; then
     echo "FAIL: ext4 -u didn't report uninstalled" >&2
     fail=1
@@ -235,7 +298,6 @@ if ! grep -A4 "Re-check" <<<"$OUT" | grep -q "TSR not detected"; then
     echo "FAIL: TSR still detected after ext4 -u" >&2
     fail=1
 fi
-# SKIP(MSDOS4): auto-detect check — CONFIG.SYS load path differs.
 
 # e2fsck-clean after all writes.
 E2FSCK="$(command -v e2fsck || true)"
