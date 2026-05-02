@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# SYNC: Keep this script in sync with scripts/run-msdos4-test.sh and
-# scripts/run-msdos6-test.sh.  When adding a new test here, port it to both.
-# Known skips are marked "# SKIP(MSDOS4):" and "# SKIP(MSDOS6):" in those scripts.
+# SYNC: Keep this script in sync with scripts/run-msdos4-test.sh.
+# When adding a new test here, port it there too.  Known MS-DOS 4 skips
+# are marked with "# SKIP(MSDOS4):" in that script.
 #
 # Boots a fresh copy of the FreeDOS LiteUSB image with our TSR + test
 # binaries injected, runs the tests via FDAUTO.BAT, then reads the

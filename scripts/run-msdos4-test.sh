@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# SYNC: Keep this script in sync with scripts/run-freedos-test.sh and
-# scripts/run-msdos6-test.sh.  When run-freedos-test.sh gains a new test,
-# port it here and either add the test or mark it "# SKIP(MSDOS4): <reason>".
+# SYNC: Keep this script in sync with scripts/run-freedos-test.sh.
+# When run-freedos-test.sh gains a new test, port it here and either add
+# the test or mark it with "# SKIP(MSDOS4): <reason>".
 #
 # Boot Microsoft's open-source MS-DOS 4.0 (April 2024) bootable floppy in
 # DOSBox-X with our TSR + ext4 test fixture attached. Exercises the same

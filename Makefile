@@ -70,7 +70,7 @@ TSR_OBJ := \
 
 vpath %.c tools src/blockdev src/ext4 src/partition src/util
 
-.PHONY: all host-build dos-build host-test dos-test fixtures fixture fixture-partitioned clean msdos6-image
+.PHONY: all host-build dos-build host-test dos-test fixtures fixture fixture-partitioned clean
 
 all: host-build
 
@@ -229,14 +229,6 @@ freedos-test: dos-build tests/freedos/FD14LITE.img
 
 msdos4-test: dos-build tests/freedos/FD14LITE.img
 	@bash scripts/run-msdos4-test.sh
-
-msdos6-image: tests/msdos6/msdos6-source.img
-
-tests/msdos6/msdos6-source.img:
-	@bash scripts/setup-msdos6.sh
-
-msdos6-test: dos-build tests/freedos/FD14LITE.img tests/msdos6/msdos6-source.img
-	@bash scripts/run-msdos6-test.sh
 
 fixtures: fixture fixture-partitioned
 fixture:             tests/images/small.img
