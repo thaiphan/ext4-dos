@@ -31,6 +31,17 @@ A lot of what made this project work is folklore — undocumented DOS quirks, re
 
 Builds for every push are also available from the [Actions](../../actions) tab under the `dosix-binaries` artifact (auth required).
 
+### Debugging the TSR's interaction with the DOS kernel
+
+Several of the trickier bugs we hit needed a real CPU debugger — interactive `BPM` watchpoints and single-step into MS-DOS 4 kernel code. To reproduce that workflow:
+
+```sh
+bash scripts/setup-debugger.sh    # one-off, ~10 min: clones DOSBox-X, builds with --enable-heavy-debug
+bash scripts/run-msdos4-debug.sh  # boots MS-DOS 4 in the heavy debugger
+```
+
+The setup script pins to a specific upstream DOSBox-X commit so the build is reproducible. Skip if you'll only ever run the smoke tests.
+
 ## Why
 
 Existing DOS-side ext support is ext2-era. Modern Linux disks use ext4-specific features — extent trees, htree directories, the journal, metadata checksums — that older tools don't understand and silently misread. This project aims to do it right, or refuse cleanly when it can't.

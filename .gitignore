@@ -14,6 +14,9 @@ dist/
 # Vendored references (clones of lwext4 / grub for reading; not committed)
 references/
 
+# Heavy-debug DOSBox-X clone, populated by scripts/setup-debugger.sh
+external/
+
 # Test fixture images (regenerable from scripts/)
 tests/images/*.img
 tests/images/*.ext4
