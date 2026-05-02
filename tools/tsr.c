@@ -79,6 +79,30 @@ static int              g_fs_ready;
 static uint64_t         g_partition_lba;
 static int              g_quiet;  /* -q: suppress install banner (for CONFIG.SYS INSTALL=) */
 
+/* Snapshot of critical superblock fields, taken at install time.
+ *
+ * These are NON-ZERO-INITIALIZED on purpose — that places them in the
+ * _DATA segment (low DGROUP offsets) instead of _BSS (high offsets,
+ * 0x81C+). Some MS-DOS 4 code path writes to a fixed offset in our DS
+ * around 0x8AA — likely a stale far pointer pointing at our segment with
+ * a kernel-side scratch-buffer offset. The corruption silently clobbers
+ * whatever sb field happens to live there (block_size, free_blocks_count,
+ * etc.), making subsequent ext4 reads or GetDiskSpace replies break.
+ *
+ * Reading from these snapshots in the GetDiskSpace handler keeps that
+ * reply stable even when the live sb has been corrupted.
+ *
+ * Zeroing curdir_ifs_hdr in hook_cds() killed the FIRST corruption path
+ * (block_size's high word — see earlier commit). This is a residual path
+ * we haven't fully traced. The DOSBox-X heavy-debugger trap shows MS-DOS 4
+ * kernel code at CS=0F30 doing FAT time/date encoder writes through our
+ * DS at offset 0x8AA/0x8AC. */
+static uint32_t g_safe_block_size           = 1u;
+static uint32_t g_safe_blocks_count_lo      = 1u;
+static uint32_t g_safe_blocks_count_hi      = 1u;
+static uint32_t g_safe_free_blocks_count_lo = 1u;
+static uint32_t g_safe_free_blocks_count_hi = 1u;
+
 /* Open-file slot table.
  *
  * DOS passes us the SFT (system file table entry) pointer in ES:DI on every
@@ -819,38 +843,30 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                 return;
             }
 
-            bs = g_fs.sb.block_size;
-            blocks_total = (uint32_t)g_fs.sb.blocks_count;
-            blocks_free  = (uint32_t)g_fs.sb.free_blocks_count;
+            /* Read from the install-time snapshot rather than g_fs.sb —
+             * see comment near g_safe_block_size definition. */
+            bs           = g_safe_block_size;
+            blocks_total = g_safe_blocks_count_lo;
+            blocks_free  = g_safe_free_blocks_count_lo;
             spc = (uint16_t)(bs / 512u);
             if (spc == 0u) spc = 1u;
 
-            /* Two-phase strategy:
+            /* Scale spc up if either count overflows 16 bits, then clamp.
+             * Cap spc at 64 — beyond that DOS apps may stumble on >32 KB
+             * clusters. Total rounds up (avoid claiming non-existent
+             * space), free rounds down (conservative).
              *
-             *   1. If blocks_total <= 0x18000 (1.5 × 65536), just truncate
-             *      to fit 16 bits. Loses at most ~50% of the count, but
-             *      empirically MS-DOS 4 DIR's "bytes free" display
-             *      misbehaves when spc is scaled up (returns garbage like
-             *      ~2 GB for a 64 MB disk). FreeDOS handles either path
-             *      correctly. For our typical small-disk test fixtures
-             *      (≤96 MB), truncation is the path that keeps both DOSes
-             *      happy.
-             *
-             *   2. For genuinely large disks, doubling spc until counts
-             *      fit is the only way to report a meaningful total —
-             *      truncating a 1 GB disk to 64 MB would be far worse
-             *      than the MS-DOS 4 display quirk.
-             *
-             * Scaling rounds up on total (avoid claiming non-existent
-             * space) and down on free (conservative). Cap spc at 64 —
-             * beyond that DOS apps may stumble on >32 KB clusters. */
-            if (blocks_total > 0x18000ul) {
-                while ((blocks_total > 0xFFFFul || blocks_free > 0xFFFFul)
-                       && spc < 64u) {
-                    spc *= 2u;
-                    blocks_total = (blocks_total + 1u) >> 1;
-                    blocks_free  = blocks_free  >> 1;
-                }
+             * Earlier this was gated behind a `blocks_total > 0x18000`
+             * threshold to dodge an MS-DOS 4 "bytes free" misdisplay seen
+             * on small disks. The real cause was kernel-side corruption of
+             * sb fields under MS-DOS 4 (see g_safe_block_size); now we
+             * read from the safe snapshot, the empirical gate is no
+             * longer needed. */
+            while ((blocks_total > 0xFFFFul || blocks_free > 0xFFFFul)
+                   && spc < 64u) {
+                spc *= 2u;
+                blocks_total = (blocks_total + 1u) >> 1;
+                blocks_free  = blocks_free  >> 1;
             }
             if (blocks_total > 0xFFFFul) blocks_total = 0xFFFFul;
             if (blocks_free  > 0xFFFFul) blocks_free  = 0xFFFFul;
@@ -1106,6 +1122,15 @@ static int mount_ext4(uint8_t drive) {
     }
 
     g_fs_ready = 1;
+
+    /* Snapshot critical sb fields to the _DATA-segment safe globals — see
+     * the comment at g_safe_block_size. */
+    g_safe_block_size           = g_fs.sb.block_size;
+    g_safe_blocks_count_lo      = (uint32_t)g_fs.sb.blocks_count;
+    g_safe_blocks_count_hi      = (uint32_t)(g_fs.sb.blocks_count >> 32);
+    g_safe_free_blocks_count_lo = (uint32_t)g_fs.sb.free_blocks_count;
+    g_safe_free_blocks_count_hi = (uint32_t)(g_fs.sb.free_blocks_count >> 32);
+
     if (!g_quiet) {
         printf("  ext4 mounted: drive 0x%02x, partition LBA %lu\n",
                drive, (unsigned long)g_partition_lba);
