@@ -1383,35 +1383,35 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                 r.w.flags |= 1u;
                 return;
             }
-            /* Phase 3.5: CX=0 in REM_WRITE means "set EOF to current SFT
-             * position" — the documented MS-DOS network redirector
-             * convention. DOS COPY uses this as a pre-extend before
-             * issuing the actual data writes. Support extending up to one
-             * block past current size; truncate-down and multi-block
-             * extends are deferred. */
+            /* CX=0 in REM_WRITE means "set EOF to current SFT position" —
+             * the documented MS-DOS network redirector convention. DOS COPY
+             * uses this as a pre-extend before the data writes. Loop calling
+             * extend_block one block at a time until size reaches pos; each
+             * iteration requires the current size to be block-aligned.
+             * Truncate-down (pos < file_size) is still deferred. */
             if (count == 0u) {
                 if (pos == file_size) {
-                    /* No-op: file already at requested EOF. */
                     r.w.ax = 0u;
                     r.w.flags &= ~1u;
                     return;
                 }
-                if (pos > file_size && (pos - file_size) <= bs &&
-                    (file_size & (bs - 1u)) == 0u) {
-                    /* Extend file_size .. pos with zero-fill. */
-                    uint16_t z;
+                if (pos > file_size && (file_size & (bs - 1u)) == 0u) {
                     static char werr2[64];
-                    int rc2;
+                    int rc2 = 0;
+                    uint16_t z;
                     for (z = 0; z < bs; z++) g_write_buf[z] = 0u;
-                    werr2[0] = '\0';
-                    rc2 = ext4_file_extend_block(&g_fs, &slot->inode,
-                                                 slot->inode_num,
-                                                 g_write_buf,
-                                                 (uint32_t)(pos - file_size),
-                                                 slot->inode.mtime + 1u,
-                                                 werr2, sizeof werr2);
+                    while ((uint32_t)slot->inode.size < pos && rc2 == 0) {
+                        uint32_t remaining = pos - (uint32_t)slot->inode.size;
+                        uint32_t this_ext  = (remaining > bs) ? bs : remaining;
+                        werr2[0] = '\0';
+                        rc2 = ext4_file_extend_block(&g_fs, &slot->inode,
+                                                     slot->inode_num,
+                                                     g_write_buf, this_ext,
+                                                     slot->inode.mtime + 1u,
+                                                     werr2, sizeof werr2);
+                    }
                     g_ff_capture.last_write_rc = (int16_t)rc2;
-                    if (rc2 == 0) {
+                    if (rc2 == 0 && (uint32_t)slot->inode.size == pos) {
                         *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF) =
                             (uint32_t)slot->inode.size;
                         r.w.ax = 0u;
@@ -1419,7 +1419,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                         return;
                     }
                 }
-                /* Truncate-down or extend-too-big: defer. */
+                /* Truncate-down or extend failed: defer. */
                 r.w.ax = DOS_ERR_WRITE_PROTECT;
                 r.w.flags |= 1u;
                 return;
@@ -1448,13 +1448,26 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             werr[0] = '\0';
 
             if (pos + (uint32_t)count <= file_size
-                && (uint32_t)count == bs
-                && (pos & (bs - 1u)) == 0u) {
-                /* Full-block in-place write. */
+                && (pos & (bs - 1u)) == 0u
+                && ((uint32_t)count & (bs - 1u)) == 0u) {
+                /* Block-aligned in-place write — one or more full blocks.
+                 * Loop one block at a time so g_write_buf (1024 bytes max)
+                 * is reused per block. Handles COPY with large transfer
+                 * buffers that send N*bs bytes in a single REM_WRITE. */
+                uint32_t blk_off = 0u;
                 g_ff_capture.last_write_was_extend = 0u;
-                rc = ext4_file_write_block(&g_fs, &slot->inode, slot->inode_num,
-                                           logical, g_write_buf, now_unix,
-                                           werr, sizeof werr);
+                rc = 0;
+                while (blk_off < (uint32_t)count && rc == 0) {
+                    uint16_t k;
+                    for (k = 0; k < (uint16_t)bs; k++)
+                        g_write_buf[k] = user_buf[(uint16_t)blk_off + k];
+                    rc = ext4_file_write_block(&g_fs, &slot->inode,
+                                               slot->inode_num,
+                                               logical + blk_off / bs,
+                                               g_write_buf, now_unix,
+                                               werr, sizeof werr);
+                    blk_off += bs;
+                }
             } else if (pos + (uint32_t)count <= file_size
                        && ((pos / bs) == ((pos + (uint32_t)count - 1u) / bs))) {
                 /* Partial in-place write contained within one block —

@@ -75,6 +75,10 @@ echo === Phase 3 create: COPY C:\BOTH.TXT Y:\NEWCOPY.TXT === >> C:\OUT.TXT
 COPY C:\BOTH.TXT Y:\NEWCOPY.TXT >> C:\OUT.TXT
 echo === TYPE Y:\NEWCOPY.TXT (should match BOTH.TXT contents) === >> C:\OUT.TXT
 TYPE Y:\NEWCOPY.TXT >> C:\OUT.TXT
+echo === Phase 3.6 multi-block: COPY Y:\TARGET.TXT Y:\NEWBIG.TXT === >> C:\OUT.TXT
+COPY Y:\TARGET.TXT Y:\NEWBIG.TXT >> C:\OUT.TXT
+echo === DIR Y:\NEWBIG.TXT (expect size 2048) === >> C:\OUT.TXT
+DIR Y:\NEWBIG.TXT >> C:\OUT.TXT
 echo === DEL/MD must still FAIL (Phase 3 doesn't add delete or mkdir) === >> C:\OUT.TXT
 echo --- DEL Y:\HELLO.TXT --- >> C:\OUT.TXT
 DEL Y:\HELLO.TXT >> C:\OUT.TXT
@@ -171,6 +175,12 @@ fi
 # pre-extend convention + partial-in-place data write.
 if ! grep -q "Hello, ext4-dos!" <<<"$(grep -F -A4 'TYPE Y:\NEWCOPY.TXT' <<<"$OUT")"; then
     echo "FAIL: Y:\\NEWCOPY.TXT doesn't contain expected content (REM_CREATE/REM_WRITE)" >&2
+    fail=1
+fi
+# Phase 3.6: COPY Y:\TARGET.TXT Y:\NEWBIG.TXT exercises multi-block
+# CX=0 pre-extend (TARGET.TXT is 2048 bytes = 2 blocks).
+if ! grep -F -A8 'DIR Y:\NEWBIG.TXT' <<<"$OUT" | grep -qE "NEWBIG[[:space:]]+TXT[[:space:]]+2[,]?048"; then
+    echo "FAIL: Y:\\NEWBIG.TXT not 2048 bytes after multi-block COPY (Phase 3.6)" >&2
     fail=1
 fi
 if ! grep -qE "56[,]?345[,]?600 bytes free" <<<"$OUT"; then
