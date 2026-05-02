@@ -136,6 +136,12 @@ static struct open_slot {
     struct ext4_inode  inode;
 } g_open[MAX_OPEN_SLOTS];
 
+/* Scratch buffer for REM_WRITE: copies the user's FAR buffer into
+ * DGROUP so ext4_file_write_block (which expects a near pointer) can
+ * read it. One block_size worth — phase 1b's first cut writes exactly
+ * one block per call. */
+static uint8_t g_write_buf[4096];
+
 /* Find the slot whose SFT pointer matches (sft_seg:sft_off). Returns
  * a pointer into g_open, or NULL. */
 static struct open_slot *find_open_slot(uint16_t sft_seg, uint16_t sft_off) {
@@ -224,9 +230,10 @@ struct ff_capture {
         uint8_t  searchdir_after[32];
     } calls[4];
 #pragma pack(pop)
-    /* Open/Read/Close diagnostics */
+    /* Open/Read/Write/Close diagnostics */
     uint16_t open_call_count;
     uint16_t read_call_count;
+    uint16_t write_call_count;
     uint16_t close_call_count;
     int16_t  last_open_rc;
     uint8_t  last_open_path[64];
@@ -982,7 +989,6 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
          * to support read-only via the SFT's file-size field. */
         case 0x01: /* REM_RMDIR — remove directory */
         case 0x03: /* REM_MKDIR — create directory */
-        case 0x09: /* REM_WRITE */
         case 0x0E: /* REM_SETATTR — change file attributes */
         case 0x11: /* REM_RENAME */
         case 0x13: /* REM_DELETE */
@@ -1111,6 +1117,89 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                 r.w.cx = 1u;
             }
 
+            r.w.flags &= ~1u;
+            return;
+        }
+
+        case 0x09: { /* REM_WRITE — phase 1b: in-place same-length only.
+                      *
+                      * Phase 1b refuses anything that would extend the
+                      * file or hit a write that's not exactly one
+                      * aligned FS block. With those constraints the
+                      * write is a single 2-block transaction (file
+                      * data + inode-with-mtime-bumped) through
+                      * ext4_journal_commit, immediately checkpointed
+                      * to disk. Phases 2+ relax the constraints (block
+                      * allocation for extends, partial-block writes,
+                      * etc). */
+            struct open_slot *slot;
+            uint8_t __far    *sft;
+            uint8_t __far    *user_buf;
+            uint16_t          buf_seg, buf_off;
+            uint32_t          pos, file_size;
+            uint16_t          count, i;
+            uint32_t          bs;
+            uint32_t          logical;
+            uint32_t          now_unix;
+            /* Static so it lives in DGROUP — the function takes a near
+             * char*, but stack lives at SS != DS in interrupt context. */
+            static char       werr[64];
+            int               rc;
+
+            g_ff_capture.write_call_count++;
+            slot = find_open_slot(r.x.es, r.w.di);
+            if (!slot) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            sft       = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+            bs        = g_safe_block_size;
+            pos       = *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF);
+            file_size = (uint32_t)slot->inode.size;
+            count     = r.w.cx;
+
+            /* Phase 1b limits: count == one whole FS block, pos block-
+             * aligned, no extend. Anything else falls back to
+             * WRITE_PROTECT (canonical "Write protect error writing
+             * drive Y" for DOS callers). Phases 2+ relax these. */
+            if (count == 0u
+                || (uint32_t)count != bs
+                || (pos & (bs - 1u)) != 0u
+                || pos + (uint32_t)count > file_size
+                || bs > sizeof g_write_buf) {
+                r.w.ax = DOS_ERR_WRITE_PROTECT;
+                r.w.flags |= 1u;
+                return;
+            }
+
+            /* User buffer FAR pointer at SDA+0x0C, same convention DOS
+             * uses for REM_READ (set in DosRdWrSft). */
+            buf_off  = *(uint16_t __far *)(g_sda + SDA_DTA_OFF);
+            buf_seg  = *(uint16_t __far *)(g_sda + SDA_DTA_OFF + 2);
+            user_buf = (uint8_t __far *)MK_FP(buf_seg, buf_off);
+
+            /* FAR -> DGROUP copy. ext4_file_write_block expects a near
+             * pointer (DS-relative) so the bdev_write FAR conversion
+             * inside int13_bdev_write produces the right segment. */
+            for (i = 0; i < count; i++) g_write_buf[i] = user_buf[i];
+
+            logical  = pos / bs;
+            /* No safe wall-clock from inside the redirector; bump mtime
+             * monotonically. Phase 1c can swap in a real time source. */
+            now_unix = slot->inode.mtime + 1u;
+
+            rc = ext4_file_write_block(&g_fs, &slot->inode, slot->inode_num,
+                                       logical, g_write_buf, now_unix,
+                                       werr, sizeof werr);
+            if (rc != 0) {
+                r.w.ax = DOS_ERR_WRITE_PROTECT;
+                r.w.flags |= 1u;
+                return;
+            }
+
+            *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = pos + count;
+            r.w.cx = count;
             r.w.flags &= ~1u;
             return;
         }

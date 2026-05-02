@@ -24,6 +24,9 @@ LONG_NAME_1 = "verylongname1.txt"
 LONG_NAME_2 = "verylongname2.txt"
 LONG_BYTES_1 = b"long-named file ONE.\n"
 LONG_BYTES_2 = b"long-named file TWO.\n"
+# 1024-byte target.txt: same length as one FS block, so phase 1b's
+# strict in-place writer can overwrite it from DOS.
+TARGET_BYTES = b"A" * 1024
 
 MKFS_FALLBACKS = [
     "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
@@ -87,12 +90,19 @@ def main() -> None:
             f.write(LONG_BYTES_1)
         with open(os.path.join(tdir, LONG_NAME_2), "wb") as f:
             f.write(LONG_BYTES_2)
+        # /target.txt is exactly 1 block — used by phase 1b's DOS write test.
+        with open(os.path.join(tdir, "target.txt"), "wb") as f:
+            f.write(TARGET_BYTES)
 
         offset_bytes = PART_START_LBA * SECTOR_SIZE
         size_1k_blocks = (part_sector_count * SECTOR_SIZE) // 1024
+        # ^metadata_csum — phase 1b refuses writes when metadata_csum is
+        # set (recomputing inode i_checksum on writes is phase 1c).
+        # Without this, freedos-test's REM_WRITE smoke test bails at -5.
         subprocess.check_call(
             [
                 mkfs, "-F", "-b", "1024",
+                "-O", "^metadata_csum",
                 "-E", f"offset={offset_bytes}",
                 "-L", "ext4-dos-part",
                 "-d", tdir,
@@ -104,7 +114,7 @@ def main() -> None:
 
     print(f"Wrote partitioned fixture: {OUT_PATH} "
           f"({SIZE_MB} MiB, partition at LBA {PART_START_LBA}) with /hello.txt, "
-          f"/{LONG_NAME_1}, /{LONG_NAME_2}, /subdir/nested.txt")
+          f"/{LONG_NAME_1}, /{LONG_NAME_2}, /subdir/nested.txt, /target.txt")
 
 if __name__ == "__main__":
     main()

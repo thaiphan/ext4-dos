@@ -188,8 +188,8 @@ if ! grep -q "Hello, ext4-dos!" <<<"$OUT"; then
 fi
 # Alias TYPE assertions live in run-freedos-test.sh only — see the
 # autoexec comment for why MS-DOS 4 trades alias TYPE for uninstall.
-if ! grep -q "56346624 bytes free" <<<"$OUT"; then
-    echo "FAIL: 'bytes free' wrong (expected 56346624) — kernel write may be hitting g_safe_*" >&2
+if ! grep -q "56345600 bytes free" <<<"$OUT"; then
+    echo "FAIL: 'bytes free' wrong (expected 56345600 with /target.txt 1024B) — kernel write may be hitting g_safe_*" >&2
     fail=1
 fi
 if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then

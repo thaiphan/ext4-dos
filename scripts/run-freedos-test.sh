@@ -28,7 +28,7 @@ if [[ ! -f "$SOURCE_IMG" ]]; then
     exit 1
 fi
 
-for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe; do
+for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe ext4wr.exe; do
     if [[ ! -x "$DOS_DIR/$f" ]]; then
         echo "ERROR: $DOS_DIR/$f missing. Run: make dos-build" >&2
         exit 1
@@ -59,6 +59,12 @@ echo === Multi-file: COPY HELLO+NESTED to BOTH.TXT === >> C:\OUT.TXT
 COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT C:\BOTH.TXT >> C:\OUT.TXT
 echo === TYPE C:\BOTH.TXT (concatenation result) === >> C:\OUT.TXT
 TYPE C:\BOTH.TXT >> C:\OUT.TXT
+echo === Phase 1b in-place write: Y:\TARGET.TXT before === >> C:\OUT.TXT
+TYPE Y:\TARGET.TXT >> C:\OUT.TXT
+echo --- run ext4wr (one block of 'B' over the existing 'A's) --- >> C:\OUT.TXT
+C:\EXT4WR.EXE >> C:\OUT.TXT
+echo === Y:\TARGET.TXT after write === >> C:\OUT.TXT
+TYPE Y:\TARGET.TXT >> C:\OUT.TXT
 echo === Read-only enforcement: attempts must FAIL === >> C:\OUT.TXT
 echo --- DEL Y:\HELLO.TXT --- >> C:\OUT.TXT
 DEL Y:\HELLO.TXT >> C:\OUT.TXT
@@ -99,6 +105,7 @@ mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4chk.exe" ::EXT4CHK.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4dir.exe" ::EXT4DIR.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4cnt.exe" ::EXT4CNT.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4dmp.exe" ::EXT4DMP.EXE
+mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4wr.exe"  ::EXT4WR.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$FREEDOS_DIR/fdauto-test.bat" ::FDAUTO.BAT
 
 # Boot in DOSBox-X, then kill after timeout (poweroff doesn't exit DOSBox-X).
@@ -151,8 +158,8 @@ if ! grep -q "long-named file TWO" <<<"$OUT"; then
     echo "FAIL: TYPE Y:\\VERY~EB7.TXT (8.3 alias) didn't return file content" >&2
     fail=1
 fi
-if ! grep -qE "56[,]?346[,]?624 bytes free" <<<"$OUT"; then
-    echo "FAIL: 'bytes free' wrong (expected 56,346,624) — kernel write may be hitting g_safe_*" >&2
+if ! grep -qE "56[,]?345[,]?600 bytes free" <<<"$OUT"; then
+    echo "FAIL: 'bytes free' wrong (expected 56,345,600 with /target.txt 1024B) — kernel write may be hitting g_safe_*" >&2
     fail=1
 fi
 if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
@@ -162,6 +169,24 @@ fi
 # Read-only enforcement: HELLO.TXT must survive the DEL attempt.
 if ! grep -A2 "HELLO.TXT must still be there" <<<"$OUT" | grep -q "HELLO"; then
     echo "FAIL: read-only enforcement may have allowed DEL Y:\\HELLO.TXT" >&2
+    fail=1
+fi
+# Phase 1b REM_WRITE wiring: ext4wr reports the byte count, and the
+# post-write TYPE has long runs of 'B' (not 'A'). DOS TYPE doesn't
+# emit a newline so the next echo concatenates onto the same line —
+# pattern-match for >=100 consecutive 'B' and no >=100 consecutive 'A'
+# in the post-write block.
+if ! grep -q "Wrote 1024 bytes" <<<"$OUT"; then
+    echo "FAIL: ext4wr didn't report 1024 bytes written (REM_WRITE wiring)" >&2
+    fail=1
+fi
+WRITE_AFTER=$(grep -F -A1 'Y:\TARGET.TXT after write' <<<"$OUT" | tail -1)
+if ! grep -qE 'B{100}' <<<"$WRITE_AFTER"; then
+    echo "FAIL: TARGET.TXT after write missing 100+ consecutive 'B' bytes" >&2
+    fail=1
+fi
+if grep -qE 'A{100}' <<<"$WRITE_AFTER"; then
+    echo "FAIL: TARGET.TXT after write still has 100+ consecutive 'A' bytes" >&2
     fail=1
 fi
 # Wildcard: DIR Y:\*.TXT must list HELLO.TXT and skip SUBDIR (no extension).
