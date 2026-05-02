@@ -64,6 +64,16 @@ struct ff_capture {
     uint32_t last_read_pos;
     uint16_t last_read_count;
     int16_t  last_read_actual;
+#pragma pack(push, 1)
+    struct {
+        uint32_t inode_num;
+        uint8_t  step;
+        uint16_t mode;
+        int16_t  inode_rc;
+        uint32_t dir_rc;
+    } open_calls[2];
+#pragma pack(pop)
+    uint8_t  open_call_idx;
     uint32_t entry_inode_mtime;
     uint16_t entry_inode_dos_time;
     uint16_t entry_inode_dos_date;
@@ -125,6 +135,16 @@ int main(void) {
         printf("  last open inode = %lu, size = %lu\n",
                (unsigned long)cap->last_open_inode_num,
                (unsigned long)cap->last_open_size);
+        printf("  open_call_idx: %u\n", (unsigned)cap->open_call_idx);
+        for (j = 0; j < 2; j++) {
+            printf("  call[%u]: inode=%lu step=0x%02x mode=0x%04x inode_rc=%d dir_rc=%lu\n",
+                   j,
+                   (unsigned long)cap->open_calls[j].inode_num,
+                   (unsigned)cap->open_calls[j].step,
+                   (unsigned)cap->open_calls[j].mode,
+                   (int)cap->open_calls[j].inode_rc,
+                   (unsigned long)cap->open_calls[j].dir_rc);
+        }
     }
 
     if (!cap->valid) {
