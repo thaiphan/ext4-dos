@@ -42,18 +42,16 @@
 
 /* What v1 (read-only) supports.
  *
- * RECOVER (journal-needs-recovery) is intentionally allowed without
- * actually replaying the journal. Same approach GRUB's ext2 driver takes
- * for the same reason: a read-only mount that ignores the journal sees the
- * ON-DISK state, which is the state as of the last sync. The transactions
- * sitting in the journal are LOST writes — for files actively being
- * written when the host crashed, the user may see slightly stale content.
- * For typical use (reading existing data on a disk that's been idle),
- * this is fine. If we ever need post-replay correctness, implement real
- * journal replay (parse jbd2 transactions, build a {disk_blk -> jrnl_blk}
- * map, override block reads to consult it) — see references/lwext4 and
- * grub's ext2.c "needs_recovery" comment. INLINE_DATA / LARGEDIR /
- * ENCRYPT / CASEFOLD / EA_INODE / DIRDATA / MMP all deferred. */
+ * RECOVER (journal-needs-recovery) is allowed because src/ext4/journal.c
+ * does soft replay at mount: it parses the on-disk jbd2 log, builds a
+ * {fs_block -> journal_blk} map, and ext4_fs_read_block redirects reads
+ * of journaled blocks to their newest committed copy. On-disk state is
+ * never modified. If the walker hits its caps or sees a feature it
+ * doesn't understand, replay aborts cleanly and reads fall back to the
+ * pre-replay world (the same posture GRUB's ext2 driver takes — slightly
+ * stale data for files written just before the crash, but otherwise
+ * fine). INLINE_DATA / LARGEDIR / ENCRYPT / CASEFOLD / EA_INODE /
+ * DIRDATA / MMP all deferred. */
 #define EXT4_V1_INCOMPAT_SUPPORTED ( \
     EXT4_FEATURE_INCOMPAT_FILETYPE  | \
     EXT4_FEATURE_INCOMPAT_RECOVER   | \

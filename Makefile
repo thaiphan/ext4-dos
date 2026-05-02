@@ -39,7 +39,8 @@ LIB_SRCS_HOST := \
 	src/ext4/extent.c \
 	src/ext4/dir.c \
 	src/ext4/journal.c \
-	src/partition/mbr.c
+	src/partition/mbr.c \
+	src/util/crc32c.c
 
 DOS_CLI_OBJ := \
 	$(DOS_DIR)/dos_cli.obj \
@@ -51,7 +52,8 @@ DOS_CLI_OBJ := \
 	$(DOS_DIR)/extent.obj \
 	$(DOS_DIR)/dir.obj \
 	$(DOS_DIR)/journal.obj \
-	$(DOS_DIR)/mbr.obj
+	$(DOS_DIR)/mbr.obj \
+	$(DOS_DIR)/crc32c.obj
 
 TSR_OBJ := \
 	$(DOS_DIR)/tsr.obj \
@@ -63,15 +65,16 @@ TSR_OBJ := \
 	$(DOS_DIR)/extent.obj \
 	$(DOS_DIR)/dir.obj \
 	$(DOS_DIR)/journal.obj \
-	$(DOS_DIR)/mbr.obj
+	$(DOS_DIR)/mbr.obj \
+	$(DOS_DIR)/crc32c.obj
 
-vpath %.c tools src/blockdev src/ext4 src/partition
+vpath %.c tools src/blockdev src/ext4 src/partition src/util
 
 .PHONY: all host-build dos-build host-test dos-test fixtures fixture fixture-partitioned clean
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_crc32c_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
@@ -83,6 +86,9 @@ $(HOST_DIR)/host_stress_test: tools/host_stress_test.c $(LIB_SRCS_HOST) | $(HOST
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_journal_test: tools/host_journal_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
+$(HOST_DIR)/host_crc32c_test: tools/host_crc32c_test.c src/util/crc32c.c | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR):
@@ -114,11 +120,15 @@ $(DOS_DIR)/%.obj: %.c | $(DOS_DIR)
 $(DOS_DIR):
 	mkdir -p $@
 
-host-test: host-build tests/images/journal.img
+host-test: host-build tests/images/journal.img tests/images/journal-csum.img
 	@echo "==> running host_features_test"
 	@$(HOST_DIR)/host_features_test
-	@echo "==> running host_journal_test"
+	@echo "==> running host_crc32c_test"
+	@$(HOST_DIR)/host_crc32c_test
+	@echo "==> running host_journal_test (no-csum fixture)"
 	@$(HOST_DIR)/host_journal_test tests/images/journal.img tests/images/journal.expect
+	@echo "==> running host_journal_test (CSUM_V2 fixture)"
+	@$(HOST_DIR)/host_journal_test tests/images/journal-csum.img tests/images/journal-csum.expect
 
 host-stress: host-build tests/images/stress.img
 	@echo "==> running host_stress_test"
@@ -128,6 +138,9 @@ tests/images/stress.img: scripts/mkfixture-stress.py
 	python3 scripts/mkfixture-stress.py
 
 tests/images/journal.img: scripts/mkfixture-journal.py
+	$(PYTHON) $<
+
+tests/images/journal-csum.img: scripts/mkfixture-journal-csum.py
 	$(PYTHON) $<
 
 dos-test: dos-build fixture-partitioned

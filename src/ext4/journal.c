@@ -4,6 +4,7 @@
 #include "extent.h"
 #include "../blockdev/blockdev.h"
 #include "../util/endian.h"
+#include "../util/crc32c.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -110,6 +111,40 @@ static int is_revoked(const struct ext4_jbd *j, uint64_t fs_block, uint32_t this
         }
     }
     return 0;
+}
+
+/* Verify a descriptor or revoke block's tail checksum. Only meaningful
+ * when CSUM_V2 or CSUM_V3 is enabled — V1 (or no-csum) has no tail. The
+ * tail is the last 4 bytes of the block, holding crc32c(uuid + block)
+ * computed with the tail itself zeroed at write time. */
+static int verify_meta_block(const struct ext4_jbd *j, uint8_t *buf) {
+    uint32_t orig, computed;
+    uint8_t  saved[4];
+
+    if (!(j->csum_v2 || j->csum_v3)) return 1;
+    memcpy(saved, buf + j->blocksize - 4u, 4);
+    orig = be32(saved);
+    memset(buf + j->blocksize - 4u, 0, 4);
+    computed = crc32c(CRC32C_INIT, j->uuid, 16);
+    computed = crc32c(computed,    buf, j->blocksize);
+    memcpy(buf + j->blocksize - 4u, saved, 4);
+    return computed == orig;
+}
+
+/* Verify a commit block's checksum. chksum[0] sits at offset 16
+ * (4 bytes), holding crc32c(uuid + commit_block_with_chksum0_zeroed). */
+static int verify_commit_block(const struct ext4_jbd *j, uint8_t *buf) {
+    uint32_t orig, computed;
+    uint8_t  saved[4];
+
+    if (!(j->csum_v2 || j->csum_v3)) return 1;
+    memcpy(saved, buf + 16u, 4);
+    orig = be32(saved);
+    memset(buf + 16u, 0, 4);
+    computed = crc32c(CRC32C_INIT, j->uuid, 16);
+    computed = crc32c(computed,    buf, j->blocksize);
+    memcpy(buf + 16u, saved, 4);
+    return computed == orig;
 }
 
 /* Per-FS tag size, sans UUID. Mirrors lwext4 jbd_tag_bytes. */
@@ -252,16 +287,21 @@ static int walk_log(struct ext4_fs *fs, int action, uint32_t *last_seq_io) {
 
         switch (blocktype) {
         case EXT4_JBD_BT_DESCRIPTOR:
+            /* CSUM_V2/V3: bad descriptor tail = treat as end of log. The
+             * commit for THIS transaction never landed atomically. */
+            if (!verify_meta_block(&fs->jbd, walk_buf)) { log_end = 1; break; }
             rc = iterate_descriptor_tags(fs, this_seq, &this_block, walk_buf, action);
             if (rc) return -4;
             break;
 
         case EXT4_JBD_BT_COMMIT:
+            if (!verify_commit_block(&fs->jbd, walk_buf)) { log_end = 1; break; }
             this_seq++;
             if (action == JBD_ACTION_SCAN) end_seq = this_seq;
             break;
 
         case EXT4_JBD_BT_REVOKE:
+            if (!verify_meta_block(&fs->jbd, walk_buf)) { log_end = 1; break; }
             if (action == JBD_ACTION_REVOKE) {
                 rc = handle_revoke(&fs->jbd, this_seq, walk_buf);
                 if (rc) return -5;
