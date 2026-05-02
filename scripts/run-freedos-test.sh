@@ -91,11 +91,10 @@ echo === Phase 4.5 rmdir: RD Y:\NEWDIR === >> C:\OUT.TXT
 RD Y:\NEWDIR >> C:\OUT.TXT
 echo === DIR Y: (NEWDIR must be gone) === >> C:\OUT.TXT
 DIR Y: >> C:\OUT.TXT
-echo === DEL must still FAIL (no unlink yet) === >> C:\OUT.TXT
-echo --- DEL Y:\HELLO.TXT --- >> C:\OUT.TXT
-DEL Y:\HELLO.TXT >> C:\OUT.TXT
-echo --- (HELLO.TXT must still be there) --- >> C:\OUT.TXT
-DIR Y:\HELLO.TXT >> C:\OUT.TXT
+echo === DEL Y:\NEWCOPY.TXT (Phase DEL — remove created file) === >> C:\OUT.TXT
+DEL Y:\NEWCOPY.TXT >> C:\OUT.TXT
+echo === DIR Y: after DEL (NEWCOPY must be gone, HELLO still there) === >> C:\OUT.TXT
+DIR Y: >> C:\OUT.TXT
 echo === TYPE Y:\VERY~876.TXT (8.3 alias roundtrip) === >> C:\OUT.TXT
 TYPE Y:\VERY~876.TXT >> C:\OUT.TXT
 echo === TYPE Y:\VERY~EB7.TXT (8.3 alias roundtrip) === >> C:\OUT.TXT
@@ -211,9 +210,13 @@ if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
     echo "FAIL: g_fs.sb integrity canary tripped — see 'verify:' lines above" >&2
     fail=1
 fi
-# Read-only enforcement: HELLO.TXT must survive the DEL attempt.
-if ! grep -A2 "HELLO.TXT must still be there" <<<"$OUT" | grep -q "HELLO"; then
-    echo "FAIL: read-only enforcement may have allowed DEL Y:\\HELLO.TXT" >&2
+# DEL: NEWCOPY.TXT must be absent after DEL, HELLO.TXT must still be present.
+if grep -F -A12 'DIR Y: after DEL' <<<"$OUT" | grep -qE "NEWCOPY[[:space:]]+TXT"; then
+    echo "FAIL: Y:\\NEWCOPY.TXT still visible after DEL (Phase DEL)" >&2
+    fail=1
+fi
+if ! grep -F -A12 'DIR Y: after DEL' <<<"$OUT" | grep -q "HELLO"; then
+    echo "FAIL: Y:\\HELLO.TXT missing from DIR Y: after DEL (should survive)" >&2
     fail=1
 fi
 # Phase 1b + 2 REM_WRITE wiring: ext4wr reports both writes, and the

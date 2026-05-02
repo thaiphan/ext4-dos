@@ -1082,9 +1082,58 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             return;
         }
 
+        case 0x13: { /* REM_DELETE — delete a file. */
+            static char path_buf[128];
+            static char werr[64];
+            static char parent_path[128];
+            uint32_t file_ino, parent_ino;
+            int rc_path, p, base_idx, j;
+
+            if (!g_fs_ready) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            rc_path = dos_to_ext4_path(path_buf, sizeof path_buf);
+            if (rc_path != 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            file_ino = path_lookup_with_alias(&g_fs, path_buf);
+            if (file_ino == 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            base_idx = 0;
+            for (p = 0; path_buf[p]; p++)
+                if (path_buf[p] == '/') base_idx = p + 1;
+            if (base_idx <= 1) {
+                parent_ino = 2u;
+            } else {
+                for (j = 0; j + 1 < base_idx && j < 127; j++)
+                    parent_path[j] = path_buf[j];
+                parent_path[j] = '\0';
+                parent_ino = ext4_path_lookup(&g_fs, parent_path);
+                if (parent_ino == 0) {
+                    r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                    r.w.flags |= 1u;
+                    return;
+                }
+            }
+            werr[0] = '\0';
+            if (ext4_file_remove(&g_fs, parent_ino, file_ino, werr, sizeof werr) != 0) {
+                r.w.ax = DOS_ERR_WRITE_PROTECT;
+                r.w.flags |= 1u;
+                return;
+            }
+            r.w.flags &= ~1u;
+            return;
+        }
+
         case 0x0E: /* REM_SETATTR — change file attributes */
         case 0x11: /* REM_RENAME */
-        case 0x13: /* REM_DELETE */
         /* 0x17 = REM_CREATE: now handled above — do not fall through here */
             /* 0x18 deliberately NOT here: FreeDOS's network.h calls it
              * REM_CRTRWOCDS (create-R/W-without-CDS), but other references

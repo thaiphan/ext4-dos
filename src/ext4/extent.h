@@ -86,6 +86,14 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
                          uint32_t now_unix,
                          char *err, uint32_t err_len);
 
+/* Remove a regular file from parent_ino.  Frees each data block (one
+ * 3-block journal transaction per block), then frees the inode + removes
+ * the parent dir entry in a final 6-block transaction.  Refuses
+ * directories (use ext4_dir_remove), depth>0 extent trees, and inode 0/2.
+ * Returns 0 on success, -1 on failure. */
+int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
+                     char *err, uint32_t err_len);
+
 /* Remove an empty directory from parent_ino.  Verifies dir_ino is a
  * directory containing only dot/dotdot, frees the data block (tx1) and
  * inode (tx2), removes the entry from parent_ino, and decrements

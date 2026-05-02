@@ -1896,6 +1896,300 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
     return 0;
 }
 
+/* Phase 5 (DEL): file removal ------------------------------------------ */
+
+int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
+                     char *err, uint32_t err_len) {
+    static struct ext4_inode file_inode;
+    static struct ext4_inode par_inode;
+    static uint64_t dir_phys;       /* DGROUP — extent_lookup out-pointer */
+
+    uint64_t sb_fs_block, bgd_fs_block;
+    uint32_t sb_offset_in_block;
+    uint32_t parent_gen;
+    uint64_t parent_dir_block;
+    uint32_t parent_slot_off, parent_prev_off;
+    uint32_t inode_group, inode_bit;
+    uint64_t inode_bmap_phys;
+    uint64_t file_inode_fs_block;
+    uint32_t file_inode_offset;
+    uint64_t parent_inode_fs_block;
+    uint32_t parent_inode_offset;
+    int rc;
+
+    if (err && err_len) err[0] = '\0';
+    if (fs->sb.block_size > EXT4_WRITE_BUF_SIZE) {
+        say_simple(err, err_len, "block_size > write cap"); return -1;
+    }
+    if (file_ino == 0u || file_ino == 2u) {
+        say_simple(err, err_len, "cannot remove inode 0 or root"); return -1;
+    }
+
+    /* Read file inode; refuse directories (use ext4_dir_remove). */
+    if (ext4_inode_read(fs, file_ino, &file_inode) != 0) {
+        say_simple(err, err_len, "file inode read failed"); return -1;
+    }
+    if ((file_inode.mode & 0xF000u) == EXT4_S_IFDIR) {
+        say_simple(err, err_len, "is a directory — use ext4_dir_remove"); return -1;
+    }
+
+    /* Verify extent tree is depth-0. */
+    {
+        const uint8_t *iblk = file_inode.i_block;
+        if (le16(iblk + 0) != EXT4_EXT_MAGIC) {
+            say_simple(err, err_len, "file lacks extent header"); return -1;
+        }
+        if (le16(iblk + 6) != 0) {
+            say_simple(err, err_len, "extent tree depth>0"); return -1;
+        }
+    }
+
+    bgd_fs_block       = (fs->sb.block_size > 1024u) ? 1u : 2u;
+    sb_fs_block        = (fs->sb.block_size > 1024u) ? 0u : 1u;
+    sb_offset_in_block = (fs->sb.block_size > 1024u) ? 1024u : 0u;
+
+    /* ================================================================
+     * Free each data block, batching by bitmap group.
+     * For each unique group that holds data blocks: read the bitmap,
+     * clear all bits belonging to that group's data blocks, update
+     * BGD free_blocks_count + SB free_blocks_count, and commit.
+     * ================================================================ */
+    {
+        const uint8_t *iblk = file_inode.i_block;
+        uint16_t num_extents = le16(iblk + 2);
+        uint32_t ei;
+
+        for (ei = 0; ei < num_extents; ei++) {
+            const uint8_t *e = iblk + 12u + ei * 12u;
+            uint16_t len  = le16(e + 4);
+            uint64_t phys = ((uint64_t)le16(e + 6) << 32) | (uint64_t)le32(e + 8);
+            uint32_t bi;
+
+            /* Free each block in this extent, one group-transaction at a
+             * time.  For most small files all blocks are in the same group
+             * so this is a single transaction. */
+            for (bi = 0; bi < (uint32_t)len; bi++) {
+                uint64_t blk_phys  = phys + (uint64_t)bi;
+                uint64_t base      = blk_phys - (uint64_t)fs->sb.first_data_block;
+                uint32_t grp       = (uint32_t)(base / fs->sb.blocks_per_group);
+                uint32_t bit       = (uint32_t)(base % fs->sb.blocks_per_group);
+                uint64_t bmap_phys;
+
+                if (ext4_fs_read_block(fs, bgd_fs_block, scratch_bgd) != 0) {
+                    say_simple(err, err_len, "BGD read failed (blk free)"); return -1;
+                }
+                {
+                    uint8_t *be = scratch_bgd + grp * fs->bgd_size;
+                    uint16_t fl; uint32_t fh;
+                    bmap_phys = (((fs->bgd_size >= 64u)
+                                  ? ((uint64_t)le32(be + 0x20) << 32) : 0u)
+                                 | (uint64_t)le32(be + 0x00));
+                    if (ext4_fs_read_block(fs, bmap_phys, scratch_bitmap) != 0) {
+                        say_simple(err, err_len, "block bitmap read failed"); return -1;
+                    }
+                    scratch_bitmap[bit >> 3] &= ~(uint8_t)(1u << (bit & 7u));
+                    fl = le16(be + 0x0C); fh = (fs->bgd_size >= 64u) ? le16(be + 0x2C) : 0u;
+                    fl++; if (fl == 0u) fh++;
+                    be[0x0C]=(uint8_t)fl; be[0x0D]=(uint8_t)(fl>>8);
+                    if (fs->bgd_size>=64u){be[0x2C]=(uint8_t)fh; be[0x2D]=(uint8_t)(fh>>8);}
+                    { uint32_t bcs=bitmap_compute_csum(fs,scratch_bitmap);
+                      be[0x18]=(uint8_t)bcs; be[0x19]=(uint8_t)(bcs>>8);
+                      if (fs->bgd_size>=64u){be[0x38]=(uint8_t)(bcs>>16);be[0x39]=(uint8_t)(bcs>>24);}
+                    }
+                    { uint16_t bc=bgd_compute_csum(fs,grp,be);
+                      be[0x1E]=(uint8_t)bc; be[0x1F]=(uint8_t)(bc>>8); }
+                }
+                if (ext4_fs_read_block(fs, sb_fs_block, scratch_sb) != 0) {
+                    say_simple(err, err_len, "SB read failed (blk free)"); return -1;
+                }
+                {
+                    uint8_t *sb = scratch_sb + sb_offset_in_block;
+                    uint32_t lo = le32(sb+0x0C);
+                    uint32_t hi = (fs->sb.feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) ? le32(sb+0x158) : 0u;
+                    uint64_t fb = ((uint64_t)hi<<32)|lo; fb++;
+                    sb[0x0C]=(uint8_t)fb; sb[0x0D]=(uint8_t)(fb>>8);
+                    sb[0x0E]=(uint8_t)(fb>>16); sb[0x0F]=(uint8_t)(fb>>24);
+                    if (fs->sb.feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) {
+                        uint32_t h32=(uint32_t)(fb>>32);
+                        sb[0x158]=(uint8_t)h32; sb[0x159]=(uint8_t)(h32>>8);
+                        sb[0x15A]=(uint8_t)(h32>>16); sb[0x15B]=(uint8_t)(h32>>24);
+                    }
+                    if (fs->sb.feature_ro_compat & 0x400u) {
+                        uint32_t cs; sb[0x3FC]=sb[0x3FD]=0; sb[0x3FE]=sb[0x3FF]=0;
+                        cs=crc32c(CRC32C_INIT,sb,0x3FC);
+                        sb[0x3FC]=(uint8_t)cs; sb[0x3FD]=(uint8_t)(cs>>8);
+                        sb[0x3FE]=(uint8_t)(cs>>16); sb[0x3FF]=(uint8_t)(cs>>24);
+                    }
+                }
+                scratch_trans.block_count = 3u;
+                scratch_trans.fs_block[0] = bmap_phys; scratch_trans.buf[0] = scratch_bitmap;
+                scratch_trans.fs_block[1] = bgd_fs_block; scratch_trans.buf[1] = scratch_bgd;
+                scratch_trans.fs_block[2] = sb_fs_block;  scratch_trans.buf[2] = scratch_sb;
+                if (ext4_journal_commit(fs, &scratch_trans, err, err_len) != 0) return -1;
+            }
+        }
+    }
+
+    /* ================================================================
+     * Final transaction: free inode + remove parent dir entry + update parent.
+     * ================================================================ */
+
+    /* Get parent generation for dir block csum. */
+    if (ext4_inode_read(fs, parent_ino, &par_inode) != 0) {
+        say_simple(err, err_len, "parent inode read failed"); return -1;
+    }
+    {
+        uint32_t g0 = (parent_ino-1u)/fs->sb.inodes_per_group;
+        uint32_t id0= (parent_ino-1u)%fs->sb.inodes_per_group;
+        const uint8_t *b0 = fs->bgd_buf + g0 * fs->bgd_size;
+        uint64_t it = ((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
+        uint64_t ib = (uint64_t)id0 * fs->sb.inode_size;
+        if (ext4_fs_read_block(fs, it + ib/fs->sb.block_size, scratch_inode_block) != 0) {
+            say_simple(err, err_len, "parent inode block read (gen)"); return -1;
+        }
+        parent_gen = le32(scratch_inode_block + (uint32_t)(ib%fs->sb.block_size) + 0x64);
+    }
+
+    /* Scan parent dir for entry with file_ino. */
+    {
+        uint32_t nblks = (uint32_t)((par_inode.size+fs->sb.block_size-1u)/fs->sb.block_size);
+        uint32_t b; int found = 0;
+        parent_slot_off = 0; parent_prev_off = 0xFFFFFFFFu; parent_dir_block = 0;
+        for (b = 0; b < nblks && !found; b++) {
+            uint32_t off, prev;
+            if (ext4_extent_lookup(fs, par_inode.i_block, b, &dir_phys) != 0) continue;
+            parent_dir_block = dir_phys;
+            if (ext4_fs_read_block(fs, parent_dir_block, scratch_parent_dir) != 0) continue;
+            prev = 0xFFFFFFFFu; off = 0;
+            while (off + 8u <= fs->sb.block_size) {
+                uint16_t rec = le16(scratch_parent_dir + off + 4);
+                uint32_t ino = le32(scratch_parent_dir + off);
+                if (rec < 8u || rec > fs->sb.block_size - off) break;
+                if (scratch_parent_dir[off+7] == 0xDEu && rec == 12u && ino == 0u) {
+                    off += rec; continue;
+                }
+                if (ino == file_ino) {
+                    parent_slot_off = off; parent_prev_off = prev; found = 1; break;
+                }
+                prev = off; off += rec;
+            }
+        }
+        if (!found) { say_simple(err, err_len, "entry not found in parent"); return -1; }
+    }
+
+    /* Remove entry: expand predecessor or zero inode field. */
+    {
+        uint16_t cr = le16(scratch_parent_dir + parent_slot_off + 4);
+        if (parent_prev_off != 0xFFFFFFFFu) {
+            uint16_t pr = le16(scratch_parent_dir + parent_prev_off + 4);
+            uint16_t nr = (uint16_t)(pr + cr);
+            scratch_parent_dir[parent_prev_off+4]=(uint8_t)nr;
+            scratch_parent_dir[parent_prev_off+5]=(uint8_t)(nr>>8);
+        } else {
+            scratch_parent_dir[parent_slot_off+0]=scratch_parent_dir[parent_slot_off+1]=0;
+            scratch_parent_dir[parent_slot_off+2]=scratch_parent_dir[parent_slot_off+3]=0;
+        }
+    }
+    if (fs->sb.feature_ro_compat & 0x400u) {
+        uint32_t tail=fs->sb.block_size-12u; uint32_t cs;
+        scratch_parent_dir[tail+0]=scratch_parent_dir[tail+1]=0;
+        scratch_parent_dir[tail+2]=scratch_parent_dir[tail+3]=0;
+        scratch_parent_dir[tail+4]=12u; scratch_parent_dir[tail+5]=0u;
+        scratch_parent_dir[tail+6]=0u; scratch_parent_dir[tail+7]=0xDEu;
+        scratch_parent_dir[tail+8]=scratch_parent_dir[tail+9]=0;
+        scratch_parent_dir[tail+10]=scratch_parent_dir[tail+11]=0;
+        cs=dir_block_csum(fs,parent_ino,parent_gen,scratch_parent_dir);
+        scratch_parent_dir[tail+8]=(uint8_t)cs; scratch_parent_dir[tail+9]=(uint8_t)(cs>>8);
+        scratch_parent_dir[tail+10]=(uint8_t)(cs>>16); scratch_parent_dir[tail+11]=(uint8_t)(cs>>24);
+    }
+
+    /* Free inode: bitmap + BGD (free_inodes++) + SB + zero inode slot. */
+    inode_group = (file_ino - 1u) / fs->sb.inodes_per_group;
+    inode_bit   = (file_ino - 1u) % fs->sb.inodes_per_group;
+
+    if (ext4_fs_read_block(fs, bgd_fs_block, scratch_bgd) != 0) {
+        say_simple(err, err_len, "BGD read failed (final tx)"); return -1;
+    }
+    {
+        uint8_t *be = scratch_bgd + inode_group * fs->bgd_size;
+        uint16_t fl; uint32_t fh;
+        inode_bmap_phys = (((fs->bgd_size>=64u)?((uint64_t)le32(be+0x24)<<32):0u)|(uint64_t)le32(be+0x04));
+        if (ext4_fs_read_block(fs, inode_bmap_phys, scratch_bitmap) != 0) {
+            say_simple(err, err_len, "inode bitmap read failed"); return -1;
+        }
+        scratch_bitmap[inode_bit>>3] &= ~(uint8_t)(1u<<(inode_bit&7u));
+        fl=le16(be+0x0E); fh=(fs->bgd_size>=64u)?le16(be+0x2E):0u;
+        fl++; if (fl==0u) fh++;
+        be[0x0E]=(uint8_t)fl; be[0x0F]=(uint8_t)(fl>>8);
+        if (fs->bgd_size>=64u){be[0x2E]=(uint8_t)fh; be[0x2F]=(uint8_t)(fh>>8);}
+        { uint32_t ic=inode_bitmap_csum(fs,scratch_bitmap);
+          be[0x1A]=(uint8_t)(ic&0xFFu); be[0x1B]=(uint8_t)(ic>>8);
+          if (fs->bgd_size>=64u){be[0x3A]=(uint8_t)(ic>>16);be[0x3B]=(uint8_t)(ic>>24);}
+        }
+        { uint16_t bc=bgd_compute_csum(fs,inode_group,be); be[0x1E]=(uint8_t)bc; be[0x1F]=(uint8_t)(bc>>8); }
+    }
+    if (ext4_fs_read_block(fs, sb_fs_block, scratch_sb) != 0) {
+        say_simple(err, err_len, "SB read failed (final tx)"); return -1;
+    }
+    {
+        uint8_t *sb=scratch_sb+sb_offset_in_block;
+        uint32_t fi=le32(sb+0x10); fi++;
+        sb[0x10]=(uint8_t)fi; sb[0x11]=(uint8_t)(fi>>8);
+        sb[0x12]=(uint8_t)(fi>>16); sb[0x13]=(uint8_t)(fi>>24);
+        if (fs->sb.feature_ro_compat & 0x400u) {
+            uint32_t cs; sb[0x3FC]=sb[0x3FD]=0; sb[0x3FE]=sb[0x3FF]=0;
+            cs=crc32c(CRC32C_INIT,sb,0x3FC);
+            sb[0x3FC]=(uint8_t)cs; sb[0x3FD]=(uint8_t)(cs>>8);
+            sb[0x3FE]=(uint8_t)(cs>>16); sb[0x3FF]=(uint8_t)(cs>>24);
+        }
+    }
+    {
+        uint32_t g=inode_group, idx=inode_bit;
+        const uint8_t *b0=fs->bgd_buf+g*fs->bgd_size;
+        uint64_t it=((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
+        uint64_t ib=(uint64_t)idx*fs->sb.inode_size;
+        file_inode_fs_block = it + ib/fs->sb.block_size;
+        file_inode_offset   = (uint32_t)(ib%fs->sb.block_size);
+    }
+    if (ext4_fs_read_block(fs, file_inode_fs_block, scratch_inode_block) != 0) {
+        say_simple(err, err_len, "file inode block read failed"); return -1;
+    }
+    memset(scratch_inode_block + file_inode_offset, 0, fs->sb.inode_size);
+
+    /* Parent inode: update mtime only (file links don't affect parent count). */
+    {
+        uint32_t g=(parent_ino-1u)/fs->sb.inodes_per_group;
+        uint32_t id=(parent_ino-1u)%fs->sb.inodes_per_group;
+        const uint8_t *b0=fs->bgd_buf+g*fs->bgd_size;
+        uint64_t it=((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
+        uint64_t ib=(uint64_t)id*fs->sb.inode_size;
+        parent_inode_fs_block=it+ib/fs->sb.block_size;
+        parent_inode_offset=(uint32_t)(ib%fs->sb.block_size);
+    }
+    if (ext4_fs_read_block(fs, parent_inode_fs_block, scratch_parent_inode) != 0) {
+        say_simple(err, err_len, "parent inode block read failed"); return -1;
+    }
+    {
+        uint8_t *pi=scratch_parent_inode+parent_inode_offset;
+        uint32_t t=file_inode.mtime+1u;
+        pi[0x10]=(uint8_t)t; pi[0x11]=(uint8_t)(t>>8);
+        pi[0x12]=(uint8_t)(t>>16); pi[0x13]=(uint8_t)(t>>24);
+        ext4_inode_recompute_csum(fs, parent_ino, pi);
+    }
+
+    scratch_trans.block_count = 6u;
+    scratch_trans.fs_block[0] = inode_bmap_phys;      scratch_trans.buf[0] = scratch_bitmap;
+    scratch_trans.fs_block[1] = bgd_fs_block;          scratch_trans.buf[1] = scratch_bgd;
+    scratch_trans.fs_block[2] = sb_fs_block;           scratch_trans.buf[2] = scratch_sb;
+    scratch_trans.fs_block[3] = file_inode_fs_block;   scratch_trans.buf[3] = scratch_inode_block;
+    scratch_trans.fs_block[4] = parent_dir_block;      scratch_trans.buf[4] = scratch_parent_dir;
+    scratch_trans.fs_block[5] = parent_inode_fs_block; scratch_trans.buf[5] = scratch_parent_inode;
+    rc = ext4_journal_commit(fs, &scratch_trans, err, err_len);
+    if (rc) return -1;
+
+    return 0;
+}
+
 int ext4_file_read_head(struct ext4_fs *fs, const struct ext4_inode *inode,
                         uint32_t length, void *out_buf) {
     static uint8_t blk[EXT4_EXT_NODE_BUF];
