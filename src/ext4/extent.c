@@ -136,8 +136,7 @@ int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     if (err && err_len) err[0] = '\0';
     if (inode_num == 0) { say_simple(err, err_len, "inode 0 invalid"); return -1; }
     if (fs->sb.block_size > EXT4_WRITE_BUF_SIZE) {
-        snprintf(err, err_len, "block_size %lu > write cap %u (DOS DGROUP)",
-                 (unsigned long)fs->sb.block_size, (unsigned)EXT4_WRITE_BUF_SIZE);
+        say_simple(err, err_len, "block_size > write cap (DOS DGROUP)");
         return -1;
     }
 
@@ -145,8 +144,7 @@ int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
      * — phase 2's job. */
     rc = ext4_extent_lookup(fs, inode_in->i_block, logical_block, &fs_block_data);
     if (rc) {
-        snprintf(err, err_len, "logical block %lu has no extent (rc=%d)",
-                 (unsigned long)logical_block, rc);
+        say_simple(err, err_len, "logical block has no extent");
         return rc;
     }
 
@@ -174,7 +172,7 @@ int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
      * straight on-disk read). */
     rc = ext4_fs_read_block(fs, fs_block_inode, scratch_inode_block);
     if (rc) {
-        snprintf(err, err_len, "read inode block failed (rc=%d)", rc);
+        say_simple(err, err_len, "read inode block failed");
         return rc;
     }
 

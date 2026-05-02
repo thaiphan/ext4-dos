@@ -35,6 +35,40 @@ static void say(char *err, size_t err_len, const char *msg) {
     }
 }
 
+/* say + " N" where N is a signed decimal. Used in place of snprintf
+ * for interrupt-callable error messages — snprintf's varargs pickup
+ * fails in OpenWatcom DOS small-model __interrupt context (SS != DS,
+ * va_arg reads through near pointers and lands in DGROUP at the
+ * wrong offset, producing empty output). See feedback memory:
+ * dos_ssneds_pointer_rules. */
+static void say_dec(char *err, size_t err_len, const char *msg, int32_t value) {
+    size_t i, mlen;
+    int32_t v;
+    char    tmp[12];
+    int     n;
+
+    if (!err || !err_len) return;
+    mlen = strlen(msg);
+    if (mlen >= err_len) mlen = err_len - 1u;
+    for (i = 0; i < mlen; i++) err[i] = msg[i];
+
+    if (i + 2u < err_len) err[i++] = ' ';
+
+    v = value;
+    if (v < 0 && i + 1u < err_len) { err[i++] = '-'; v = -v; }
+
+    n = 0;
+    if (v == 0) tmp[n++] = '0';
+    else {
+        while (v > 0 && n < (int)sizeof tmp) {
+            tmp[n++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+    }
+    while (n > 0 && i < err_len - 1u) err[i++] = tmp[--n];
+    err[i] = '\0';
+}
+
 /* Sequence numbers wrap at 2^32. Compare with signed-difference. */
 static int seq_diff(uint32_t a, uint32_t b) {
     return (int32_t)(a - b);
@@ -357,7 +391,7 @@ int ext4_journal_replay(struct ext4_fs *fs, char *err, uint32_t err_len) {
     last_seq = 0;
     rc = walk_log(fs, JBD_ACTION_SCAN, &last_seq);
     if (rc) {
-        snprintf(err, err_len, "journal scan failed (rc=%d)", rc);
+        say_dec(err, err_len, "journal scan failed rc=", rc);
         return rc;
     }
     /* No valid transactions — nothing to replay. */
@@ -367,7 +401,7 @@ int ext4_journal_replay(struct ext4_fs *fs, char *err, uint32_t err_len) {
     rc = walk_log(fs, JBD_ACTION_REVOKE, &last_seq);
     if (rc) {
         fs->jbd.revoke_count = 0;
-        snprintf(err, err_len, "journal revoke pass failed (rc=%d)", rc);
+        say_dec(err, err_len, "journal revoke pass failed rc=", rc);
         return rc;
     }
 
@@ -377,7 +411,7 @@ int ext4_journal_replay(struct ext4_fs *fs, char *err, uint32_t err_len) {
     if (rc) {
         fs->jbd.replay_count = 0;
         fs->jbd.revoke_count = 0;
-        snprintf(err, err_len, "journal build pass failed (rc=%d)", rc);
+        say_dec(err, err_len, "journal build pass failed rc=", rc);
         return rc;
     }
 
@@ -542,8 +576,8 @@ int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
         return -3;
     }
     if (trans->block_count == 0 || trans->block_count > EXT4_JBD_TRANS_MAX_BLOCKS) {
-        snprintf(err, err_len, "trans block_count %lu out of range",
-                 (unsigned long)trans->block_count);
+        say_dec(err, err_len, "trans block_count out of range:",
+                (int32_t)trans->block_count);
         return -4;
     }
     /* metadata_csum is now handled — the *caller* is responsible for
@@ -674,8 +708,7 @@ int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
     for (i = 0; i < trans->block_count; i++) {
         rc = write_journal_block(fs, this_first + 1u + i, trans->buf[i]);
         if (rc) {
-            snprintf(err, err_len, "data write failed at #%lu (rc=%d)",
-                     (unsigned long)i, rc);
+            say_dec(err, err_len, "data write failed at index", (int32_t)i);
             return rc;
         }
     }
@@ -750,8 +783,7 @@ int ext4_journal_checkpoint(struct ext4_fs *fs, char *err, uint32_t err_len) {
                                   fs->jbd.replay[i].journal_blk,
                                   fs->jbd.replay[i].is_escape);
         if (rc) {
-            snprintf(err, err_len, "checkpoint flush failed at #%lu (rc=%d)",
-                     (unsigned long)i, rc);
+            say_dec(err, err_len, "checkpoint flush failed at index", (int32_t)i);
             return rc;
         }
     }

@@ -216,4 +216,31 @@ if ! grep -A4 "Re-check" <<<"$OUT" | grep -q "TSR not detected"; then
     echo "FAIL: TSR still detected after ext4 -u" >&2
     fail=1
 fi
+
+# Symmetric to freedos-test: assert the ext4 partition is e2fsck-clean
+# after the run. msdos4-test currently doesn't write to the FS (the
+# read-only enforcement attempts hit our 0x13 refusal before any disk
+# touch), so this is mostly insurance — catches any hypothetical
+# misroute where a "read" path accidentally writes.
+E2FSCK="$(command -v e2fsck || true)"
+for c in /opt/homebrew/opt/e2fsprogs/sbin/e2fsck \
+         /usr/local/opt/e2fsprogs/sbin/e2fsck; do
+    [[ -x "$c" ]] && E2FSCK="$c" && break
+done
+if [[ -n "$E2FSCK" ]]; then
+    PART_IMG="$MSDOS4_DIR/post-run-part.img"
+    dd if="$EXT4_IMG" of="$PART_IMG" bs=512 skip=2048 status=none
+    if "$E2FSCK" -fn "$PART_IMG" >"$MSDOS4_DIR/e2fsck.out" 2>&1; then
+        rm -f "$PART_IMG" "$MSDOS4_DIR/e2fsck.out"
+    else
+        E2RC=$?
+        echo "FAIL: e2fsck on ext4 fixture reported errors (rc=$E2RC):" >&2
+        cat "$MSDOS4_DIR/e2fsck.out" >&2
+        rm -f "$PART_IMG" "$MSDOS4_DIR/e2fsck.out"
+        fail=1
+    fi
+else
+    echo "WARN: e2fsck not found — skipping post-run integrity check" >&2
+fi
+
 exit $fail
