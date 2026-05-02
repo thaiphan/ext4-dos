@@ -1290,6 +1290,85 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             inode_num = path_lookup_with_alias(&g_fs, path_buf);
             g_ff_capture.last_open_inode_num = inode_num;
             if (inode_num == 0) {
+                /* AL=0x2E is MS-DOS 4's "Extended Open" dispatch from
+                 * AH=6C00h.  When the file doesn't exist MS-DOS 4 routes
+                 * here instead of AL=0x17 (REM_CREATE) — the distinction
+                 * in the DOS-4 source is EXTOPEN_ON being set in
+                 * CREATE.ASM:IFS_extopen.  Fall through to create the
+                 * file so that COPY to Y: works the same as on FreeDOS. */
+                if (al == 0x2E) {
+                    static char werr_eo[64];
+                    static char parent_eo[128];
+                    uint32_t parent_ino;
+                    uint32_t new_ino;
+                    int p, base_idx, j;
+                    uint8_t nm_len;
+                    uint8_t __far *sft_eo;
+                    struct open_slot *slot_eo;
+                    uint32_t now_eo = 0x6A000000u;
+
+                    base_idx = 0;
+                    for (p = 0; path_buf[p]; p++)
+                        if (path_buf[p] == '/') base_idx = p + 1;
+                    if (base_idx <= 1) {
+                        parent_ino = 2u;
+                    } else {
+                        for (j = 0; j + 1 < base_idx && j < 127; j++)
+                            parent_eo[j] = path_buf[j];
+                        parent_eo[j] = '\0';
+                        parent_ino = ext4_path_lookup(&g_fs, parent_eo);
+                        if (parent_ino == 0) goto extopen_notfound;
+                    }
+                    nm_len = 0;
+                    while (path_buf[base_idx + nm_len]) nm_len++;
+                    if (nm_len == 0) goto extopen_notfound;
+
+                    slot_eo = alloc_open_slot(r.x.es, r.w.di);
+                    if (!slot_eo) {
+                        r.w.ax = 4u;
+                        r.w.flags |= 1u;
+                        return;
+                    }
+                    werr_eo[0] = '\0';
+                    new_ino = ext4_file_create(&g_fs, parent_ino,
+                                               path_buf + base_idx, nm_len,
+                                               (uint16_t)(0x8000u | 0644u),
+                                               now_eo, werr_eo, sizeof werr_eo);
+                    if (new_ino == 0) {
+                        slot_eo->used = 0;
+                        goto extopen_notfound;
+                    }
+                    slot_eo->used      = 1;
+                    slot_eo->sft_seg   = r.x.es;
+                    slot_eo->sft_off   = r.w.di;
+                    slot_eo->inode_num = new_ino;
+                    memset(&slot_eo->inode, 0, sizeof slot_eo->inode);
+                    slot_eo->inode.mode  = (uint16_t)(0x8000u | 0644u);
+                    slot_eo->inode.mtime = now_eo;
+                    slot_eo->inode.flags = EXT4_INODE_FLAG_EXTENTS;
+                    slot_eo->inode.i_block[0] = (uint8_t)EXT4_EXT_MAGIC;
+                    slot_eo->inode.i_block[1] = (uint8_t)(EXT4_EXT_MAGIC >> 8);
+                    slot_eo->inode.i_block[4] = 4u;
+
+                    sft_eo = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+                    *(uint16_t __far *)(sft_eo + SFT_REF_COUNT_OFF) = 1u;
+                    *(uint16_t __far *)(sft_eo + SFT_DEVINFO_OFF)   =
+                        (uint16_t)(0x8000u | g_drive_index);
+                    sft_eo[SFT_FILE_ATTR_OFF] = 0x00u;
+                    {
+                        uint32_t td = unix_to_dos(now_eo);
+                        *(uint16_t __far *)(sft_eo + SFT_FILE_TIME_OFF) =
+                            (uint16_t)(td & 0xFFFFul);
+                        *(uint16_t __far *)(sft_eo + SFT_FILE_DATE_OFF) =
+                            (uint16_t)(td >> 16);
+                    }
+                    *(uint32_t __far *)(sft_eo + SFT_FILE_SIZE_OFF)     = 0u;
+                    *(uint32_t __far *)(sft_eo + SFT_FILE_POSITION_OFF) = 0u;
+                    r.w.cx = 2u; /* action taken: file created */
+                    r.w.flags &= ~1u;
+                    return;
+                }
+extopen_notfound:
                 g_ff_capture.last_open_rc = -102;
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;
                 r.w.flags |= 1u;
