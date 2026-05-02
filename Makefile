@@ -215,7 +215,16 @@ dos-test: dos-build fixture-partitioned
 tsr-test: dos-build
 	@bash scripts/run-tsr-test.sh
 
-freedos-test: dos-build
+FREEDOS_ZIP_URL := https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.4/FD14-LiteUSB.zip
+
+tests/freedos/FD14LITE.img:
+	@mkdir -p tests/freedos
+	@echo "==> Downloading FreeDOS LiteUSB image..."
+	curl -L -o tests/freedos/FD14LITE.img.zip '$(FREEDOS_ZIP_URL)'
+	unzip -d tests/freedos tests/freedos/FD14LITE.img.zip FD14LITE.img
+	rm -f tests/freedos/FD14LITE.img.zip
+
+freedos-test: dos-build tests/freedos/FD14LITE.img
 	@bash scripts/run-freedos-test.sh
 
 msdos4-test: dos-build

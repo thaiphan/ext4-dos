@@ -26,12 +26,6 @@ if [[ ! -f "$EXT4_SRC_IMG" ]]; then
     exit 1
 fi
 
-if [[ ! -f "$SOURCE_IMG" ]]; then
-    echo "ERROR: $SOURCE_IMG not found." >&2
-    echo "  Download:  curl -L -o $SOURCE_IMG.zip 'https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.4/FD14-LiteUSB.zip'" >&2
-    echo "  Extract:   unzip -d $FREEDOS_DIR $SOURCE_IMG.zip FD14LITE.img" >&2
-    exit 1
-fi
 
 for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe ext4wr.exe; do
     if [[ ! -x "$DOS_DIR/$f" ]]; then
