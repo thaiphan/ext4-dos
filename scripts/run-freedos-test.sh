@@ -57,6 +57,10 @@ echo === Multi-file: COPY HELLO+NESTED to BOTH.TXT === >> C:\OUT.TXT
 COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT C:\BOTH.TXT >> C:\OUT.TXT
 echo === TYPE C:\BOTH.TXT (concatenation result) === >> C:\OUT.TXT
 TYPE C:\BOTH.TXT >> C:\OUT.TXT
+echo === TYPE Y:\VERY~876.TXT (8.3 alias roundtrip) === >> C:\OUT.TXT
+TYPE Y:\VERY~876.TXT >> C:\OUT.TXT
+echo === TYPE Y:\VERY~EB7.TXT (8.3 alias roundtrip) === >> C:\OUT.TXT
+TYPE Y:\VERY~EB7.TXT >> C:\OUT.TXT
 echo === Verify g_fs.sb integrity (canary) === >> C:\OUT.TXT
 C:\EXT4CHK.EXE /V >> C:\OUT.TXT
 echo === Subfunction call counts === >> C:\OUT.TXT
@@ -115,6 +119,14 @@ echo "$OUT"
 fail=0
 if ! grep -q "Hello, ext4-dos!" <<<"$OUT"; then
     echo "FAIL: TYPE Y:\\HELLO.TXT didn't return file content" >&2
+    fail=1
+fi
+if ! grep -q "long-named file ONE" <<<"$OUT"; then
+    echo "FAIL: TYPE Y:\\VERY~876.TXT (8.3 alias) didn't return file content" >&2
+    fail=1
+fi
+if ! grep -q "long-named file TWO" <<<"$OUT"; then
+    echo "FAIL: TYPE Y:\\VERY~EB7.TXT (8.3 alias) didn't return file content" >&2
     fail=1
 fi
 if ! grep -qE "56[,]?346[,]?624 bytes free" <<<"$OUT"; then

@@ -386,21 +386,95 @@ static int read_file_bytes(const struct ext4_inode *inode, uint32_t offset,
     return (int)bytes_done;
 }
 
+/* Forward decl — to_8_3 below calls name_is_8_3_safe defined later. */
+static int name_is_8_3_safe(const char *name, uint8_t name_len);
+
+/* Cheap 16-bit case-insensitive hash for the ~XXX suffix on alias names. */
+static uint16_t lfn_hash(const char *name, uint8_t name_len) {
+    uint16_t h = 0;
+    int i;
+    for (i = 0; i < name_len; i++) {
+        uint8_t c = (uint8_t)name[i];
+        if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+        h = (uint16_t)((h * 17u) + c);
+    }
+    return h;
+}
+
+static int is_8_3_char(uint8_t c) {
+    if (c >= 'A' && c <= 'Z') return 1;
+    if (c >= '0' && c <= '9') return 1;
+    if (c == '_' || c == '-' || c == '~') return 1;
+    return 0;
+}
+
+/* Convert an ext4 filename to the 11-byte FAT 8.3 form.
+ *
+ * Names that already fit 8.3 cleanly: trivial truncate + uppercase.
+ *
+ * Names too long or with 8.3-illegal chars (multiple dots, basename > 8,
+ * extension > 3, foreign letters): generate a Win95-style alias
+ * BASE4~HHH.EXT, where HHH is a 3-hex-digit hash of the FULL ext4 name.
+ *
+ * Deterministic — the same long name always maps to the same alias, so
+ * `TYPE Y:\VERY~876.TXT` reopens the same file every time. Per-directory
+ * collision rate is 1/4096 between any two long names that share the
+ * first 4 8.3-safe characters; sufficient for typical DOS use. */
 static void to_8_3(const char *name, uint8_t name_len, uint8_t out[11]) {
     int i = 0, j = 0, k;
     for (k = 0; k < 11; k++) out[k] = ' ';
-    while (i < name_len && j < 8 && name[i] != '.') {
-        uint8_t c = (uint8_t)name[i++];
-        if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
-        out[j++] = c;
+
+    if (name_is_8_3_safe(name, name_len)) {
+        while (i < name_len && j < 8 && name[i] != '.') {
+            uint8_t c = (uint8_t)name[i++];
+            if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+            out[j++] = c;
+        }
+        while (i < name_len && name[i] != '.') i++;
+        if (i < name_len && name[i] == '.') i++;
+        j = 8;
+        while (i < name_len && j < 11) {
+            uint8_t c = (uint8_t)name[i++];
+            if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+            out[j++] = c;
+        }
+        return;
     }
-    while (i < name_len && name[i] != '.') i++;
-    if (i < name_len && name[i] == '.') i++;
-    j = 8;
-    while (i < name_len && j < 11) {
-        uint8_t c = (uint8_t)name[i++];
-        if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
-        out[j++] = c;
+
+    /* Hash-based alias path. */
+    {
+        static const char hex[] = "0123456789ABCDEF";
+        uint16_t h;
+        int last_dot = -1;
+        int basename_end;
+
+        for (i = 0; i < name_len; i++) {
+            if (name[i] == '.') last_dot = i;
+        }
+        basename_end = (last_dot >= 0) ? last_dot : name_len;
+
+        j = 0;
+        for (i = 0; i < basename_end && j < 4; i++) {
+            uint8_t c = (uint8_t)name[i];
+            if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+            if (is_8_3_char(c)) out[j++] = c;
+        }
+        if (j == 0) out[j++] = '_';
+
+        h = lfn_hash(name, name_len);
+        out[4] = '~';
+        out[5] = hex[(h >> 8) & 0xF];
+        out[6] = hex[(h >> 4) & 0xF];
+        out[7] = hex[(h >> 0) & 0xF];
+
+        j = 8;
+        if (last_dot >= 0) {
+            for (i = last_dot + 1; i < name_len && j < 11; i++) {
+                uint8_t c = (uint8_t)name[i];
+                if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+                if (is_8_3_char(c)) out[j++] = c;
+            }
+        }
     }
 }
 
@@ -441,13 +515,83 @@ static int name_is_8_3_safe(const char *name, uint8_t name_len) {
     return 1;
 }
 
+/* Alias-match callback: iterates a directory and finds the entry whose
+ * generated 8.3 alias matches a target 11-byte name. Used when exact
+ * dir_lookup fails — lets `TYPE Y:\VERY~876.TXT` reopen the long-named
+ * file `verylongname1.txt`. */
+struct alias_lookup_state {
+    const uint8_t *target_alias;   /* 11-byte 8.3 form (uppercase, padded) */
+    uint32_t       found_inode;
+};
+static int alias_lookup_cb(const struct ext4_dir_entry *e, void *ud) {
+    /* Static so &candidate resolves via DS, not SS (interrupt context). */
+    static uint8_t candidate[11];
+    struct alias_lookup_state *s = (struct alias_lookup_state *)ud;
+    if (e->name_len == 1 && e->name[0] == '.') return 0;
+    if (e->name_len == 2 && e->name[0] == '.' && e->name[1] == '.') return 0;
+    to_8_3(e->name, e->name_len, candidate);
+    if (memcmp(candidate, s->target_alias, 11) == 0) {
+        s->found_inode = e->inode;
+        return 1;
+    }
+    return 0;
+}
+
+/* Path-lookup wrapper that walks segment-by-segment, trying exact match
+ * first and falling back to 8.3-alias match on each segment. Required for
+ * `TYPE Y:\VERY~876.TXT` — the basename "very~876.txt" doesn't exist in
+ * the directory, but it's the alias for "verylongname1.txt". */
+static uint32_t path_lookup_with_alias(struct ext4_fs *fs, const char *path) {
+    static struct ext4_inode dir_inode;
+    static char    seg[256];
+    static uint8_t target_alias[11];
+    /* Static so &alias_state resolves via DS, not SS — alias_lookup_cb
+     * dereferences `s` via near pointer, and in interrupt-handler context
+     * SS != DS. Same reason ext4_dir_lookup keeps its lookup_state static. */
+    static struct alias_lookup_state alias_state;
+    uint32_t       cur_ino = 2u;
+    uint32_t       next;
+    const char    *p = path;
+    const char    *seg_start;
+    size_t         seg_len;
+
+    while (*p == '/') p++;
+    while (*p) {
+        seg_start = p;
+        while (*p && *p != '/') p++;
+        seg_len = (size_t)(p - seg_start);
+        if (seg_len == 0u) break;
+        if (seg_len >= sizeof seg) return 0u;
+        memcpy(seg, seg_start, seg_len);
+        seg[seg_len] = '\0';
+
+        if (ext4_inode_read(fs, cur_ino, &dir_inode) != 0) return 0u;
+        if ((dir_inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) return 0u;
+
+        next = ext4_dir_lookup(fs, &dir_inode, seg);
+        if (next == 0u) {
+            /* Exact match failed — try 8.3-alias match. */
+            to_8_3(seg, (uint8_t)seg_len, target_alias);
+            alias_state.target_alias = target_alias;
+            alias_state.found_inode  = 0u;
+            (void)ext4_dir_iter(fs, &dir_inode, alias_lookup_cb, &alias_state);
+            next = alias_state.found_inode;
+        }
+        if (next == 0u) return 0u;
+        cur_ino = next;
+
+        while (*p == '/') p++;
+    }
+    return cur_ino;
+}
+
 static int find_iter_cb(const struct ext4_dir_entry *e, void *ud) {
     struct find_iter_state *s = (struct find_iter_state *)ud;
     /* Skip . and .. — FAT root convention */
     if (e->name_len == 1 && e->name[0] == '.') return 0;
     if (e->name_len == 2 && e->name[0] == '.' && e->name[1] == '.') return 0;
-    /* Skip names that don't fit DOS 8.3 (no LFN support yet). */
-    if (!name_is_8_3_safe(e->name, e->name_len)) return 0;
+    /* Names that don't fit 8.3 cleanly are NOT skipped — to_8_3() generates
+     * a deterministic ~HHH alias so they're visible to classic 8.3 callers. */
 
     if (s->current_index == s->target_index) {
         s->name_len  = e->name_len;
@@ -725,7 +869,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                 r.w.flags |= 1u;
                 return;
             }
-            inode_num = ext4_path_lookup(&g_fs, path_buf);
+            inode_num = path_lookup_with_alias(&g_fs, path_buf);
             g_ff_capture.last_open_inode_num = inode_num;
             if (inode_num == 0) {
                 g_ff_capture.last_open_rc = -102;

@@ -20,6 +20,10 @@ PART_START_LBA = 2048
 
 HELLO_BYTES = b"Hello, ext4-dos!\nThis is a test file used by tools/host_cli.\n"
 NESTED_BYTES = b"Nested file contents.\n"
+LONG_NAME_1 = "verylongname1.txt"
+LONG_NAME_2 = "verylongname2.txt"
+LONG_BYTES_1 = b"long-named file ONE.\n"
+LONG_BYTES_2 = b"long-named file TWO.\n"
 
 MKFS_FALLBACKS = [
     "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
@@ -77,6 +81,12 @@ def main() -> None:
         os.makedirs(os.path.join(tdir, "subdir"), exist_ok=True)
         with open(os.path.join(tdir, "subdir", "nested.txt"), "wb") as f:
             f.write(NESTED_BYTES)
+        # Two long-named files sharing a 4-char prefix — exercises the
+        # hash-based ~XXX alias generator (Win95-style 8.3 alias).
+        with open(os.path.join(tdir, LONG_NAME_1), "wb") as f:
+            f.write(LONG_BYTES_1)
+        with open(os.path.join(tdir, LONG_NAME_2), "wb") as f:
+            f.write(LONG_BYTES_2)
 
         offset_bytes = PART_START_LBA * SECTOR_SIZE
         size_1k_blocks = (part_sector_count * SECTOR_SIZE) // 1024
@@ -93,7 +103,8 @@ def main() -> None:
         )
 
     print(f"Wrote partitioned fixture: {OUT_PATH} "
-          f"({SIZE_MB} MiB, partition at LBA {PART_START_LBA}) with /hello.txt + /subdir/nested.txt")
+          f"({SIZE_MB} MiB, partition at LBA {PART_START_LBA}) with /hello.txt, "
+          f"/{LONG_NAME_1}, /{LONG_NAME_2}, /subdir/nested.txt")
 
 if __name__ == "__main__":
     main()

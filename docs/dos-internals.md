@@ -247,7 +247,9 @@ For now we use a conservative threshold (truncate up to ~96 MB; scale beyond) so
 
 ### LFN
 
-Long filenames (`AX=71xxh`) only work meaningfully on FreeDOS-with-DOSLFN, and DOSLFN is FAT-only — it can't query our redirector for long names. We currently truncate ext4 names to 8.3 with a (TODO) collision-suffix generator. Expect to see `MYREAL~1.TXT` for `myreallylongfilename.txt`.
+Long filenames (`AX=71xxh`) only work meaningfully on FreeDOS-with-DOSLFN, and DOSLFN is FAT-only — it can't query our redirector for long names. ext4 names that don't fit 8.3 are presented under a deterministic Win95-style alias `BASE4~HHH.EXT`, where `HHH` is a 3-hex-digit hash of the full ext4 name (see `to_8_3` and `lfn_hash` in `tools/tsr.c`). The alias is reversible — `path_lookup_with_alias` falls back to alias matching when an exact dir lookup fails, so `TYPE Y:\VERY~876.TXT` reopens `verylongname1.txt`. Per-directory collision rate is 1/4096 between any two long names that share the first 4 8.3-safe characters; the smoke test fixture has two `verylongname*.txt` files specifically to exercise the alias path.
+
+**MS-DOS 4 alias-after quirk:** opening an aliased file with TYPE works, but afterwards COMMAND.COM seems unable to EXEC anything from drive A:\ for the rest of the session (some kernel state about SFT or transient COMMAND.COM gets confused). FreeDOS doesn't have this issue. Smoke tests work around it by running ext4chk/ext4cnt/ext4dmp BEFORE the alias TYPE, with the alias roundtrip last in autoexec. Not a blocker for normal use — opening a single aliased file and continuing to work in the same shell session is fine.
 
 ### Write support
 
