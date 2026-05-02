@@ -68,9 +68,12 @@ vpath %.c tools src/blockdev src/ext4 src/partition
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
+$(HOST_DIR)/host_features_test: tools/host_features_test.c src/ext4/features.c | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR):
@@ -103,7 +106,8 @@ $(DOS_DIR):
 	mkdir -p $@
 
 host-test: host-build
-	@echo "host-test: no tests yet"
+	@echo "==> running host_features_test"
+	@$(HOST_DIR)/host_features_test
 
 dos-test: dos-build fixture-partitioned
 	@bash scripts/run-dosbox.sh

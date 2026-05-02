@@ -233,6 +233,16 @@ The `ext4chk /V` invocation in `scripts/run-msdos4-test.sh` and `scripts/run-fre
 
 ## 5. Known limitations and workarounds
 
+### Journal replay — intentionally absent
+
+ext4 puts pending writes in a journal (jbd2) before flushing them to their final disk location. A clean unmount empties the journal; an unclean unmount (crash, kernel panic, power loss) leaves transactions there. The `INCOMPAT_RECOVER` feature bit tells subsequent mounts "the journal is dirty, replay it before reading."
+
+**This driver does NOT replay the journal.** Instead, it ignores the RECOVER flag and reads the on-disk state as it stands. Same approach GRUB's ext2 driver takes ([references/grub-ext2.c "needs_recovery" comment](../references/grub-ext2.c)).
+
+The trade-off: for files that were actively being written when the host crashed, the user sees slightly stale content (the new bytes were in the journal, not yet on disk). For typical use (reading existing data on a disk that's been idle), this is fine. For boot-time recovery scenarios it would not be.
+
+If real replay ever becomes necessary, the implementation path is: parse the journal superblock from inode 8, walk descriptor → data → commit blocks building a `{disk_blk → jrnl_blk}` map, route block reads through the map. References: `references/lwext4/src/ext4_journal.c` (full read/write impl, ~2300 lines), Linux kernel `fs/jbd2/`. Estimate ~1–2 days for a read-only-replay subset.
+
 ### Multi-file open
 
 Default DOS `FILES=` defaults to 8; we have an 8-slot SFT-keyed table. If you need more, raise `FILES=` in CONFIG.SYS *and* bump `MAX_OPEN_SLOTS` in `tools/tsr.c`.
