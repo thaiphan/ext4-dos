@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fixture for in-place file-write tests (phase 1b).
+"""Fixture for in-place file-write tests.
 
-A clean ext4 with metadata_csum disabled (phase 1b refuses writes when
-metadata_csum is set; phase 1c will lift that), has_journal, and a
-single known file `/target.txt` filled with one block of 'A'.
+A clean ext4 with metadata_csum disabled (the write path requires
+metadata_csum-enabled fixtures to use mkfixture-write-csum.py instead),
+has_journal, and a single known file `/target.txt` filled with one block
+of 'A'.
 
 The test (host_write_test) writes new content (one block of 'B') via
 ext4_file_write_block and verifies the read-back matches.

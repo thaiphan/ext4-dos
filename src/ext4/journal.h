@@ -8,7 +8,7 @@
  * All multi-byte fields on disk are big-endian (the log was inherited
  * from JBD on PowerPC). Use util/endian.h's be16/be32/be64.
  *
- * Phase 0: read-side soft replay. We parse the on-disk journal, build a
+ * Read-side soft replay: we parse the on-disk journal, build a
  * map {fs_block -> latest committed copy in the journal}, and have the
  * fs read path consult the map. We do not write anything. Compared to
  * GRUB's ext2 driver (which ignores the journal entirely) this gives
@@ -42,7 +42,7 @@
  * caps aborts replay (we fall back to on-disk state with a clear error,
  * not silent corruption).
  *
- * Sized down from earlier (256/64/16) once phase 2 added 5 more
+ * Sized down from earlier (256/64/16) once the write path added 5 more
  * fs-block scratch buffers — DGROUP is finite in DOS small-model. A
  * journal flush of a few hundred journaled blocks is rare; if it
  * happens the walker bails and we serve on-disk state. */
@@ -143,8 +143,8 @@ int ext4_journal_lookup(const struct ext4_fs *fs, uint64_t fs_block,
 
 /* A pending transaction. Caller fills block_count/fs_block/buf and
  * passes to ext4_journal_commit. Buffers must remain live until commit
- * returns. Cap is small — phase 1's first call site (in-place file
- * write) uses 2 (data + inode metadata). */
+ * returns. Cap is small — the in-place file write call site uses 2
+ * (data + inode metadata). */
 #define EXT4_JBD_TRANS_MAX_BLOCKS 8
 struct ext4_jbd_trans {
     uint32_t block_count;
@@ -157,13 +157,11 @@ struct ext4_jbd_trans {
  * uses them, then immediately checkpoint (flush data to fs_blocks,
  * clean jsb, clear RECOVER).
  *
- * Phase 1 limitations:
+ * Requires:
  *   - jsb.start must be 0 on entry (clean journal — caller should mount
  *     writable so any pending replay is checkpointed first).
- *   - FS must NOT have metadata_csum set (recomputing inode/block-group
- *     checksums is phase 1c).
- *   - Refuses blocks whose first u32 matches JBD_MAGIC; the ESCAPE-tag
- *     handling for self-encoding data is also phase 1c.
+ *   - Callers are responsible for recomputing inode/block-group
+ *     checksums on metadata blocks before passing them here.
  *
  * Returns 0 on success. err is filled with a short reason on failure. */
 int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,

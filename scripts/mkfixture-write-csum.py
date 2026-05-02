@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Like mkfixture-write.py but with metadata_csum on (default
-mkfs.ext4 features), so phase 1c's inode-checksum recompute path is
-exercised end-to-end and e2fsck can validate the post-write image.
+mkfs.ext4 features), so the inode-checksum recompute path is exercised
+end-to-end and e2fsck can validate the post-write image.
 """
 import os
 import shutil

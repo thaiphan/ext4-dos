@@ -24,8 +24,8 @@ LONG_NAME_1 = "verylongname1.txt"
 LONG_NAME_2 = "verylongname2.txt"
 LONG_BYTES_1 = b"long-named file ONE.\n"
 LONG_BYTES_2 = b"long-named file TWO.\n"
-# 1024-byte target.txt: same length as one FS block, so phase 1b's
-# strict in-place writer can overwrite it from DOS.
+# 1024-byte target.txt: same length as one FS block, so the in-place
+# writer can overwrite it from DOS.
 TARGET_BYTES = b"A" * 1024
 
 MKFS_FALLBACKS = [
@@ -90,14 +90,14 @@ def main() -> None:
             f.write(LONG_BYTES_1)
         with open(os.path.join(tdir, LONG_NAME_2), "wb") as f:
             f.write(LONG_BYTES_2)
-        # /target.txt is exactly 1 block — used by phase 1b's DOS write test.
+        # /target.txt is exactly 1 block — used by the DOS write test.
         with open(os.path.join(tdir, "target.txt"), "wb") as f:
             f.write(TARGET_BYTES)
 
         offset_bytes = PART_START_LBA * SECTOR_SIZE
         size_1k_blocks = (part_sector_count * SECTOR_SIZE) // 1024
-        # Default features (incl. metadata_csum) — phase 1c recomputes
-        # inode i_checksum on writes through ext4_inode_recompute_csum.
+        # Default features (incl. metadata_csum) — inode i_checksum is
+        # recomputed on writes through ext4_inode_recompute_csum.
         subprocess.check_call(
             [
                 mkfs, "-F", "-b", "1024",

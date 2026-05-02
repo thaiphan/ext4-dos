@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixture for phase 2.5 cross-group allocation test.
+"""Fixture for cross-group block allocation test.
 
 Creates an ext4 with small blocks_per_group (-g 256) so that a 16 MiB
 FS has ~64 groups. A ~220 KiB filler packs group 0's data blocks full.

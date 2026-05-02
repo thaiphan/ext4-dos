@@ -1,4 +1,4 @@
-/* Host-side test for ext4_dir_create (phase 4).
+/* Host-side test for ext4_dir_create.
  *
  * Mounts a writable copy of write.img, creates /newdir, then verifies:
  *   - ext4_path_lookup finds the new directory

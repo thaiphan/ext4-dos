@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SYNC: Keep this script in sync with scripts/run-msdos4-test.sh.
-# When adding a new test phase here, port it there too.  Known MS-DOS 4 skips
+# When adding a new test here, port it there too.  Known MS-DOS 4 skips
 # are marked with "# SKIP(MSDOS4):" in that script.
 #
 # Boots a fresh copy of the FreeDOS LiteUSB image with our TSR + test
@@ -41,8 +41,8 @@ for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe ext4wr.exe; do
 done
 
 # Fresh working copies. The ext4 image gets mutated by the TSR's
-# REM_WRITE path now that phase 1+ writes go through int13; we don't
-# want those persisting into the source fixture.
+# REM_WRITE path now that writes go through int13; we don't want those
+# persisting into the source fixture.
 cp "$SOURCE_IMG"      "$TEST_IMG"
 cp "$EXT4_SRC_IMG"    "$EXT4_IMG"
 
@@ -67,7 +67,7 @@ echo === Multi-file: COPY HELLO+NESTED to BOTH.TXT === >> C:\OUT.TXT
 COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT C:\BOTH.TXT >> C:\OUT.TXT
 echo === TYPE C:\BOTH.TXT (concatenation result) === >> C:\OUT.TXT
 TYPE C:\BOTH.TXT >> C:\OUT.TXT
-echo === Phase 1b/2 writes: Y:\TARGET.TXT before === >> C:\OUT.TXT
+echo === Write test: Y:\TARGET.TXT before === >> C:\OUT.TXT
 TYPE Y:\TARGET.TXT >> C:\OUT.TXT
 echo --- run ext4wr (in-place B + extend C) --- >> C:\OUT.TXT
 C:\EXT4WR.EXE >> C:\OUT.TXT
@@ -75,11 +75,11 @@ echo === Y:\TARGET.TXT after write (expect 'B'*1024 + 'C'*1024) === >> C:\OUT.TX
 TYPE Y:\TARGET.TXT >> C:\OUT.TXT
 echo === DIR Y:\TARGET.TXT (expect size 2048 — extended) === >> C:\OUT.TXT
 DIR Y:\TARGET.TXT >> C:\OUT.TXT
-echo === Phase 3 create: COPY C:\BOTH.TXT Y:\NEWCOPY.TXT === >> C:\OUT.TXT
+echo === Create file: COPY C:\BOTH.TXT Y:\NEWCOPY.TXT === >> C:\OUT.TXT
 COPY C:\BOTH.TXT Y:\NEWCOPY.TXT >> C:\OUT.TXT
 echo === TYPE Y:\NEWCOPY.TXT (should match BOTH.TXT contents) === >> C:\OUT.TXT
 TYPE Y:\NEWCOPY.TXT >> C:\OUT.TXT
-echo === Phase 3.6 multi-block: COPY Y:\TARGET.TXT Y:\NEWBIG.TXT === >> C:\OUT.TXT
+echo === Multi-block copy: COPY Y:\TARGET.TXT Y:\NEWBIG.TXT === >> C:\OUT.TXT
 COPY Y:\TARGET.TXT Y:\NEWBIG.TXT >> C:\OUT.TXT
 echo === DIR Y:\NEWBIG.TXT (expect size 2048) === >> C:\OUT.TXT
 DIR Y:\NEWBIG.TXT >> C:\OUT.TXT
@@ -87,15 +87,15 @@ echo === RENAME: REN Y:\NEWBIG.TXT RENAMED.TXT === >> C:\OUT.TXT
 REN Y:\NEWBIG.TXT RENAMED.TXT >> C:\OUT.TXT
 echo === DIR Y:\RENAMED.TXT (must exist, same size) === >> C:\OUT.TXT
 DIR Y:\RENAMED.TXT >> C:\OUT.TXT
-echo === Phase 4 mkdir: MD Y:\NEWDIR === >> C:\OUT.TXT
+echo === Make directory: MD Y:\NEWDIR === >> C:\OUT.TXT
 MD Y:\NEWDIR >> C:\OUT.TXT
 echo === DIR Y:\NEWDIR (must exist) === >> C:\OUT.TXT
 DIR Y:\NEWDIR >> C:\OUT.TXT
-echo === Phase 4.5 rmdir: RD Y:\NEWDIR === >> C:\OUT.TXT
+echo === Remove directory: RD Y:\NEWDIR === >> C:\OUT.TXT
 RD Y:\NEWDIR >> C:\OUT.TXT
 echo === DIR Y: (NEWDIR must be gone) === >> C:\OUT.TXT
 DIR Y: >> C:\OUT.TXT
-echo === DEL Y:\NEWCOPY.TXT (Phase DEL — remove created file) === >> C:\OUT.TXT
+echo === DEL Y:\NEWCOPY.TXT (remove created file) === >> C:\OUT.TXT
 DEL Y:\NEWCOPY.TXT >> C:\OUT.TXT
 echo === DIR Y: after DEL (NEWCOPY must be gone, HELLO still there) === >> C:\OUT.TXT
 DIR Y: >> C:\OUT.TXT
@@ -183,17 +183,17 @@ if ! grep -q "long-named file TWO" <<<"$OUT"; then
     echo "FAIL: TYPE Y:\\VERY~EB7.TXT (8.3 alias) didn't return file content" >&2
     fail=1
 fi
-# Phase 3.5: COPY C:\BOTH.TXT Y:\NEWCOPY.TXT must produce a populated
-# file matching BOTH.TXT's contents. Exercises REM_CREATE + the CX=0
-# pre-extend convention + partial-in-place data write.
+# COPY C:\BOTH.TXT Y:\NEWCOPY.TXT must produce a populated file matching
+# BOTH.TXT's contents. Exercises REM_CREATE + the CX=0 pre-extend
+# convention + partial-in-place data write.
 if ! grep -q "Hello, ext4-dos!" <<<"$(grep -F -A4 'TYPE Y:\NEWCOPY.TXT' <<<"$OUT")"; then
     echo "FAIL: Y:\\NEWCOPY.TXT doesn't contain expected content (REM_CREATE/REM_WRITE)" >&2
     fail=1
 fi
-# Phase 3.6: COPY Y:\TARGET.TXT Y:\NEWBIG.TXT exercises multi-block
-# CX=0 pre-extend (TARGET.TXT is 2048 bytes = 2 blocks).
+# COPY Y:\TARGET.TXT Y:\NEWBIG.TXT exercises multi-block CX=0 pre-extend
+# (TARGET.TXT is 2048 bytes = 2 blocks).
 if ! grep -F -A8 'DIR Y:\NEWBIG.TXT' <<<"$OUT" | grep -qE "NEWBIG[[:space:]]+TXT[[:space:]]+2[,]?048"; then
-    echo "FAIL: Y:\\NEWBIG.TXT not 2048 bytes after multi-block COPY (Phase 3.6)" >&2
+    echo "FAIL: Y:\\NEWBIG.TXT not 2048 bytes after multi-block COPY" >&2
     fail=1
 fi
 # RENAME: NEWBIG.TXT -> RENAMED.TXT must show up at the same size.
@@ -201,14 +201,14 @@ if ! grep -F -A8 'DIR Y:\RENAMED.TXT' <<<"$OUT" | grep -qE "RENAMED[[:space:]]+T
     echo "FAIL: Y:\\RENAMED.TXT not 2048 bytes after REN (RENAME)" >&2
     fail=1
 fi
-# Phase 4: MD Y:\NEWDIR must produce a visible directory.
+# MD Y:\NEWDIR must produce a visible directory.
 if ! grep -F -A8 'DIR Y:\NEWDIR' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
-    echo "FAIL: Y:\\NEWDIR not visible as DIR after MD (Phase 4)" >&2
+    echo "FAIL: Y:\\NEWDIR not visible as DIR after MD" >&2
     fail=1
 fi
-# Phase 4.5: RD Y:\NEWDIR — must be absent from the subsequent DIR Y: listing.
+# RD Y:\NEWDIR — must be absent from the subsequent DIR Y: listing.
 if grep -F -A12 'DIR Y: (NEWDIR must be gone)' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
-    echo "FAIL: Y:\\NEWDIR still visible after RD (Phase 4.5)" >&2
+    echo "FAIL: Y:\\NEWDIR still visible after RD" >&2
     fail=1
 fi
 if ! grep -qE "56[,]?345[,]?600 bytes free" <<<"$OUT"; then
@@ -221,17 +221,17 @@ if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
 fi
 # DEL: NEWCOPY.TXT must be absent after DEL, HELLO.TXT must still be present.
 if grep -F -A12 'DIR Y: after DEL' <<<"$OUT" | grep -qE "NEWCOPY[[:space:]]+TXT"; then
-    echo "FAIL: Y:\\NEWCOPY.TXT still visible after DEL (Phase DEL)" >&2
+    echo "FAIL: Y:\\NEWCOPY.TXT still visible after DEL" >&2
     fail=1
 fi
 if ! grep -F -A12 'DIR Y: after DEL' <<<"$OUT" | grep -q "HELLO"; then
     echo "FAIL: Y:\\HELLO.TXT missing from DIR Y: after DEL (should survive)" >&2
     fail=1
 fi
-# Phase 1b + 2 REM_WRITE wiring: ext4wr reports both writes, and the
-# post-write TYPE shows 'B' followed by 'C' (no 'A' left). DOS TYPE
-# doesn't emit a trailing newline so the next echo line concatenates;
-# pattern-match for ≥100 consecutive each of 'B' and 'C', and no 'A'.
+# Write test: ext4wr reports both writes, and the post-write TYPE shows
+# 'B' followed by 'C' (no 'A' left). DOS TYPE doesn't emit a trailing
+# newline so the next echo line concatenates; pattern-match for ≥100
+# consecutive each of 'B' and 'C', and no 'A'.
 if ! grep -q "In-place wrote 1024 bytes" <<<"$OUT"; then
     echo "FAIL: ext4wr didn't report in-place 1024 bytes written" >&2
     fail=1
@@ -281,12 +281,11 @@ if ! grep -A4 "Re-check" <<<"$OUT" | grep -q "TSR not detected"; then
     fail=1
 fi
 
-# Phase 1c regression net: the TSR's REM_WRITE path must produce an
-# e2fsck-clean partition. The inode-checksum-mismatch bug we caught
-# during phase 1c bring-up (stack-local crc32c buffers under SS!=DS)
-# was invisible to DIR/TYPE assertions — only e2fsck flagged it. With
-# metadata_csum on the partitioned fixture, this catches any future
-# regression in ext4_inode_recompute_csum and friends.
+# Regression net: the TSR's REM_WRITE path must produce an e2fsck-clean
+# partition. An inode-checksum-mismatch bug (stack-local crc32c buffers
+# under SS!=DS) was invisible to DIR/TYPE assertions — only e2fsck
+# flagged it. With metadata_csum on the partitioned fixture, this catches
+# any future regression in ext4_inode_recompute_csum and friends.
 E2FSCK="$(command -v e2fsck || true)"
 for c in /opt/homebrew/opt/e2fsprogs/sbin/e2fsck \
          /usr/local/opt/e2fsprogs/sbin/e2fsck; do

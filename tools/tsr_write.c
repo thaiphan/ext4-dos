@@ -1,8 +1,8 @@
-/* Phase 1b/2 smoke test on Y:\TARGET.TXT:
+/* Write smoke test on Y:\TARGET.TXT:
  *
  *   1. Open r/w (no truncate)
- *   2. Write 1024 bytes of 'B' at offset 0 — phase 1b in-place
- *   3. Write 1024 bytes of 'C' at offset 1024 — phase 2 extend
+ *   2. Write 1024 bytes of 'B' at offset 0 — in-place overwrite
+ *   3. Write 1024 bytes of 'C' at offset 1024 — extend by one block
  *   4. Close
  *
  * After the run TARGET.TXT is 2048 bytes: 1024 'B' + 1024 'C'.

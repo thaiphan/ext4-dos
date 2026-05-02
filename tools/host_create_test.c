@@ -1,4 +1,4 @@
-/* Host-side test for ext4_file_create (phase 3).
+/* Host-side test for ext4_file_create.
  *
  * Mounts a writable copy of write.img, creates /newfile.txt with known
  * content, then verifies:

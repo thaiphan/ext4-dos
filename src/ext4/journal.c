@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Phase 0 / B: parse jbd2 superblock and walk the log to build a
+/* Parse jbd2 superblock and walk the log to build a
  * {fs_block -> journal_blk} replay map. Soft replay only — no writes. */
 
 /* Walk actions — three passes, lwext4-style. SCAN finds the last
@@ -433,11 +433,11 @@ int ext4_journal_lookup(const struct ext4_fs *fs, uint64_t fs_block,
     return 0;
 }
 
-/* --- Phase 1a: hard checkpoint (write replay map back to disk) ----------- */
+/* --- Hard checkpoint (write replay map back to disk) -------------------- */
 
 /* Write one journal-recorded block back to its on-disk fs_block
  * location. Restores the JBD magic if the tag was escaped. Reuses
- * walk_buf — phase B's walker isn't running concurrently with this. */
+ * walk_buf — the log walker isn't running concurrently with this. */
 static int checkpoint_one_block(struct ext4_fs *fs, uint64_t fs_block,
                                 uint32_t jblk, uint8_t is_escape) {
     uint32_t byte, sector, sectors;
@@ -549,7 +549,7 @@ static int update_fs_sb_recover(struct ext4_fs *fs, int set) {
     return bdev_write(fs->bd, sector, sectors, sb);
 }
 
-/* --- Phase 1b: emit a transaction (descriptor + data + commit) -------- */
+/* --- Emit a transaction (descriptor + data + commit) ------------------- */
 
 int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
                         char *err, uint32_t err_len) {
@@ -591,7 +591,7 @@ int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
     tag_bytes  = jbd_tag_bytes(&fs->jbd);
 
     /* Descriptor + N data + commit must fit in the log starting at
-     * jsb.first. (Phase 1 doesn't wrap the log.) */
+     * jsb.first. (Log wrap is not implemented.) */
     if ((uint32_t)(this_first + 1u + trans->block_count + 1u) > fs->jbd.maxlen) {
         say(err, err_len, "journal log too small for trans");
         return -7;
@@ -920,7 +920,8 @@ int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len) {
 
     /* ASYNC_COMMIT changes commit-block placement in ways the walker
      * misinterprets. Refuse it. CSUM_V2/V3 we tolerate by ignoring (commit
-     * block CRC verification is a later phase). REVOKE / 64BIT are normal. */
+     * block CRC verification is not yet implemented). REVOKE / 64BIT are
+     * normal. */
     unsupported = fs->jbd.feature_incompat & ~((uint32_t)(
         EXT4_JBD_INCOMPAT_REVOKE  |
         EXT4_JBD_INCOMPAT_64BIT   |

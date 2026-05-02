@@ -1,4 +1,4 @@
-/* Host-side test for ext4_journal_checkpoint (phase 1a hard-flush).
+/* Host-side test for ext4_journal_checkpoint (hard-flush).
  *
  * Takes a working copy of the dirty-journal fixture, opens it via the
  * writable file blockdev, and asserts that ext4_fs_open performs the

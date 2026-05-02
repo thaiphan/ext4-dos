@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SYNC: Keep this script in sync with scripts/run-freedos-test.sh.
-# When run-freedos-test.sh gains a new phase, port it here and either add
+# When run-freedos-test.sh gains a new test, port it here and either add
 # the test or mark it with "# SKIP(MSDOS4): <reason>".
 #
 # Boot Microsoft's open-source MS-DOS 4.0 (April 2024) bootable floppy in
@@ -107,11 +107,11 @@ echo === DIR Y:\*.TXT (wildcard) === >> A:\OUT.TXT
 DIR Y:\*.TXT >> A:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
-REM SKIP(MSDOS4): ext4wr, Phase 3, Phase 3.6 — any file-create write to Y: via
+REM SKIP(MSDOS4): ext4wr, file creation via COPY, multi-block COPY — any file-create write to Y: via
 REM our redirector corrupts MS-DOS 4's EXEC path (Cannot execute A:\*.EXE for
 REM the rest of the session). Same root class as the 8.3 alias TYPE quirk.
 REM Confirmed empirically; root cause not fully diagnosed. FreeDOS covers all.
-echo === Phase 4 mkdir: MD Y:\NEWDIR === >> A:\OUT.TXT
+echo === Make directory: MD Y:\NEWDIR === >> A:\OUT.TXT
 MD Y:\NEWDIR >> A:\OUT.TXT
 REM Under MS-DOS 4, DIR Y:\NEWDIR lists the *contents* of NEWDIR,
 REM not NEWDIR itself in Y:\. Use DIR Y: so the entry is visible.
@@ -200,11 +200,12 @@ if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
     echo "FAIL: g_fs.sb integrity canary tripped" >&2
     fail=1
 fi
-# SKIP(MSDOS4): Phase 1b/2, 3, 3.6 assertions — any file-create write to Y:
-# corrupts MS-DOS 4's EXEC path; all covered by FreeDOS test.
-# Phase 4: MD Y:\NEWDIR — check it appears in the subsequent DIR Y: listing.
+# SKIP(MSDOS4): write test, file creation via COPY, multi-block COPY assertions
+# — any file-create write to Y: corrupts MS-DOS 4's EXEC path; all covered by
+# FreeDOS test.
+# MD Y:\NEWDIR — check it appears in the subsequent DIR Y: listing.
 if ! grep -F -A12 'DIR Y: after MD' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
-    echo "FAIL: Y:\\NEWDIR not visible in DIR Y: after MD (Phase 4)" >&2
+    echo "FAIL: Y:\\NEWDIR not visible in DIR Y: after MD" >&2
     fail=1
 fi
 # Read-only enforcement: HELLO.TXT must survive DEL.

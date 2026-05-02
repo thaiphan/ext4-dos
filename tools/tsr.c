@@ -139,8 +139,7 @@ static struct open_slot {
 
 /* Scratch buffer for REM_WRITE: copies the user's FAR buffer into
  * DGROUP so ext4_file_write_block (which expects a near pointer) can
- * read it. One block_size worth — phase 1b's first cut writes exactly
- * one block per call. */
+ * read it. One block_size worth — writes one block per call. */
 static uint8_t g_write_buf[4096];
 
 /* Find the slot whose SFT pointer matches (sft_seg:sft_off). Returns
@@ -259,7 +258,7 @@ struct ff_capture {
     uint16_t utd_year_iters;
     uint32_t utd_days_after_year_loop;
     uint16_t utd_final_year;
-    /* Phase 3.5 diagnosis: tracks what DOS hands us on REM_CREATE vs the
+    /* SFT-pointer diagnosis: tracks what DOS hands us on REM_CREATE vs the
      * subsequent REM_WRITE. If the SFT pointer (es:di) changes between
      * the two calls, find_open_slot misses and the new file stays
      * size 0 after a DOS COPY. The captured SFT bytes let us see
@@ -1033,7 +1032,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
          * REM_CRTRWOCDS=0x18). 0x21 LSEEK is handled separately in the
          * stub below — DOS uses it for SeekEnd-to-find-EOF, which is fine
          * to support read-only via the SFT's file-size field. */
-        case 0x01: { /* REM_RMDIR — remove directory (Phase 4.5). */
+        case 0x01: { /* REM_RMDIR — remove directory. */
             static char path_buf[128];
             static char werr[64];
             static char parent_path[128];
@@ -1239,7 +1238,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             r.w.flags |= 1u;
             return;
 
-        case 0x03: { /* REM_MKDIR — create a new directory (Phase 4). */
+        case 0x03: { /* REM_MKDIR — create a new directory. */
             static char path_buf[128];
             static char werr[64];
             uint32_t parent_ino;
@@ -1318,9 +1317,9 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
         }
 
         case 0x17: { /* REM_CREATE — create a new file (or open existing for r/w).
-                      * Phase 3 first cut: create new file in a linear (non-htree)
-                      * parent directory. If file already exists: refuse with access
-                      * denied (no truncate yet — phase 3.5). */
+                      * Creates a new file in a linear (non-htree) parent directory.
+                      * If file already exists: refuse with access denied (no
+                      * truncate supported). */
             static char path_buf[128];
             static char werr[64];
             uint8_t __far *sft;
@@ -1436,7 +1435,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF)     = 0u;
             *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = 0u;
 
-            /* Phase 3.5 diagnosis: snapshot what DOS handed us + what we
+            /* SFT-pointer diagnosis: snapshot what DOS handed us + what we
              * wrote back, so a later REM_WRITE that misses the slot can
              * be compared. */
             g_ff_capture.last_create_ax        = r.w.ax;
@@ -1638,17 +1637,7 @@ extopen_notfound:
             return;
         }
 
-        case 0x09: { /* REM_WRITE — phase 1b: in-place same-length only.
-                      *
-                      * Phase 1b refuses anything that would extend the
-                      * file or hit a write that's not exactly one
-                      * aligned FS block. With those constraints the
-                      * write is a single 2-block transaction (file
-                      * data + inode-with-mtime-bumped) through
-                      * ext4_journal_commit, immediately checkpointed
-                      * to disk. Phases 2+ relax the constraints (block
-                      * allocation for extends, partial-block writes,
-                      * etc). */
+        case 0x09: { /* REM_WRITE — in-place and extend writes. */
             struct open_slot *slot;
             uint8_t __far    *sft;
             uint8_t __far    *user_buf;
@@ -1664,7 +1653,7 @@ extopen_notfound:
             int               rc;
 
             g_ff_capture.write_call_count++;
-            /* Phase 3.5 diagnosis: snapshot the entry SFT pointer + 64
+            /* SFT-pointer diagnosis: snapshot the entry SFT pointer + 64
              * bytes of SFT + register state + 128 bytes of SDA, every
              * call, to see how DOS conveys the byte count and user
              * buffer pointer. */
@@ -1775,7 +1764,7 @@ extopen_notfound:
 
             logical  = pos / bs;
             /* No safe wall-clock from inside the redirector; bump mtime
-             * monotonically. Phase 1c can swap in a real time source. */
+             * monotonically. */
             now_unix = slot->inode.mtime + 1u;
 
             g_ff_capture.last_write_pos       = pos;
@@ -1810,7 +1799,7 @@ extopen_notfound:
                  * read existing block into g_write_buf (overwriting the
                  * user-data we copied at offset 0), then overlay user
                  * data at the in-block offset. Used by DOS COPY's
-                 * post-pre-extend data writes (Phase 3.5). */
+                 * post-pre-extend data writes. */
                 uint16_t off_in_block = (uint16_t)(pos & (bs - 1u));
                 g_ff_capture.last_write_was_extend = 0u;
                 rc = ext4_file_read_block(&g_fs, &slot->inode, logical,
@@ -1836,7 +1825,7 @@ extopen_notfound:
                                             g_write_buf, (uint32_t)count, now_unix,
                                             werr, sizeof werr);
             } else {
-                /* Sparse-hole or non-contiguous extend — phase 2.5+. */
+                /* Sparse-hole or non-contiguous extend. */
                 g_ff_capture.last_write_rc = -42;
                 memcpy(g_ff_capture.last_write_err, "sparse-hole or non-contiguous extend", 36);
                 g_ff_capture.last_write_err[36] = '\0';

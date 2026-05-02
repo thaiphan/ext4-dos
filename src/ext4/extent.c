@@ -18,8 +18,8 @@ static void say_simple(char *err, uint32_t err_len, const char *msg) {
 }
 
 /* DGROUP-resident scratch buffers shared across the write paths. DOS
- * small-model has a 64 KiB DGROUP cap; with phase 2's five FS-block
- * write buffers we'd overflow at 4 KiB-per-buffer, so the WRITE path
+ * small-model has a 64 KiB DGROUP cap; with the write path's five
+ * FS-block buffers we'd overflow at 4 KiB-per-buffer, so the WRITE path
  * is capped at block_size <= 1024 (read paths still support 4 KiB).
  * Both write call sites — ext4_file_write_block (uses data + inode)
  * and ext4_file_extend_block (uses all five) — refuse to run on
@@ -143,7 +143,7 @@ int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     }
 
     /* Resolve the data block via the existing extent tree. No allocation
-     * — phase 2's job. */
+     * — not yet allocated means the call fails here. */
     rc = ext4_extent_lookup(fs, inode_in->i_block, logical_block, &fs_block_data);
     if (rc) {
         say_simple(err, err_len, "logical block has no extent");
@@ -170,8 +170,8 @@ int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     offset_in_block     = (uint32_t)(inode_byte_in_table % fs->sb.block_size);
 
     /* Read the FS block containing the inode (through the journal-aware
-     * helper — phase 1b already requires jsb.start == 0 so this is a
-     * straight on-disk read). */
+     * helper — requires jsb.start == 0 so this is a straight on-disk
+     * read). */
     rc = ext4_fs_read_block(fs, fs_block_inode, scratch_inode_block);
     if (rc) {
         say_simple(err, err_len, "read inode block failed");
@@ -211,7 +211,7 @@ int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     return 0;
 }
 
-/* --- Phase 2: extend a file by one contiguous block --------------------- */
+/* --- Block extent append ------------------------------------------------- */
 
 /* Compute the BGD checksum (low 16 bits of crc32c) for a 32- or 64-byte
  * BGD entry at `bgd_bytes` (within a BGD block buffer). The checksum
@@ -263,7 +263,7 @@ static uint32_t bitmap_compute_csum(const struct ext4_fs *fs,
     return crc;
 }
 
-/* --- Phase 3: file creation -------------------------------------------- */
+/* --- File creation ------------------------------------------------------- */
 
 /* Inode allocation result — parallel to alloc_candidate / alloc_group. */
 static uint32_t alloc_inode_num;   /* 1-based inode number */
@@ -462,7 +462,7 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
 
     /* Refuse htree directories (EXT2_INDEX_FL = 0x1000 in i_flags). */
     if (parent_inode.flags & 0x1000u) {
-        say_simple(err, err_len, "htree dir — only linear dirs supported (phase 3.5)");
+        say_simple(err, err_len, "htree dir — only linear dirs supported");
         return 0;
     }
 
@@ -530,7 +530,7 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
         }
     }
     if (!found_slot) {
-        say_simple(err, err_len, "no room in parent dir (phase 3.5 adds new dir block)");
+        say_simple(err, err_len, "no room in parent dir");
         return 0;
     }
 
@@ -1100,8 +1100,8 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
         e[11] = (uint8_t)(alloc_candidate >> 24);
     }
 
-    /* Bump i_size_lo and i_size_hi by block_size. Phase 2 only touches
-     * sub-4GB files, so size_hi typically stays 0. */
+    /* Bump i_size_lo and i_size_hi by block_size. Sub-4GB files are
+     * the common case, so size_hi typically stays 0. */
     new_size_total = (uint64_t)inode_in->size + (uint64_t)append_bytes;
     new_size_lo    = (uint32_t)(new_size_total & 0xFFFFFFFFul);
     inode_in_block[0x04] = (uint8_t) new_size_lo;
@@ -1186,7 +1186,7 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     return 0;
 }
 
-/* Phase 4: directory creation ------------------------------------------ */
+/* --- Directory creation -------------------------------------------------- */
 
 uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
                          const char *name, uint8_t name_len,
@@ -1291,7 +1291,7 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
         }
     }
     if (!found_slot) {
-        say_simple(err, err_len, "no room in parent dir (phase 4.5)");
+        say_simple(err, err_len, "no room in parent dir");
         return 0;
     }
 
@@ -1578,7 +1578,7 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
     return new_ino;
 }
 
-/* Phase 4.5: directory removal ----------------------------------------- */
+/* --- Directory removal --------------------------------------------------- */
 
 /* Physical address of the directory's data block, saved across tx1/tx2. */
 static uint64_t rmdir_data_phys;
@@ -1896,7 +1896,7 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
     return 0;
 }
 
-/* Phase 5 (DEL): file removal ------------------------------------------ */
+/* --- File removal -------------------------------------------------------- */
 
 int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
                      char *err, uint32_t err_len) {
@@ -2190,7 +2190,7 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
     return 0;
 }
 
-/* Phase RENAME: in-place directory-entry rename ------------------------- */
+/* --- In-place directory-entry rename ------------------------------------- */
 
 int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
                 const char *new_name, uint8_t new_name_len,

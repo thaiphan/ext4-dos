@@ -1,4 +1,4 @@
-/* Host-side test for ext4_dir_remove (phase 4.5).
+/* Host-side test for ext4_dir_remove.
  *
  * Creates /newdir, verifies it exists, removes it, then checks:
  *   - path_lookup returns 0 after removal

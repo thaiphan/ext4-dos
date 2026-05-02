@@ -176,11 +176,11 @@ int main(void) {
                (unsigned long)cap->last_open_size);
     }
 
-    /* Phase 3.5 diagnosis: compare REM_CREATE entry/post-state with
+    /* SFT-pointer diagnosis: compare REM_CREATE entry/post-state with
      * the subsequent REM_WRITE entry. If write_seg:write_off differs
      * from create_seg:create_off, DOS handed us a different SFT and
      * find_open_slot misses (we'd see slot_found=0). */
-    printf("\nPhase 3.5 SFT-pointer diagnosis:\n");
+    printf("\nSFT-pointer diagnosis:\n");
     printf("  CREATE: AX=0x%04x  ES:DI = %04x:%04x  inode=%lu\n",
            cap->last_create_ax,
            cap->last_create_seg, cap->last_create_off,

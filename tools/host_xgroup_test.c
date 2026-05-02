@@ -1,4 +1,4 @@
-/* Host-side test for phase 2.5 cross-group block allocation.
+/* Host-side test for cross-group block allocation.
  *
  * The xgroup fixture was built with blocks_per_group=256 and a filler
  * that completely fills group 0 (free_lo=0). Extending /target.txt

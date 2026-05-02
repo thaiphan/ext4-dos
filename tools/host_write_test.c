@@ -1,4 +1,4 @@
-/* Host-side test for ext4_file_write_block (phase 1b).
+/* Host-side test for ext4_file_write_block.
  *
  * Mounts a writable working copy of the write fixture, finds /target.txt,
  * writes one block of 'B' over its existing 'A' content, and asserts:
@@ -116,8 +116,8 @@ int main(int argc, char **argv) {
                "/control.txt was accidentally modified");
     }
 
-    /* Phase 2: extend /target.txt by exactly one block of 'C' bytes.
-     * Reuses the same working copy — the post-1b inode now has 1024
+    /* Extend /target.txt by exactly one block of 'C' bytes.
+     * Reuses the same working copy — the post-write inode now has 1024
      * bytes; we expect a 2048-byte file with block 0 'B' and block 1
      * 'C' afterwards. */
     {
@@ -146,7 +146,7 @@ int main(int argc, char **argv) {
                (unsigned long)(orig_size + 1024u),
                (unsigned long)inode.size);
 
-        /* Block 0 should still be 'B' (from the phase 1b write). */
+        /* Block 0 should still be 'B' (from the in-place write). */
         rc = ext4_file_read_block(&fs, &inode, 0, verify);
         ASSERT(rc == 0, "read /target.txt block 0 post-extend rc=%d", rc);
         {
