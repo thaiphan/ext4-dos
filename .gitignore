@@ -21,6 +21,7 @@ external/
 tests/images/*.img
 tests/images/*.ext4
 tests/images/*.raw
+tests/images/*.expect
 
 # FreeDOS test image + cached download (large, fetched on demand)
 tests/freedos/

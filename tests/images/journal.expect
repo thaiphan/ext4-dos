@@ -1,6 +1,0 @@
-fs_block=67
-journal_blk=2
-on_disk_byte0=0x02
-journal_byte0=0x40
-jsb_first=1
-jsb_sequence=1
