@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SYNC: Keep this script in sync with scripts/run-msdos4-test.sh.
+# When adding a new test phase here, port it there too.  Known MS-DOS 4 skips
+# are marked with "# SKIP(MSDOS4):" in that script.
+#
 # Boots a fresh copy of the FreeDOS LiteUSB image with our TSR + test
 # binaries injected, runs the tests via FDAUTO.BAT, then reads the
 # captured OUT.TXT back out of the image.
