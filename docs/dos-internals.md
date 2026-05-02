@@ -261,6 +261,12 @@ Long filenames (`AX=71xxh`) only work meaningfully on FreeDOS-with-DOSLFN, and D
 
 **MS-DOS 4 alias-after quirk:** opening an aliased file with TYPE works, but afterwards COMMAND.COM seems unable to EXEC anything from drive A:\ for the rest of the session (some kernel state about SFT or transient COMMAND.COM gets confused). FreeDOS doesn't have this issue. Smoke tests work around it by running ext4chk/ext4cnt/ext4dmp BEFORE the alias TYPE, with the alias roundtrip last in autoexec. Not a blocker for normal use — opening a single aliased file and continuing to work in the same shell session is fine.
 
+### Wildcard DIR — works on FreeDOS, MS-DOS 4 limitation
+
+`DIR Y:\*.TXT` works correctly on FreeDOS — our redirector compiles the user's mask from the qualified path in SDA+0x9E (e.g., `*.TXT` → 11-byte FAT pattern `????????TXT`), filters the directory iterator against it, and FreeDOS displays the matches. Smoke test verifies HELLO.TXT and the long-named files' aliases all show up under `*.TXT`, and SUBDIR (no extension) is correctly excluded.
+
+Under MS-DOS 4, the same `DIR Y:\*.TXT` request issues a single FindFirst (AL=0x19) and never follows up with FindNext (AL=0x1A or 0x1C) — the call counts show zero FindNexts. Our FindFirst returns success with HELLO.TXT in the SDA's SearchDir entry, but MS-DOS 4's DIR command shows "Volume in drive Y has no label" with zero entries. Plain `DIR Y:` (no wildcard) works fine, so the issue is specific to the wildcard-result-display path inside MS-DOS 4 COMMAND.COM. We didn't trace it further — FreeDOS being the production target, the MS-DOS 4 wildcard limitation is documented and shipped. If a real user reports it, the fix would likely involve setting an additional SearchDir field that MS-DOS 4 reads for "more results pending" — needs heavy-debugger trace into TCMD1A.ASM's DIR loop.
+
 ### Write support
 
 Read-only for v1. Writes are deliberately out of scope — `CREATE`, `WRITE`, `DELETE`, `RENAME`, `SET_ATTR`, etc. all return error.

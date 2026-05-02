@@ -51,6 +51,8 @@ echo === FindFirst Y: (raw INT 21h) === >> C:\OUT.TXT
 C:\EXT4DIR.EXE >> C:\OUT.TXT
 echo === DIR Y: === >> C:\OUT.TXT
 DIR Y: >> C:\OUT.TXT
+echo === DIR Y:\*.TXT (wildcard) === >> C:\OUT.TXT
+DIR Y:\*.TXT >> C:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> C:\OUT.TXT
 TYPE Y:\HELLO.TXT >> C:\OUT.TXT
 echo === Multi-file: COPY HELLO+NESTED to BOTH.TXT === >> C:\OUT.TXT
@@ -154,6 +156,17 @@ fi
 # Read-only enforcement: HELLO.TXT must survive the DEL attempt.
 if ! grep -A2 "HELLO.TXT must still be there" <<<"$OUT" | grep -q "HELLO"; then
     echo "FAIL: read-only enforcement may have allowed DEL Y:\\HELLO.TXT" >&2
+    fail=1
+fi
+# Wildcard: DIR Y:\*.TXT must list HELLO.TXT and skip SUBDIR (no extension).
+# -F (fixed-string) avoids escaping the literal \ and * in the header marker.
+WILD_BLOCK=$(grep -F -A12 'DIR Y:\*.TXT (wildcard)' <<<"$OUT")
+if ! grep -q "HELLO" <<<"$WILD_BLOCK"; then
+    echo "FAIL: DIR Y:\\*.TXT didn't list HELLO.TXT" >&2
+    fail=1
+fi
+if grep -q "SUBDIR" <<<"$WILD_BLOCK"; then
+    echo "FAIL: DIR Y:\\*.TXT incorrectly listed SUBDIR (no .TXT extension)" >&2
     fail=1
 fi
 # Uninstall: TSR should report success and the post-uninstall ext4chk

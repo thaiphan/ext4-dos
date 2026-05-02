@@ -484,11 +484,30 @@ struct find_iter_state {
     uint16_t target_index;
     uint16_t current_index;
     int      found;
+    uint8_t  pattern[11];     /* 8.3-form search pattern from SDA's SDB */
+    uint8_t  pattern_set;     /* 1 if caller populated `pattern`, 0 = match all */
     uint8_t  name_len;
     char     name[256];
+    uint8_t  name83[11];      /* 8.3 form of the matched entry */
     uint32_t inode;
     uint8_t  file_type;
 };
+
+/* FAT 8.3 wildcard matching: each pattern position must equal the
+ * corresponding name byte, except '?' matches any character (including
+ * the trailing-space padding used for short names and missing
+ * extensions). DOS pre-compiles user patterns like `*.TXT` into the
+ * 11-byte form (`????????TXT`) and stuffs it into the SDB before
+ * dispatching to us, so we don't need to expand `*` ourselves — just
+ * compare. */
+static int name83_matches_pattern(const uint8_t *name83, const uint8_t *pattern) {
+    int i;
+    for (i = 0; i < 11; i++) {
+        if (pattern[i] == '?') continue;
+        if (pattern[i] != name83[i]) return 0;
+    }
+    return 1;
+}
 
 static int name_is_8_3_safe(const char *name, uint8_t name_len) {
     /* DOS 8.3 char set: A-Z 0-9 ! # $ % & ' ( ) - @ ^ _ ` { } ~ + spaces.
@@ -588,6 +607,9 @@ static uint32_t path_lookup_with_alias(struct ext4_fs *fs, const char *path) {
 }
 
 static int find_iter_cb(const struct ext4_dir_entry *e, void *ud) {
+    /* Static so &alias resolves via DS, not SS — interrupt-context SS!=DS
+     * pitfall, same reason every other static buffer in this file is. */
+    static uint8_t alias[11];
     struct find_iter_state *s = (struct find_iter_state *)ud;
     /* Skip . and .. — FAT root convention */
     if (e->name_len == 1 && e->name[0] == '.') return 0;
@@ -595,10 +617,18 @@ static int find_iter_cb(const struct ext4_dir_entry *e, void *ud) {
     /* Names that don't fit 8.3 cleanly are NOT skipped — to_8_3() generates
      * a deterministic ~HHH alias so they're visible to classic 8.3 callers. */
 
+    /* Filter by 8.3 search pattern (e.g. DIR Y:\*.TXT). pattern_set==0
+     * means no filter — return everything. */
+    to_8_3(e->name, e->name_len, alias);
+    if (s->pattern_set && !name83_matches_pattern(alias, s->pattern)) {
+        return 0;
+    }
+
     if (s->current_index == s->target_index) {
         s->name_len  = e->name_len;
         memcpy(s->name, e->name, e->name_len);
         s->name[e->name_len] = '\0';
+        memcpy(s->name83, alias, 11);
         s->inode     = e->inode;
         s->file_type = e->file_type;
         s->found     = 1;
@@ -663,6 +693,74 @@ static int do_findfirst_or_next(uint16_t entry_index) {
     state.target_index  = entry_index;
     state.current_index = 0;
     state.found         = 0;
+    /* Compile the user's 8.3 search pattern from the canonical path in
+     * SDA+SDA_PRI_PATH_OFF (e.g. "Y:\*.TXT"). MS-DOS 4 doesn't fill the
+     * SDB pattern field for redirector dispatch (FreeDOS sometimes does);
+     * parsing the last path component and expanding `*` to `?` ourselves
+     * works on both. Patterns of "*.*" or no extension match everything. */
+    {
+        uint8_t __far *src = (uint8_t __far *)(g_sda + SDA_PRI_PATH_OFF);
+        int          basename_start = 0;
+        int          src_len = 0;
+        int          j;
+        int          dot_at = -1;
+        int          star_seen = 0;
+        /* Walk the path, find last '\' or '/'. Skip the drive prefix
+         * "X:" if present so a bare "Y:" or "Y:" + no path component
+         * doesn't get treated as the basename. */
+        while (src_len < 80 && src[src_len] != 0) src_len++;
+        if (src_len >= 2 && src[1] == ':') basename_start = 2;
+        for (j = 0; j < src_len; j++) {
+            if (src[j] == '\\' || src[j] == '/') basename_start = j + 1;
+        }
+        /* Locate '.' within the basename (last one wins for things like
+         * "verylongname1.txt" — but for 8.3 patterns there's only one). */
+        for (j = basename_start; j < src_len; j++) {
+            if (src[j] == '.') dot_at = j;
+        }
+        /* Initialise pattern to all '?' (= match anything). Then overlay
+         * literal characters from the basename. */
+        for (j = 0; j < 11; j++) state.pattern[j] = '?';
+        state.pattern_set = 0u;
+
+        /* Name field (positions 0..7). */
+        {
+            int p = 0;
+            int end = (dot_at >= 0) ? dot_at : src_len;
+            for (j = basename_start; j < end && p < 8; j++) {
+                uint8_t c = src[j];
+                if (c == '*') { star_seen = 1; break; }
+                if (c == '?') { p++; continue; }
+                if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+                state.pattern[p++] = c;
+                state.pattern_set = 1u;
+            }
+            if (!star_seen) {
+                /* Literal name shorter than 8: pad with space (so trailing
+                 * '?'s in pattern would over-match). DOS convention: an
+                 * exact basename must equal the entry's space-padded form. */
+                for (; p < 8; p++) state.pattern[p] = ' ';
+            }
+        }
+        /* Extension field (positions 8..10). */
+        if (dot_at >= 0) {
+            int p = 8;
+            star_seen = 0;
+            for (j = dot_at + 1; j < src_len && p < 11; j++) {
+                uint8_t c = src[j];
+                if (c == '*') { star_seen = 1; break; }
+                if (c == '?') { p++; continue; }
+                if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+                state.pattern[p++] = c;
+                state.pattern_set = 1u;
+            }
+            if (!star_seen) {
+                for (; p < 11; p++) state.pattern[p] = ' ';
+            }
+        }
+        /* No basename at all (e.g. "Y:\") — match everything. */
+        if (basename_start >= src_len) state.pattern_set = 0u;
+    }
     rc = ext4_dir_iter(&g_fs, &root_inode, find_iter_cb, &state);
     g_ff_capture.flow_dir_iter_returned = (uint16_t)rc;
     if (!state.found) {
@@ -677,7 +775,9 @@ static int do_findfirst_or_next(uint16_t entry_index) {
         goto done;
     }
 
-    to_8_3(state.name, state.name_len, name83);
+    /* Use the alias find_iter_cb already generated for the matched entry —
+     * no need to recompute via to_8_3(). */
+    for (i = 0; i < 11; i++) name83[i] = state.name83[i];
 
     sdb    = (uint8_t __far *)(g_sda + SDA_TMP_DM_OFF);
     dirent = (uint8_t __far *)(g_sda + SDA_SEARCH_DIR_OFF);
