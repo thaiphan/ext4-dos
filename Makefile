@@ -68,12 +68,15 @@ vpath %.c tools src/blockdev src/ext4 src/partition
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_features_test: tools/host_features_test.c src/ext4/features.c | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
+$(HOST_DIR)/host_stress_test: tools/host_stress_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR):
@@ -108,6 +111,13 @@ $(DOS_DIR):
 host-test: host-build
 	@echo "==> running host_features_test"
 	@$(HOST_DIR)/host_features_test
+
+host-stress: host-build tests/images/stress.img
+	@echo "==> running host_stress_test"
+	@$(HOST_DIR)/host_stress_test tests/images/stress.img
+
+tests/images/stress.img: scripts/mkfixture-stress.py
+	python3 scripts/mkfixture-stress.py
 
 dos-test: dos-build fixture-partitioned
 	@bash scripts/run-dosbox.sh

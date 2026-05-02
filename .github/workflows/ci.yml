@@ -42,6 +42,9 @@ jobs:
       - name: Run host tests (feature-flag refusal)
         run: make host-test
 
+      - name: Run host stress test (256 MiB modern-ext4 fixture)
+        run: make host-stress
+
       - name: Build DOS binaries
         run: |
           export WATCOM="${WATCOM:-$WATCOM_2_0}"
