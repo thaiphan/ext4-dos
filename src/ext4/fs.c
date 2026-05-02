@@ -66,3 +66,28 @@ void ext4_fs_close(struct ext4_fs *fs) {
     (void)fs;
     /* No dynamic state; nothing to free. */
 }
+
+int ext4_fs_read_block(struct ext4_fs *fs, uint64_t fs_block, void *out_buf) {
+    uint32_t jblk;
+    uint8_t  is_escape;
+    uint32_t byte, sector, sectors;
+    int      rc;
+
+    if (ext4_journal_lookup(fs, fs_block, &jblk, &is_escape)) {
+        rc = ext4_journal_read_log_block(fs, jblk, out_buf);
+        if (rc) return rc;
+        if (is_escape) {
+            /* jbd2 zeroes the first u32 of any data block whose original
+             * value was the journal magic, so the descriptor walker
+             * doesn't get confused. On replay we restore it. */
+            uint8_t *p = (uint8_t *)out_buf;
+            p[0] = 0xC0; p[1] = 0x3B; p[2] = 0x39; p[3] = 0x98;
+        }
+        return 0;
+    }
+
+    byte    = (uint32_t)(fs_block * (uint64_t)fs->sb.block_size);
+    sector  = (uint32_t)(fs->partition_lba + byte / fs->bd->sector_size);
+    sectors = fs->sb.block_size / fs->bd->sector_size;
+    return bdev_read(fs->bd, sector, sectors, out_buf);
+}

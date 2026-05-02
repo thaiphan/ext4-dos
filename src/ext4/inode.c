@@ -11,16 +11,14 @@ int ext4_inode_read(struct ext4_fs *fs, uint32_t ino, struct ext4_inode *out) {
     uint32_t       inode_table_lo;
     uint32_t       inode_table_hi;
     uint64_t       inode_table_block;
-    uint64_t       inode_byte;
-    uint64_t       inode_sector;
-    uint32_t       offset_in_sector;
-    uint32_t       sector_size;
-    uint32_t       end_byte;
-    uint32_t       sectors_to_read;
+    uint64_t       inode_byte_in_table;
+    uint64_t       fs_block;
+    uint32_t       offset_in_block;
     /* Static so this lives in DGROUP — the bdev_read path stores
      * its segment as DS, which is wrong for stack locals when called
-     * from an interrupt context (SS != DS). */
-    static uint8_t buf[1024];
+     * from an interrupt context (SS != DS). Sized to hold a full FS
+     * block since journaling tracks at FS-block granularity. */
+    static uint8_t buf[4096];
     const uint8_t *raw;
     uint32_t       size_lo;
     uint32_t       size_hi;
@@ -37,22 +35,19 @@ int ext4_inode_read(struct ext4_fs *fs, uint32_t ino, struct ext4_inode *out) {
     inode_table_hi = (fs->bgd_size >= 64u) ? le32(bgd + 0x28) : 0u;
     inode_table_block = ((uint64_t)inode_table_hi << 32) | inode_table_lo;
 
-    inode_byte = inode_table_block * (uint64_t)fs->sb.block_size
-               + (uint64_t)index_in_group * fs->sb.inode_size;
-
-    sector_size      = fs->bd->sector_size;
-    inode_sector     = fs->partition_lba + inode_byte / sector_size;
-    offset_in_sector = (uint32_t)(inode_byte % sector_size);
-
     if (fs->sb.inode_size > 1024u) return -3;
-    end_byte        = offset_in_sector + fs->sb.inode_size;
-    sectors_to_read = (end_byte + sector_size - 1u) / sector_size;
-    if (sectors_to_read * sector_size > sizeof buf) return -4;
+    if (fs->sb.block_size > sizeof buf) return -4;
 
-    rc = bdev_read(fs->bd, inode_sector, sectors_to_read, buf);
+    /* Read the whole FS block that contains this inode so the journal
+     * redirect can substitute it block-for-block if needed. */
+    inode_byte_in_table = (uint64_t)index_in_group * fs->sb.inode_size;
+    fs_block            = inode_table_block + inode_byte_in_table / fs->sb.block_size;
+    offset_in_block     = (uint32_t)(inode_byte_in_table % fs->sb.block_size);
+
+    rc = ext4_fs_read_block(fs, fs_block, buf);
     if (rc) return -5;
 
-    raw = buf + offset_in_sector;
+    raw = buf + offset_in_block;
     out->mode  = le16(raw + 0x00);
     out->flags = le32(raw + 0x20);
     out->mtime = le32(raw + 0x10);

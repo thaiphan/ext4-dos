@@ -16,9 +16,6 @@ int ext4_extent_lookup(struct ext4_fs *fs, const uint8_t *initial_node,
     uint64_t       next_block;
     int            found;
     uint32_t       best_logical;
-    uint64_t       byte;
-    uint64_t       sector;
-    uint32_t       sectors;
     int            rc;
 
     if (fs->sb.block_size > sizeof node_buf) return -10;
@@ -71,11 +68,7 @@ int ext4_extent_lookup(struct ext4_fs *fs, const uint8_t *initial_node,
         }
         if (!found) return -3;
 
-        byte    = next_block * (uint64_t)fs->sb.block_size;
-        sector  = fs->partition_lba + byte / fs->bd->sector_size;
-        sectors = fs->sb.block_size / fs->bd->sector_size;
-
-        rc = bdev_read(fs->bd, sector, sectors, node_buf);
+        rc = ext4_fs_read_block(fs, next_block, node_buf);
         if (rc) return -5;
 
         node = node_buf;
@@ -88,24 +81,12 @@ int ext4_file_read_block(struct ext4_fs *fs, const struct ext4_inode *inode,
      * In interrupt-handler context SS != DS — extent_lookup writes *out_phys
      * with DS-relative addressing, so we need phys to live in DGROUP. */
     static uint64_t phys;
-    /* Math is done in 32-bit because OpenWatcom 16-bit's 64-bit runtime
-     * appears to misbehave when the handler runs with SS != DS. uint32_t
-     * is sufficient for v1: phys < 2^22 typical, block_size <= 4096,
-     * product < 2^34 — fits in 64-bit but our worst-case sectors (<2^32)
-     * fits in uint32_t. */
-    uint32_t byte;
-    uint32_t sector;
-    uint32_t sectors;
-    int      rc;
+    int             rc;
 
     rc = ext4_extent_lookup(fs, inode->i_block, logical_block, &phys);
     if (rc) return rc;
 
-    byte    = (uint32_t)phys * fs->sb.block_size;
-    sector  = (uint32_t)fs->partition_lba + byte / fs->bd->sector_size;
-    sectors = fs->sb.block_size / fs->bd->sector_size;
-
-    return bdev_read(fs->bd, sector, sectors, out_buf);
+    return ext4_fs_read_block(fs, phys, out_buf);
 }
 
 int ext4_file_read_head(struct ext4_fs *fs, const struct ext4_inode *inode,

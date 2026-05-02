@@ -96,6 +96,34 @@ int main(int argc, char **argv) {
                                        journal_blk_expect, jblk);
     ASSERT(is_escape == 0,             "tag should not be escaped");
 
+    /* End-to-end: ext4_fs_read_block should return the journaled bytes,
+     * not the on-disk bytes. The forged data block has its first byte
+     * XORed; both bytes are recorded in the expect file. */
+    {
+        static uint8_t blk[4096];
+        rc = ext4_fs_read_block(&fs, (uint64_t)fs_block_expect, blk);
+        ASSERT(rc == 0, "ext4_fs_read_block rc=%d", rc);
+        ASSERT(blk[0] == (uint8_t)journal_byte0,
+               "post-replay byte0 expected 0x%02x (journaled), got 0x%02x "
+               "(on-disk would be 0x%02x)",
+               journal_byte0, blk[0], on_disk_byte0);
+    }
+
+    /* Bypass: a raw bdev_read of the same block (no replay) should
+     * return the on-disk content. This proves the redirect is actually
+     * happening, not just coincidence. */
+    {
+        static uint8_t raw[4096];
+        uint32_t byte    = (uint32_t)((uint64_t)fs_block_expect * fs.sb.block_size);
+        uint32_t sector  = byte / fs.bd->sector_size;
+        uint32_t sectors = fs.sb.block_size / fs.bd->sector_size;
+        rc = bdev_read(fs.bd, sector, sectors, raw);
+        ASSERT(rc == 0, "raw bdev_read rc=%d", rc);
+        ASSERT(raw[0] == (uint8_t)on_disk_byte0,
+               "raw read byte0 expected 0x%02x (on-disk), got 0x%02x",
+               on_disk_byte0, raw[0]);
+    }
+
     if (failures == 0) {
         printf("host_journal_test: all asserts passed (replay redirects "
                "fs_block=%u -> journal_blk=%u)\n",

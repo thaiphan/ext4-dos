@@ -25,4 +25,11 @@ struct ext4_fs {
 int  ext4_fs_open(struct ext4_fs *fs, struct blockdev *bd, uint64_t partition_lba);
 void ext4_fs_close(struct ext4_fs *fs);
 
+/* Read one full FS block (block_size bytes) into out_buf, redirecting
+ * through the journal replay map if a newer committed copy exists.
+ * Use this for any post-mount FS-block read (inode tables, extent
+ * nodes, file/dir data). The pre-mount paths (sb, bgd) and the journal
+ * itself stay on raw bdev_read. */
+int ext4_fs_read_block(struct ext4_fs *fs, uint64_t fs_block, void *out_buf);
+
 #endif
