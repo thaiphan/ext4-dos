@@ -76,7 +76,7 @@ int main(int argc, char **argv) {
 
     memset(new_block, 'C', sizeof new_block);
     now = inode.mtime + 1u;
-    rc = ext4_file_extend_block(&fs, &inode, target_ino, new_block,
+    rc = ext4_file_extend_block(&fs, &inode, target_ino, new_block, sizeof new_block,
                                 now, err, sizeof err);
     ASSERT(rc == 0, "ext4_file_extend_block rc=%d err='%s'", rc, err);
 

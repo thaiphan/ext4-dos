@@ -42,6 +42,18 @@ int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
                           const void *new_data, uint32_t now_unix,
                           char *err, uint32_t err_len);
 
+/* Create a new regular file in the directory at parent_ino.
+ * name must be null-terminated; name_len is strlen(name).
+ * mode sets the file type bits (e.g. EXT4_S_IFREG | 0644).
+ * Finds a free inode, initialises it, and inserts a new linear dir entry
+ * into parent_ino's first data block that has room. Refuses if the
+ * parent directory uses htree indexing (phase 3.5 adds htree support).
+ * Returns the new inode number on success, 0 on failure with err set. */
+uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
+                          const char *name, uint8_t name_len,
+                          uint16_t mode, uint32_t now_unix,
+                          char *err, uint32_t err_len);
+
 /* Append exactly one new block to the end of the file, populating it
  * with `new_data` (block_size bytes). Phase 2 first cut: only the
  * "extend last leaf extent by 1" path is supported, and only when the
@@ -61,8 +73,12 @@ int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
  *
  * The inode's size is bumped by exactly one block; mtime is set to
  * `now_unix`; the in-memory inode_in is updated to reflect both. */
+/* append_bytes: how many valid bytes are in new_data (≤ block_size).
+ * Zeros fill the rest of the block on disk; inode.size advances by
+ * append_bytes, not block_size. Pass block_size for a full-block extend. */
 int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
                            uint32_t inode_num, const void *new_data,
+                           uint32_t append_bytes,
                            uint32_t now_unix, char *err, uint32_t err_len);
 
 #endif

@@ -1001,7 +1001,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
         case 0x0E: /* REM_SETATTR — change file attributes */
         case 0x11: /* REM_RENAME */
         case 0x13: /* REM_DELETE */
-        case 0x17: /* REM_CREATE — create new file */
+        /* 0x17 = REM_CREATE: now handled above — do not fall through here */
             /* 0x18 deliberately NOT here: FreeDOS's network.h calls it
              * REM_CRTRWOCDS (create-R/W-without-CDS), but other references
              * map it to a FindFirst-alt that older DOS issues. The
@@ -1020,6 +1020,129 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             /* If no slot matched, the SFT wasn't ours — be lenient and
              * return success anyway. DOS may close handles in bulk
              * during process termination. */
+            r.w.flags &= ~1u;
+            return;
+        }
+
+        case 0x17: { /* REM_CREATE — create a new file (or open existing for r/w).
+                      * Phase 3 first cut: create new file in a linear (non-htree)
+                      * parent directory. If file already exists: refuse with access
+                      * denied (no truncate yet — phase 3.5). */
+            static char path_buf[128];
+            static char werr[64];
+            uint8_t __far *sft;
+            uint32_t       new_inode_num;
+            uint32_t       parent_ino;
+            int            rc_path;
+            int            base_idx;
+            int            p;
+            uint8_t        name_len;
+            uint32_t       now_unix;
+            struct open_slot *slot;
+
+            if (!g_fs_ready) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            rc_path = dos_to_ext4_path(path_buf, sizeof path_buf);
+            if (rc_path != 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+
+            /* Split path: find last '/' to get parent + basename. */
+            base_idx = 0;
+            for (p = 0; path_buf[p]; p++) {
+                if (path_buf[p] == '/') base_idx = p + 1;
+            }
+            /* Refuse if file already exists. */
+            if (path_lookup_with_alias(&g_fs, path_buf) != 0) {
+                r.w.ax = 5u; /* ACCESS_DENIED */
+                r.w.flags |= 1u;
+                return;
+            }
+            /* Resolve parent directory. base_idx is one past the last '/'.
+             * Copy path_buf[0..base_idx-2] (strips trailing slash). */
+            if (base_idx <= 1) {
+                parent_ino = 2u; /* root — file is directly in '/' */
+            } else {
+                static char parent_path[128];
+                int j;
+                /* Copy up to but NOT including the trailing '/' at base_idx-1. */
+                for (j = 0; j + 1 < base_idx && j < 127; j++)
+                    parent_path[j] = path_buf[j];
+                parent_path[j] = '\0';
+                parent_ino = ext4_path_lookup(&g_fs, parent_path);
+                if (parent_ino == 0) {
+                    r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                    r.w.flags |= 1u;
+                    return;
+                }
+            }
+            /* name_len and pointer. */
+            name_len = 0;
+            while (path_buf[base_idx + name_len]) name_len++;
+            if (name_len == 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+
+            /* TSR has no wall clock; use a fixed timestamp (~2026). */
+            now_unix = 0x6A000000u;
+
+            slot = alloc_open_slot(r.x.es, r.w.di);
+            if (!slot) {
+                r.w.ax = 4u; /* TOO_MANY_OPEN_FILES */
+                r.w.flags |= 1u;
+                return;
+            }
+
+            werr[0] = '\0';
+            new_inode_num = ext4_file_create(&g_fs, parent_ino,
+                                             path_buf + base_idx, name_len,
+                                             (uint16_t)(0x8000u | 0644u), now_unix,
+                                             werr, sizeof werr);
+            if (new_inode_num == 0) {
+                slot->used = 0;
+                r.w.ax = DOS_ERR_WRITE_PROTECT;
+                r.w.flags |= 1u;
+                return;
+            }
+
+            /* Initialise slot with the new (empty) inode. */
+            slot->used      = 1;
+            slot->sft_seg   = r.x.es;
+            slot->sft_off   = r.w.di;
+            slot->inode_num = new_inode_num;
+            /* Build a minimal in-memory inode for the slot (no disk re-read). */
+            memset(&slot->inode, 0, sizeof slot->inode);
+            slot->inode.mode  = (uint16_t)(0x8000u | 0644u);
+            slot->inode.size  = 0u;
+            slot->inode.mtime = now_unix;
+            slot->inode.flags = EXT4_INODE_FLAG_EXTENTS;
+            /* i_block: extent header (entries=0) */
+            slot->inode.i_block[0] = (uint8_t)EXT4_EXT_MAGIC;
+            slot->inode.i_block[1] = (uint8_t)(EXT4_EXT_MAGIC >> 8);
+            slot->inode.i_block[4] = 4u; /* max = 4 */
+
+            sft = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+            *(uint16_t __far *)(sft + SFT_REF_COUNT_OFF) = 1u;
+            *(uint16_t __far *)(sft + SFT_DEVINFO_OFF)   =
+                (uint16_t)(0x8000u | g_drive_index);
+            sft[SFT_FILE_ATTR_OFF] = 0x00u; /* normal file */
+            {
+                uint32_t td = unix_to_dos(now_unix);
+                *(uint16_t __far *)(sft + SFT_FILE_TIME_OFF) =
+                    (uint16_t)(td & 0xFFFFul);
+                *(uint16_t __far *)(sft + SFT_FILE_DATE_OFF) =
+                    (uint16_t)(td >> 16);
+            }
+            *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF)     = 0u;
+            *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = 0u;
+
             r.w.flags &= ~1u;
             return;
         }
@@ -1168,16 +1291,12 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             file_size = (uint32_t)slot->inode.size;
             count     = r.w.cx;
 
-            /* Phase 1b/2 shape: count == one whole FS block, pos block-
-             * aligned. Either in-place (pos+count <= file_size, calls
-             * write_block) or pure append (pos == file_size, calls
-             * extend_block by exactly one block). Anything else
-             * (partial-block, mid-file write that grows, sparse hole)
-             * still falls back to WRITE_PROTECT. */
-            if (count == 0u
-                || (uint32_t)count != bs
-                || (pos & (bs - 1u)) != 0u
-                || bs > sizeof g_write_buf) {
+            /* Phase 3 relaxes the count constraint: partial-block appends
+             * (count < bs) are now allowed for the extend path (phase 3 creates
+             * files whose size doesn't align to a full block — e.g. 61-byte
+             * HELLO.TXT). In-place still requires count == bs AND alignment.
+             * Partial in-place writes and sparse-hole grows remain refused. */
+            if (count == 0u || bs > sizeof g_write_buf) {
                 r.w.ax = DOS_ERR_WRITE_PROTECT;
                 r.w.flags |= 1u;
                 return;
@@ -1205,16 +1324,25 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             g_ff_capture.last_write_file_size = file_size;
             werr[0] = '\0';
 
-            if (pos + (uint32_t)count <= file_size) {
+            if (pos + (uint32_t)count <= file_size
+                && (uint32_t)count == bs
+                && (pos & (bs - 1u)) == 0u) {
+                /* Full-block in-place write. */
                 g_ff_capture.last_write_was_extend = 0u;
                 rc = ext4_file_write_block(&g_fs, &slot->inode, slot->inode_num,
                                            logical, g_write_buf, now_unix,
                                            werr, sizeof werr);
-            } else if (pos == file_size) {
-                /* Pure single-block append. extend_block bumps inode size. */
+            } else if (pos == file_size && (pos & (bs - 1u)) == 0u) {
+                /* Append at EOF — may be partial (count < bs).
+                 * Zero-pad g_write_buf beyond count bytes; extend_block
+                 * writes the full block but inode.size advances by count. */
+                {
+                    uint16_t z;
+                    for (z = count; z < bs; z++) g_write_buf[z] = 0u;
+                }
                 g_ff_capture.last_write_was_extend = 1u;
                 rc = ext4_file_extend_block(&g_fs, &slot->inode, slot->inode_num,
-                                            g_write_buf, now_unix,
+                                            g_write_buf, (uint32_t)count, now_unix,
                                             werr, sizeof werr);
             } else {
                 /* Sparse-hole or non-contiguous extend — phase 2.5+. */

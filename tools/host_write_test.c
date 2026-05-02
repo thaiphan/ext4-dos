@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
         ASSERT(rc == 0, "re-read inode for extend rc=%d", rc);
         orig_size = inode.size;
 
-        rc = ext4_file_extend_block(&fs, &inode, target_ino, ext_block,
+        rc = ext4_file_extend_block(&fs, &inode, target_ino, ext_block, sizeof ext_block,
                                     now + 1u, err, sizeof err);
         ASSERT(rc == 0, "ext4_file_extend_block rc=%d err='%s'", rc, err);
 
