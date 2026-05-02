@@ -53,6 +53,20 @@ echo === FindFirst Y: (raw INT 21h) === >> C:\OUT.TXT
 C:\EXT4DIR.EXE >> C:\OUT.TXT
 echo === DIR Y: === >> C:\OUT.TXT
 DIR Y: >> C:\OUT.TXT
+REM Regression: REM_CLOSE must zero sf_ref_count or every Open leaks an SFT
+REM entry.  FreeDOS's higher default FILES= masks this on its own, but the
+REM same handler runs for both DOSes -- assert here so a regression can't
+REM hide on FreeDOS while breaking MS-DOS 4.
+echo === Regression: 8 sequential TYPEs (SFT leak guard) === >> C:\OUT.TXT
+TYPE Y:\HELLO.TXT >> C:\OUT.TXT
+TYPE Y:\HELLO.TXT >> C:\OUT.TXT
+TYPE Y:\HELLO.TXT >> C:\OUT.TXT
+TYPE Y:\HELLO.TXT >> C:\OUT.TXT
+TYPE Y:\HELLO.TXT >> C:\OUT.TXT
+TYPE Y:\HELLO.TXT >> C:\OUT.TXT
+TYPE Y:\HELLO.TXT >> C:\OUT.TXT
+TYPE Y:\HELLO.TXT >> C:\OUT.TXT
+echo === End regression === >> C:\OUT.TXT
 echo === DIR Y:\*.TXT (wildcard) === >> C:\OUT.TXT
 DIR Y:\*.TXT >> C:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> C:\OUT.TXT
@@ -167,6 +181,12 @@ echo "$OUT"
 fail=0
 if ! grep -q "Hello, ext4-dos!" <<<"$OUT"; then
     echo "FAIL: TYPE Y:\\HELLO.TXT didn't return file content" >&2
+    fail=1
+fi
+# Regression: 8 sequential TYPEs must all return content (SFT-leak guard).
+HELLO_COUNT=$(grep -c "Hello, ext4-dos!" <<<"$OUT" || true)
+if (( HELLO_COUNT < 8 )); then
+    echo "FAIL: expected >=8 successful TYPE Y:\\HELLO.TXT readbacks (SFT leak?), got ${HELLO_COUNT}" >&2
     fail=1
 fi
 if ! grep -q "long-named file ONE" <<<"$OUT"; then

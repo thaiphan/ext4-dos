@@ -111,6 +111,20 @@ echo === FindFirst Y: (raw INT 21h) === >> A:\OUT.TXT
 A:\EXT4DIR.EXE >> A:\OUT.TXT
 echo === DIR Y: === >> A:\OUT.TXT
 DIR Y: >> A:\OUT.TXT
+REM Regression: REM_CLOSE must zero sf_ref_count or every Open leaks an
+REM SFT entry.  At MS-DOS 4's default FILES=8 the pool exhausts after ~4
+REM opens and EXEC starts returning error 4 ("Cannot execute").  Run 8
+REM sequential TYPEs as a tight reproducer.
+echo === Regression: 8 sequential TYPEs (SFT leak guard) === >> A:\OUT.TXT
+TYPE Y:\HELLO.TXT >> A:\OUT.TXT
+TYPE Y:\HELLO.TXT >> A:\OUT.TXT
+TYPE Y:\HELLO.TXT >> A:\OUT.TXT
+TYPE Y:\HELLO.TXT >> A:\OUT.TXT
+TYPE Y:\HELLO.TXT >> A:\OUT.TXT
+TYPE Y:\HELLO.TXT >> A:\OUT.TXT
+TYPE Y:\HELLO.TXT >> A:\OUT.TXT
+TYPE Y:\HELLO.TXT >> A:\OUT.TXT
+echo === End regression === >> A:\OUT.TXT
 REM SKIP(MSDOS4): DIR Y:\*.TXT wildcard returns no entries on MS-DOS 4 -- our
 REM FindFirst pattern-matching path doesn't engage here.  Tracked separately;
 REM FreeDOS exercises the same path and works.  Leaving the call so a future
@@ -223,6 +237,12 @@ echo "$OUT"
 fail=0
 if ! grep -q "Hello, ext4-dos!" <<<"$OUT"; then
     echo "FAIL: TYPE Y:\\HELLO.TXT didn't return file content" >&2
+    fail=1
+fi
+# Regression: 8 sequential TYPEs must all return content (SFT-leak guard).
+HELLO_COUNT=$(grep -c "Hello, ext4-dos!" <<<"$OUT" || true)
+if (( HELLO_COUNT < 8 )); then
+    echo "FAIL: expected >=8 successful TYPE Y:\\HELLO.TXT readbacks (SFT leak?), got ${HELLO_COUNT}" >&2
     fail=1
 fi
 # 8.3 alias TYPE roundtrip (now passes — was masked by SFT-leak EXEC corruption).
