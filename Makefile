@@ -74,7 +74,7 @@ vpath %.c tools src/blockdev src/ext4 src/partition src/util
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_xgroup_test $(HOST_DIR)/host_create_test $(HOST_DIR)/host_mkdir_test $(HOST_DIR)/host_crc32c_test
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_xgroup_test $(HOST_DIR)/host_create_test $(HOST_DIR)/host_mkdir_test $(HOST_DIR)/host_rmdir_test $(HOST_DIR)/host_crc32c_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
@@ -101,6 +101,9 @@ $(HOST_DIR)/host_create_test: tools/host_create_test.c $(LIB_SRCS_HOST) | $(HOST
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_mkdir_test: tools/host_mkdir_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
+$(HOST_DIR)/host_rmdir_test: tools/host_rmdir_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_crc32c_test: tools/host_crc32c_test.c src/util/crc32c.c | $(HOST_DIR)
@@ -168,6 +171,9 @@ host-test: host-build tests/images/journal.img tests/images/journal-csum.img tes
 	@echo "==> running host_mkdir_test (directory creation)"
 	@cp tests/images/write.img tests/images/mkdir-test.img
 	@$(HOST_DIR)/host_mkdir_test tests/images/mkdir-test.img
+	@echo "==> running host_rmdir_test (directory removal)"
+	@cp tests/images/write.img tests/images/rmdir-test.img
+	@$(HOST_DIR)/host_rmdir_test tests/images/rmdir-test.img
 
 host-stress: host-build tests/images/stress.img
 	@echo "==> running host_stress_test"

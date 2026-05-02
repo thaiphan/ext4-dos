@@ -1032,7 +1032,56 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
          * REM_CRTRWOCDS=0x18). 0x21 LSEEK is handled separately in the
          * stub below — DOS uses it for SeekEnd-to-find-EOF, which is fine
          * to support read-only via the SFT's file-size field. */
-        case 0x01: /* REM_RMDIR — remove directory (Phase 4.5) */
+        case 0x01: { /* REM_RMDIR — remove directory (Phase 4.5). */
+            static char path_buf[128];
+            static char werr[64];
+            static char parent_path[128];
+            uint32_t dir_ino, parent_ino;
+            int rc_path, p, base_idx, j;
+
+            if (!g_fs_ready) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            rc_path = dos_to_ext4_path(path_buf, sizeof path_buf);
+            if (rc_path != 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            dir_ino = path_lookup_with_alias(&g_fs, path_buf);
+            if (dir_ino == 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            base_idx = 0;
+            for (p = 0; path_buf[p]; p++)
+                if (path_buf[p] == '/') base_idx = p + 1;
+            if (base_idx <= 1) {
+                parent_ino = 2u;
+            } else {
+                for (j = 0; j + 1 < base_idx && j < 127; j++)
+                    parent_path[j] = path_buf[j];
+                parent_path[j] = '\0';
+                parent_ino = ext4_path_lookup(&g_fs, parent_path);
+                if (parent_ino == 0) {
+                    r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                    r.w.flags |= 1u;
+                    return;
+                }
+            }
+            werr[0] = '\0';
+            if (ext4_dir_remove(&g_fs, parent_ino, dir_ino, werr, sizeof werr) != 0) {
+                r.w.ax = DOS_ERR_WRITE_PROTECT;
+                r.w.flags |= 1u;
+                return;
+            }
+            r.w.flags &= ~1u;
+            return;
+        }
+
         case 0x0E: /* REM_SETATTR — change file attributes */
         case 0x11: /* REM_RENAME */
         case 0x13: /* REM_DELETE */

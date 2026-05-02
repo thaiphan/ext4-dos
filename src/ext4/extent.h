@@ -86,6 +86,13 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
                          uint32_t now_unix,
                          char *err, uint32_t err_len);
 
+/* Remove an empty directory from parent_ino.  Verifies dir_ino is a
+ * directory containing only dot/dotdot, frees the data block (tx1) and
+ * inode (tx2), removes the entry from parent_ino, and decrements
+ * parent's link count.  Returns 0 on success, -1 on failure. */
+int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
+                    char *err, uint32_t err_len);
+
 /* append_bytes: how many valid bytes are in new_data (≤ block_size).
  * Zeros fill the rest of the block on disk; inode.size advances by
  * append_bytes, not block_size. Pass block_size for a full-block extend. */
