@@ -208,8 +208,8 @@ fi
 # Dynamic free-space check: final free (after all writes) must equal initial
 # free minus 3072 bytes (1 block TARGET.TXT extend + 2 blocks RENAMED.TXT).
 # Avoids hardcoding an mkfs.ext4-version-specific value.
-INIT_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | head -1 | tr -d ',')
-FINAL_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | tail -1 | tr -d ',')
+INIT_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | head -1 | sed 's/ bytes free//' | tr -d ',')
+FINAL_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | tail -1 | sed 's/ bytes free//' | tr -d ',')
 EXPECTED_FINAL=$(( INIT_FREE - 3072 ))
 if [[ -z "$INIT_FREE" || "$FINAL_FREE" -ne "$EXPECTED_FINAL" ]]; then
     echo "FAIL: 'bytes free' wrong (expected ${EXPECTED_FINAL}, got ${FINAL_FREE}) — write may not be consuming fs blocks" >&2
