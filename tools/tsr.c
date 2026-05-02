@@ -23,7 +23,6 @@
 #define DOS_ERR_FILE_NOT_FOUND  0x02u
 #define DOS_ERR_NO_MORE_FILES   0x12u
 
-
 /* Both bits must be set for MS-DOS 4 to dispatch file ops through INT 2Fh
  * AH=11h on this drive. 0x8000 = curdir_isnet (network/IFS drive), 0x4000 =
  * curdir_inuse (slot is live). FreeDOS works with just 0x8000 but MS-DOS 4
@@ -204,17 +203,6 @@ struct ff_capture {
     uint32_t last_read_pos;
     uint16_t last_read_count;
     int16_t  last_read_actual;
-    /* Per-Open-call snapshots — minimal but tracks where lookup failed. */
-#pragma pack(push, 1)
-    struct {
-        uint32_t inode_num;       /* ext4_path_lookup return */
-        uint8_t  step;            /* path_lookup_step trace bits */
-        uint16_t mode;            /* path_lookup_mode (root inode mode) */
-        int16_t  inode_rc;        /* path_lookup_inode_rc */
-        uint32_t dir_rc;          /* path_lookup_dir_rc */
-    } open_calls[2];
-#pragma pack(pop)
-    uint8_t  open_call_idx;
     uint32_t entry_inode_mtime;
     uint16_t entry_inode_dos_time;
     uint16_t entry_inode_dos_date;
@@ -374,93 +362,21 @@ static int read_file_bytes(const struct ext4_inode *inode, uint32_t offset,
     return (int)bytes_done;
 }
 
-/* Forward decl — to_8_3 below calls name_is_8_3_safe defined later. */
-static int name_is_8_3_safe(const char *name, uint8_t name_len);
-
-/* Cheap 16-bit case-insensitive hash for the ~XXX suffix on alias names. */
-static uint16_t lfn_hash(const char *name, uint8_t name_len) {
-    uint16_t h = 0;
-    int i;
-    for (i = 0; i < name_len; i++) {
-        uint8_t c = (uint8_t)name[i];
-        if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
-        h = (uint16_t)((h * 17u) + c);
-    }
-    return h;
-}
-
-static int is_8_3_char(uint8_t c) {
-    if (c >= 'A' && c <= 'Z') return 1;
-    if (c >= '0' && c <= '9') return 1;
-    if (c == '_' || c == '-' || c == '~') return 1;
-    return 0;
-}
-
-/* Convert an ext4 filename to the 11-byte FAT 8.3 form.
- *
- * If the name fits 8.3 cleanly: trivial truncate + uppercase.
- *
- * If the name is too long or contains 8.3-illegal chars (multiple dots,
- * basename > 8, ext > 3, foreign letters): generate a Win95-style alias
- * BASE4~HHH.EXT where HHH is a 3-hex-digit hash of the FULL ext4 name.
- * Deterministic — same long name always maps to same alias, so reopen
- * by alias works. Per-directory collisions: 1/4096 per pair sharing
- * the same 4-char prefix, sufficient for typical DOS use. */
 static void to_8_3(const char *name, uint8_t name_len, uint8_t out[11]) {
     int i = 0, j = 0, k;
     for (k = 0; k < 11; k++) out[k] = ' ';
-
-    if (name_is_8_3_safe(name, name_len)) {
-        while (i < name_len && j < 8 && name[i] != '.') {
-            uint8_t c = (uint8_t)name[i++];
-            if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
-            out[j++] = c;
-        }
-        while (i < name_len && name[i] != '.') i++;
-        if (i < name_len && name[i] == '.') i++;
-        j = 8;
-        while (i < name_len && j < 11) {
-            uint8_t c = (uint8_t)name[i++];
-            if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
-            out[j++] = c;
-        }
-        return;
+    while (i < name_len && j < 8 && name[i] != '.') {
+        uint8_t c = (uint8_t)name[i++];
+        if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+        out[j++] = c;
     }
-
-    /* Hash-based alias path. */
-    {
-        static const char hex[] = "0123456789ABCDEF";
-        uint16_t h;
-        int last_dot = -1;
-        int basename_end;
-
-        for (i = 0; i < name_len; i++) {
-            if (name[i] == '.') last_dot = i;
-        }
-        basename_end = (last_dot >= 0) ? last_dot : name_len;
-
-        j = 0;
-        for (i = 0; i < basename_end && j < 4; i++) {
-            uint8_t c = (uint8_t)name[i];
-            if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
-            if (is_8_3_char(c)) out[j++] = c;
-        }
-        if (j == 0) out[j++] = '_';
-
-        h = lfn_hash(name, name_len);
-        out[4] = '~';
-        out[5] = hex[(h >> 8) & 0xF];
-        out[6] = hex[(h >> 4) & 0xF];
-        out[7] = hex[(h >> 0) & 0xF];
-
-        j = 8;
-        if (last_dot >= 0) {
-            for (i = last_dot + 1; i < name_len && j < 11; i++) {
-                uint8_t c = (uint8_t)name[i];
-                if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
-                if (is_8_3_char(c)) out[j++] = c;
-            }
-        }
+    while (i < name_len && name[i] != '.') i++;
+    if (i < name_len && name[i] == '.') i++;
+    j = 8;
+    while (i < name_len && j < 11) {
+        uint8_t c = (uint8_t)name[i++];
+        if (c >= 'a' && c <= 'z') c = (uint8_t)(c - 'a' + 'A');
+        out[j++] = c;
     }
 }
 
@@ -506,9 +422,8 @@ static int find_iter_cb(const struct ext4_dir_entry *e, void *ud) {
     /* Skip . and .. — FAT root convention */
     if (e->name_len == 1 && e->name[0] == '.') return 0;
     if (e->name_len == 2 && e->name[0] == '.' && e->name[1] == '.') return 0;
-    /* All entries pass — to_8_3 generates a deterministic ~HHH alias
-     * for any name that doesn't fit 8.3 cleanly, so long-named files
-     * become visible to classic 8.3 callers under their alias name. */
+    /* Skip names that don't fit DOS 8.3 (no LFN support yet). */
+    if (!name_is_8_3_safe(e->name, e->name_len)) return 0;
 
     if (s->current_index == s->target_index) {
         s->name_len  = e->name_len;
@@ -758,22 +673,6 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             }
             inode_num = ext4_path_lookup(&g_fs, path_buf);
             g_ff_capture.last_open_inode_num = inode_num;
-            /* Per-call snapshot for bug bisect */
-            {
-                extern uint8_t  ext4_path_lookup_step;
-                extern uint16_t ext4_path_lookup_mode;
-                extern int16_t  ext4_path_lookup_inode_rc;
-                extern uint32_t ext4_path_lookup_dir_rc;
-                if (g_ff_capture.open_call_idx < 2) {
-                    int slot_idx = g_ff_capture.open_call_idx;
-                    g_ff_capture.open_calls[slot_idx].inode_num = inode_num;
-                    g_ff_capture.open_calls[slot_idx].step = ext4_path_lookup_step;
-                    g_ff_capture.open_calls[slot_idx].mode = ext4_path_lookup_mode;
-                    g_ff_capture.open_calls[slot_idx].inode_rc = ext4_path_lookup_inode_rc;
-                    g_ff_capture.open_calls[slot_idx].dir_rc = ext4_path_lookup_dir_rc;
-                    g_ff_capture.open_call_idx++;
-                }
-            }
             if (inode_num == 0) {
                 g_ff_capture.last_open_rc = -102;
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;

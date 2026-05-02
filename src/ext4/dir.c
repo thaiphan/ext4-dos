@@ -85,14 +85,6 @@ uint32_t ext4_dir_lookup(struct ext4_fs *fs, const struct ext4_inode *dir,
     return s.found_inode;
 }
 
-/* DEBUG: per-step trace bits set during path_lookup so a caller can see
- * which step in the chain failed. Bit 0 = entered, bit 1 = inode_read OK,
- * bit 2 = is-dir check OK, bit 3 = dir_lookup found, bit 4 = returned. */
-uint8_t ext4_path_lookup_step;
-uint16_t ext4_path_lookup_mode;       /* inode.mode after read */
-int16_t ext4_path_lookup_inode_rc;    /* return from ext4_inode_read */
-uint32_t ext4_path_lookup_dir_rc;     /* return from ext4_dir_lookup */
-
 uint32_t ext4_path_lookup(struct ext4_fs *fs, const char *path) {
     static struct ext4_inode inode;
     /* Static so the pointer we pass to ext4_dir_lookup resolves via DS. */
@@ -101,12 +93,6 @@ uint32_t ext4_path_lookup(struct ext4_fs *fs, const char *path) {
     const char    *p = path;
     const char    *seg_start;
     size_t         seg_len;
-    int            ir;
-
-    ext4_path_lookup_step = 1;
-    ext4_path_lookup_mode = 0;
-    ext4_path_lookup_inode_rc = 0;
-    ext4_path_lookup_dir_rc = 0;
 
     while (*p == '/') p++;
 
@@ -120,23 +106,14 @@ uint32_t ext4_path_lookup(struct ext4_fs *fs, const char *path) {
         memcpy(seg, seg_start, seg_len);
         seg[seg_len] = '\0';
 
-        ir = ext4_inode_read(fs, cur_ino, &inode);
-        ext4_path_lookup_inode_rc = (int16_t)ir;
-        if (ir != 0) return 0u;
-        ext4_path_lookup_step |= 2;
-        ext4_path_lookup_mode = inode.mode;
-
+        if (ext4_inode_read(fs, cur_ino, &inode) != 0) return 0u;
         if ((inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) return 0u;
-        ext4_path_lookup_step |= 4;
 
         cur_ino = ext4_dir_lookup(fs, &inode, seg);
-        ext4_path_lookup_dir_rc = cur_ino;
         if (cur_ino == 0u) return 0u;
-        ext4_path_lookup_step |= 8;
 
         while (*p == '/') p++;
     }
 
-    ext4_path_lookup_step |= 16;
     return cur_ino;
 }
