@@ -258,6 +258,42 @@ struct ff_capture {
     uint16_t utd_year_iters;
     uint32_t utd_days_after_year_loop;
     uint16_t utd_final_year;
+    /* Phase 3.5 diagnosis: tracks what DOS hands us on REM_CREATE vs the
+     * subsequent REM_WRITE. If the SFT pointer (es:di) changes between
+     * the two calls, find_open_slot misses and the new file stays
+     * size 0 after a DOS COPY. The captured SFT bytes let us see
+     * what DOS populated between our calls. */
+    uint16_t last_create_ax;
+    uint16_t last_create_seg;
+    uint16_t last_create_off;
+    uint32_t last_create_inode_num;
+    uint8_t  last_create_sft_after[64];
+    uint16_t last_write_seg;
+    uint16_t last_write_off;
+    uint8_t  last_write_slot_found;   /* 1 = find_open_slot hit, 0 = miss */
+    uint8_t  last_write_sft_at_entry[64];
+    /* Ring of last 8 REM_WRITE call snapshots (most recent in slot
+     * write_log_idx-1 mod 8). Captures every entry, even count==0 and
+     * slot-miss cases. */
+    uint8_t  write_log_idx;
+    struct {
+        uint16_t es, di;
+        uint16_t count;
+        uint32_t pos_at_sft;
+        uint32_t size_at_sft;
+        uint32_t slot_inode_num;   /* 0 if slot lookup missed */
+        uint8_t  slot_found;
+    } write_log[8];
+    /* Snapshot of register state + SDA at the LAST REM_WRITE entry,
+     * so we can see whether the byte count lives in CX or in an SDA
+     * field (DOS-C buffered-write convention). */
+    uint16_t last_write_ax_in;
+    uint16_t last_write_bx_in;
+    uint16_t last_write_cx_in;
+    uint16_t last_write_dx_in;
+    uint16_t last_write_ds_in;
+    uint16_t last_write_si_in;
+    uint8_t  last_write_sda[128];
 };
 static struct ff_capture g_ff_capture;
 
@@ -1143,6 +1179,19 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF)     = 0u;
             *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = 0u;
 
+            /* Phase 3.5 diagnosis: snapshot what DOS handed us + what we
+             * wrote back, so a later REM_WRITE that misses the slot can
+             * be compared. */
+            g_ff_capture.last_create_ax        = r.w.ax;
+            g_ff_capture.last_create_seg       = r.x.es;
+            g_ff_capture.last_create_off       = r.w.di;
+            g_ff_capture.last_create_inode_num = new_inode_num;
+            {
+                uint16_t k;
+                for (k = 0; k < 64; k++)
+                    g_ff_capture.last_create_sft_after[k] = sft[k];
+            }
+
             r.w.flags &= ~1u;
             return;
         }
@@ -1279,24 +1328,98 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             int               rc;
 
             g_ff_capture.write_call_count++;
+            /* Phase 3.5 diagnosis: snapshot the entry SFT pointer + 64
+             * bytes of SFT + register state + 128 bytes of SDA, every
+             * call, to see how DOS conveys the byte count and user
+             * buffer pointer. */
+            g_ff_capture.last_write_seg = r.x.es;
+            g_ff_capture.last_write_off = r.w.di;
+            g_ff_capture.last_write_ax_in = r.w.ax;
+            g_ff_capture.last_write_bx_in = r.w.bx;
+            g_ff_capture.last_write_cx_in = r.w.cx;
+            g_ff_capture.last_write_dx_in = r.w.dx;
+            g_ff_capture.last_write_ds_in = r.x.ds;
+            g_ff_capture.last_write_si_in = r.w.si;
+            {
+                uint8_t __far *sft_dbg = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+                uint16_t       k;
+                for (k = 0; k < 64; k++)
+                    g_ff_capture.last_write_sft_at_entry[k] = sft_dbg[k];
+                for (k = 0; k < 128; k++)
+                    g_ff_capture.last_write_sda[k] = g_sda[k];
+            }
             slot = find_open_slot(r.x.es, r.w.di);
+            /* Ring-log this call regardless of whether slot lookup hit. */
+            {
+                uint8_t        idx     = g_ff_capture.write_log_idx & 7u;
+                uint8_t __far *sft_log = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+                g_ff_capture.write_log[idx].es        = r.x.es;
+                g_ff_capture.write_log[idx].di        = r.w.di;
+                g_ff_capture.write_log[idx].count     = r.w.cx;
+                g_ff_capture.write_log[idx].pos_at_sft  =
+                    *(uint32_t __far *)(sft_log + SFT_FILE_POSITION_OFF);
+                g_ff_capture.write_log[idx].size_at_sft =
+                    *(uint32_t __far *)(sft_log + SFT_FILE_SIZE_OFF);
+                g_ff_capture.write_log[idx].slot_inode_num =
+                    slot ? slot->inode_num : 0u;
+                g_ff_capture.write_log[idx].slot_found = slot ? 1u : 0u;
+                g_ff_capture.write_log_idx = (uint8_t)((idx + 1u) & 7u);
+            }
             if (!slot) {
+                g_ff_capture.last_write_slot_found = 0u;
                 r.w.ax = DOS_ERR_FILE_NOT_FOUND;
                 r.w.flags |= 1u;
                 return;
             }
+            g_ff_capture.last_write_slot_found = 1u;
             sft       = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
             bs        = g_safe_block_size;
             pos       = *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF);
             file_size = (uint32_t)slot->inode.size;
             count     = r.w.cx;
 
-            /* Phase 3 relaxes the count constraint: partial-block appends
-             * (count < bs) are now allowed for the extend path (phase 3 creates
-             * files whose size doesn't align to a full block — e.g. 61-byte
-             * HELLO.TXT). In-place still requires count == bs AND alignment.
-             * Partial in-place writes and sparse-hole grows remain refused. */
-            if (count == 0u || bs > sizeof g_write_buf) {
+            if (bs > sizeof g_write_buf) {
+                r.w.ax = DOS_ERR_WRITE_PROTECT;
+                r.w.flags |= 1u;
+                return;
+            }
+            /* Phase 3.5: CX=0 in REM_WRITE means "set EOF to current SFT
+             * position" — the documented MS-DOS network redirector
+             * convention. DOS COPY uses this as a pre-extend before
+             * issuing the actual data writes. Support extending up to one
+             * block past current size; truncate-down and multi-block
+             * extends are deferred. */
+            if (count == 0u) {
+                if (pos == file_size) {
+                    /* No-op: file already at requested EOF. */
+                    r.w.ax = 0u;
+                    r.w.flags &= ~1u;
+                    return;
+                }
+                if (pos > file_size && (pos - file_size) <= bs &&
+                    (file_size & (bs - 1u)) == 0u) {
+                    /* Extend file_size .. pos with zero-fill. */
+                    uint16_t z;
+                    static char werr2[64];
+                    int rc2;
+                    for (z = 0; z < bs; z++) g_write_buf[z] = 0u;
+                    werr2[0] = '\0';
+                    rc2 = ext4_file_extend_block(&g_fs, &slot->inode,
+                                                 slot->inode_num,
+                                                 g_write_buf,
+                                                 (uint32_t)(pos - file_size),
+                                                 slot->inode.mtime + 1u,
+                                                 werr2, sizeof werr2);
+                    g_ff_capture.last_write_rc = (int16_t)rc2;
+                    if (rc2 == 0) {
+                        *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF) =
+                            (uint32_t)slot->inode.size;
+                        r.w.ax = 0u;
+                        r.w.flags &= ~1u;
+                        return;
+                    }
+                }
+                /* Truncate-down or extend-too-big: defer. */
                 r.w.ax = DOS_ERR_WRITE_PROTECT;
                 r.w.flags |= 1u;
                 return;
@@ -1332,6 +1455,25 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                 rc = ext4_file_write_block(&g_fs, &slot->inode, slot->inode_num,
                                            logical, g_write_buf, now_unix,
                                            werr, sizeof werr);
+            } else if (pos + (uint32_t)count <= file_size
+                       && ((pos / bs) == ((pos + (uint32_t)count - 1u) / bs))) {
+                /* Partial in-place write contained within one block —
+                 * read existing block into g_write_buf (overwriting the
+                 * user-data we copied at offset 0), then overlay user
+                 * data at the in-block offset. Used by DOS COPY's
+                 * post-pre-extend data writes (Phase 3.5). */
+                uint16_t off_in_block = (uint16_t)(pos & (bs - 1u));
+                g_ff_capture.last_write_was_extend = 0u;
+                rc = ext4_file_read_block(&g_fs, &slot->inode, logical,
+                                          g_write_buf);
+                if (rc == 0) {
+                    for (i = 0; i < count; i++)
+                        g_write_buf[off_in_block + i] = user_buf[i];
+                    rc = ext4_file_write_block(&g_fs, &slot->inode,
+                                               slot->inode_num, logical,
+                                               g_write_buf, now_unix,
+                                               werr, sizeof werr);
+                }
             } else if (pos == file_size && (pos & (bs - 1u)) == 0u) {
                 /* Append at EOF — may be partial (count < bs).
                  * Zero-pad g_write_buf beyond count bytes; extend_block

@@ -78,6 +78,31 @@ struct ff_capture {
     uint16_t utd_year_iters;
     uint32_t utd_days_after_year_loop;
     uint16_t utd_final_year;
+    uint16_t last_create_ax;
+    uint16_t last_create_seg;
+    uint16_t last_create_off;
+    uint32_t last_create_inode_num;
+    uint8_t  last_create_sft_after[64];
+    uint16_t last_write_seg;
+    uint16_t last_write_off;
+    uint8_t  last_write_slot_found;
+    uint8_t  last_write_sft_at_entry[64];
+    uint8_t  write_log_idx;
+    struct {
+        uint16_t es, di;
+        uint16_t count;
+        uint32_t pos_at_sft;
+        uint32_t size_at_sft;
+        uint32_t slot_inode_num;
+        uint8_t  slot_found;
+    } write_log[8];
+    uint16_t last_write_ax_in;
+    uint16_t last_write_bx_in;
+    uint16_t last_write_cx_in;
+    uint16_t last_write_dx_in;
+    uint16_t last_write_ds_in;
+    uint16_t last_write_si_in;
+    uint8_t  last_write_sda[128];
 };
 
 static void hex_dump(const char *label, const uint8_t __far *p, unsigned len) {
@@ -150,6 +175,53 @@ int main(void) {
                (unsigned long)cap->last_open_inode_num,
                (unsigned long)cap->last_open_size);
     }
+
+    /* Phase 3.5 diagnosis: compare REM_CREATE entry/post-state with
+     * the subsequent REM_WRITE entry. If write_seg:write_off differs
+     * from create_seg:create_off, DOS handed us a different SFT and
+     * find_open_slot misses (we'd see slot_found=0). */
+    printf("\nPhase 3.5 SFT-pointer diagnosis:\n");
+    printf("  CREATE: AX=0x%04x  ES:DI = %04x:%04x  inode=%lu\n",
+           cap->last_create_ax,
+           cap->last_create_seg, cap->last_create_off,
+           (unsigned long)cap->last_create_inode_num);
+    printf("  WRITE : ES:DI = %04x:%04x  slot_found=%u\n",
+           cap->last_write_seg, cap->last_write_off,
+           cap->last_write_slot_found);
+    printf("  same SFT ptr? %s\n",
+           (cap->last_create_seg == cap->last_write_seg &&
+            cap->last_create_off == cap->last_write_off) ? "YES" : "NO");
+    hex_dump("\nSFT bytes after REM_CREATE populated it",
+             cap->last_create_sft_after, 64);
+    hex_dump("SFT bytes at REM_WRITE entry",
+             cap->last_write_sft_at_entry, 64);
+
+    /* Ring of recent REM_WRITE calls — most recent has slot
+     * (write_log_idx-1) mod 8. Print all 8 in chronological order. */
+    printf("\nRecent REM_WRITE calls (ring buffer, oldest first):\n");
+    {
+        unsigned k;
+        unsigned start = cap->write_log_idx & 7u; /* oldest entry */
+        for (k = 0; k < 8u; k++) {
+            unsigned i = (start + k) & 7u;
+            printf("  [%u] ES:DI=%04x:%04x  count=%u  pos=%lu  size=%lu  "
+                   "inode=%lu  slot_found=%u\n",
+                   k,
+                   cap->write_log[i].es, cap->write_log[i].di,
+                   cap->write_log[i].count,
+                   (unsigned long)cap->write_log[i].pos_at_sft,
+                   (unsigned long)cap->write_log[i].size_at_sft,
+                   (unsigned long)cap->write_log[i].slot_inode_num,
+                   cap->write_log[i].slot_found);
+        }
+    }
+    printf("\nLast REM_WRITE register state at entry:\n");
+    printf("  AX=%04x  BX=%04x  CX=%04x  DX=%04x  DS=%04x  SI=%04x\n",
+           cap->last_write_ax_in, cap->last_write_bx_in,
+           cap->last_write_cx_in, cap->last_write_dx_in,
+           cap->last_write_ds_in, cap->last_write_si_in);
+    hex_dump("\nSDA[0..127] at last REM_WRITE entry",
+             cap->last_write_sda, 128);
 
     if (!cap->valid) {
         printf("(FindFirst capture skipped — valid=0, only Open data above)\n");

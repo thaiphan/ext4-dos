@@ -73,8 +73,8 @@ echo === DIR Y:\TARGET.TXT (expect size 2048 — extended) === >> C:\OUT.TXT
 DIR Y:\TARGET.TXT >> C:\OUT.TXT
 echo === Phase 3 create: COPY C:\BOTH.TXT Y:\NEWCOPY.TXT === >> C:\OUT.TXT
 COPY C:\BOTH.TXT Y:\NEWCOPY.TXT >> C:\OUT.TXT
-echo === DIR Y:\NEWCOPY.TXT (file must exist; population is Phase 3.5) === >> C:\OUT.TXT
-DIR Y:\NEWCOPY.TXT >> C:\OUT.TXT
+echo === TYPE Y:\NEWCOPY.TXT (should match BOTH.TXT contents) === >> C:\OUT.TXT
+TYPE Y:\NEWCOPY.TXT >> C:\OUT.TXT
 echo === DEL/MD must still FAIL (Phase 3 doesn't add delete or mkdir) === >> C:\OUT.TXT
 echo --- DEL Y:\HELLO.TXT --- >> C:\OUT.TXT
 DEL Y:\HELLO.TXT >> C:\OUT.TXT
@@ -166,14 +166,11 @@ if ! grep -q "long-named file TWO" <<<"$OUT"; then
     echo "FAIL: TYPE Y:\\VERY~EB7.TXT (8.3 alias) didn't return file content" >&2
     fail=1
 fi
-# Phase 3: REM_CREATE through the redirector must produce a NEWCOPY.TXT
-# entry visible to DIR. File contents are NOT asserted: DOS COPY's
-# create-then-write sequence currently leaves the file at size 0
-# because REM_WRITE post-CREATE can't match the slot registered by
-# REM_CREATE — a Phase 3.5 follow-up. The kernel-side create-and-
-# populate path is fully covered by host_create_test.
-if ! grep -F -A6 'DIR Y:\NEWCOPY.TXT' <<<"$OUT" | grep -qE "NEWCOPY[[:space:]]+TXT"; then
-    echo "FAIL: Y:\\NEWCOPY.TXT not visible to DIR after COPY (REM_CREATE didn't land)" >&2
+# Phase 3.5: COPY C:\BOTH.TXT Y:\NEWCOPY.TXT must produce a populated
+# file matching BOTH.TXT's contents. Exercises REM_CREATE + the CX=0
+# pre-extend convention + partial-in-place data write.
+if ! grep -q "Hello, ext4-dos!" <<<"$(grep -F -A4 'TYPE Y:\NEWCOPY.TXT' <<<"$OUT")"; then
+    echo "FAIL: Y:\\NEWCOPY.TXT doesn't contain expected content (REM_CREATE/REM_WRITE)" >&2
     fail=1
 fi
 if ! grep -qE "56[,]?345[,]?600 bytes free" <<<"$OUT"; then
