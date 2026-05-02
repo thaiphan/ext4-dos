@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# SYNC: Keep this script in sync with scripts/run-freedos-test.sh.
-# When run-freedos-test.sh gains a new test, port it here and either add
-# the test or mark it with "# SKIP(MSDOS4): <reason>".
+# SYNC: Keep this script in sync with scripts/run-freedos-test.sh and
+# scripts/run-msdos6-test.sh.  When run-freedos-test.sh gains a new test,
+# port it here and either add the test or mark it "# SKIP(MSDOS4): <reason>".
 #
 # Boot Microsoft's open-source MS-DOS 4.0 (April 2024) bootable floppy in
 # DOSBox-X with our TSR + ext4 test fixture attached. Exercises the same
@@ -17,6 +17,7 @@ SOURCE_IMG="${MSDOS4_SRC:-tests/msdos4/msdos4-source.img}"
 TEST_IMG="$MSDOS4_DIR/test.img"
 EXT4_SRC_IMG="tests/images/disk.img"
 EXT4_IMG="$MSDOS4_DIR/test-ext4.img"   # working copy — writes don't mutate the source
+FREEDOS_IMG="tests/freedos/FD14LITE.img"
 WAIT_SECONDS="${WAIT_SECONDS:-30}"
 
 if ! command -v dosbox-x >/dev/null 2>&1; then
@@ -32,6 +33,10 @@ if [[ ! -f "$EXT4_SRC_IMG" ]]; then
     echo "ERROR: $EXT4_SRC_IMG not found. Run: make fixture-partitioned" >&2
     exit 1
 fi
+if [[ ! -f "$FREEDOS_IMG" ]]; then
+    echo "ERROR: $FREEDOS_IMG not found. Run: make tests/freedos/FD14LITE.img" >&2
+    exit 1
+fi
 for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe ext4wr.exe; do
     if [[ ! -x "$DOS_DIR/$f" ]]; then
         echo "ERROR: $DOS_DIR/$f missing. Run: make dos-build" >&2
@@ -42,6 +47,9 @@ done
 mkdir -p "$MSDOS4_DIR"
 cp "$SOURCE_IMG" "$TEST_IMG"
 cp "$EXT4_SRC_IMG" "$EXT4_IMG"
+
+# Extract FDAPM.EXE from the FreeDOS image for graceful DOSBox-X shutdown.
+mcopy -i "${FREEDOS_IMG}@@32256" '::FREEDOS/BIN/FDAPM.COM' "$MSDOS4_DIR/fdapm.com"
 
 # ============================================================================
 # MS-DOS 4 status: full DIR + TYPE working end-to-end.
@@ -138,6 +146,7 @@ A:\EXT4.EXE -u >> A:\OUT.TXT
 echo --- Re-check (should report not-installed) --- >> A:\OUT.TXT
 A:\EXT4CHK.EXE >> A:\OUT.TXT
 echo === DONE === >> A:\OUT.TXT
+A:\FDAPM.COM POWEROFF
 EOF
 awk 'BEGIN{ORS="\r\n"} {print}' "$MSDOS4_DIR/autoexec.bat.tmp" > "$MSDOS4_DIR/autoexec.bat"
 rm -f "$MSDOS4_DIR/autoexec.bat.tmp"
@@ -149,6 +158,7 @@ mcopy -i "$TEST_IMG" -o "$DOS_DIR/ext4dir.exe" ::EXT4DIR.EXE
 mcopy -i "$TEST_IMG" -o "$DOS_DIR/ext4cnt.exe" ::EXT4CNT.EXE
 mcopy -i "$TEST_IMG" -o "$DOS_DIR/ext4dmp.exe" ::EXT4DMP.EXE
 mcopy -i "$TEST_IMG" -o "$DOS_DIR/ext4wr.exe"  ::EXT4WR.EXE
+mcopy -i "$TEST_IMG" -o "$MSDOS4_DIR/fdapm.com"    ::FDAPM.COM
 mcopy -i "$TEST_IMG" -o "$MSDOS4_DIR/config.sys"   ::CONFIG.SYS
 mcopy -i "$TEST_IMG" -o "$MSDOS4_DIR/autoexec.bat" ::AUTOEXEC.BAT
 
@@ -170,7 +180,7 @@ for i in $(seq 1 "$WAIT_SECONDS"); do
     fi
 done
 if kill -0 "$BGPID" 2>/dev/null; then
-    kill "$BGPID" 2>/dev/null || true
+    kill -9 "$BGPID" 2>/dev/null || true
     sleep 1
     echo "DOSBox-X still running after ${WAIT_SECONDS}s; killed"
 fi

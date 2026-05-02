@@ -31,6 +31,9 @@ tests/msdos4/*
 !tests/msdos4/msdos4-source.img
 !tests/msdos4/README.md
 
+# MS-DOS 6.22 — proprietary, never committed; created by scripts/setup-msdos6.sh
+tests/msdos6/
+
 # macOS
 .DS_Store
 
