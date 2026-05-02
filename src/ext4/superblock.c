@@ -26,6 +26,8 @@ int ext4_superblock_parse(const uint8_t *buf, struct ext4_superblock *sb) {
     sb->volume_name[16] = '\0';
     memcpy(sb->last_mounted, buf + 0x88, 64);
     sb->last_mounted[64] = '\0';
+    memcpy(sb->journal_uuid, buf + 0xD0, 16);
+    sb->journal_inum = le32(buf + 0xE0);
 
     {
         uint32_t blocks_lo = le32(buf + 0x04);

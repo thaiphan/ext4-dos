@@ -1,4 +1,5 @@
 #include "fs.h"
+#include "journal.h"
 #include "../blockdev/blockdev.h"
 #include "../util/endian.h"
 #include <string.h>
@@ -11,6 +12,7 @@ int ext4_fs_open(struct ext4_fs *fs, struct blockdev *bd, uint64_t partition_lba
     uint64_t bgd_sector;
     uint32_t bgd_total_bytes;
     uint32_t sectors_to_read;
+    char     jerr[64];
     int      rc;
 
     memset(fs, 0, sizeof *fs);
@@ -47,6 +49,13 @@ int ext4_fs_open(struct ext4_fs *fs, struct blockdev *bd, uint64_t partition_lba
 
     rc = bdev_read(bd, bgd_sector, sectors_to_read, fs->bgd_buf);
     if (rc) return -5;
+
+    /* Journal init is best-effort in phase A: a parse failure should not
+     * block mount, since v1 read-only continues to work without replay
+     * (we just see slightly stale data, the same as before). Only the
+     * impossible cases (e.g. wrong block size) actually warrant attention,
+     * and those callers can inspect fs->jbd.present. */
+    (void)ext4_journal_init(fs, jerr, sizeof jerr);
 
     return 0;
 }

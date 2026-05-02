@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "superblock.h"
+#include "journal.h"
 
 /* Static cap on the cached block-group descriptor table.
  * 4 KiB buffer holds 64 BGDs at 64 bytes each, or 128 BGDs at 32 bytes.
@@ -18,6 +19,7 @@ struct ext4_fs {
     uint8_t                bgd_buf[EXT4_FS_BGD_BUF_SIZE];
     uint32_t               bgd_count;
     uint16_t               bgd_size;             /* bytes per BGD entry: 32 or 64 */
+    struct ext4_jbd        jbd;                  /* journal handle (present iff sb.journal_inum != 0) */
 };
 
 int  ext4_fs_open(struct ext4_fs *fs, struct blockdev *bd, uint64_t partition_lba);

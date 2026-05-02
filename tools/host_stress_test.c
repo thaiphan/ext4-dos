@@ -168,6 +168,18 @@ int main(int argc, char **argv) {
     rc = ext4_features_check_supported(&fs.sb, err, sizeof err);
     ASSERT(rc == 0, "feature-flag refused supported fixture: %s", err);
 
+    /* Phase A journal sanity: stress fixture is built with default
+     * mkfs.ext4, so it has a journal. Parse must succeed and the log
+     * must be clean (start == 0 for a freshly-created FS). */
+    ASSERT(fs.jbd.present == 1, "journal expected present (sb.journal_inum=%u)",
+           (unsigned)fs.sb.journal_inum);
+    ASSERT(fs.jbd.blocksize == fs.sb.block_size,
+           "journal blocksize %u != fs %u",
+           (unsigned)fs.jbd.blocksize, (unsigned)fs.sb.block_size);
+    ASSERT(fs.jbd.maxlen > 0, "journal maxlen must be > 0");
+    ASSERT(fs.jbd.start == 0, "fresh fixture: journal must be clean (start=%u)",
+           (unsigned)fs.jbd.start);
+
     /* /readme.txt */
     ino = ext4_path_lookup(&fs, "/readme.txt");
     ASSERT(ino != 0, "/readme.txt not found");

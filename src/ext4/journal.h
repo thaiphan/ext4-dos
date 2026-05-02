@@ -1,0 +1,111 @@
+#ifndef EXT4_JOURNAL_H
+#define EXT4_JOURNAL_H
+
+#include <stdint.h>
+
+/* jbd2 / journal-block-device-2 — the log format ext4 uses for crash
+ * consistency. Spec: linux/Documentation/filesystems/ext4/journal.rst.
+ * All multi-byte fields on disk are big-endian (the log was inherited
+ * from JBD on PowerPC). Use util/endian.h's be16/be32/be64.
+ *
+ * Phase 0: read-side soft replay. We parse the on-disk journal, build a
+ * map {fs_block -> latest committed copy in the journal}, and have the
+ * fs read path consult the map. We do not write anything. Compared to
+ * GRUB's ext2 driver (which ignores the journal entirely) this gives
+ * post-replay correctness without committing to a write path. */
+
+#define EXT4_JBD_MAGIC        0xC03B3998u  /* JFS_MAGIC_NUMBER */
+
+/* jbd_bhdr.blocktype values */
+#define EXT4_JBD_BT_DESCRIPTOR 1u
+#define EXT4_JBD_BT_COMMIT     2u
+#define EXT4_JBD_BT_SUPERBLOCK 3u  /* v1 — pre-feature-flags */
+#define EXT4_JBD_BT_SUPER_V2   4u  /* v2 — has feature flags + uuid */
+#define EXT4_JBD_BT_REVOKE     5u
+
+/* feature_incompat — features that, if unknown, mean we cannot replay safely */
+#define EXT4_JBD_INCOMPAT_REVOKE      0x00000001u
+#define EXT4_JBD_INCOMPAT_64BIT       0x00000002u  /* block tags carry blocknr_high */
+#define EXT4_JBD_INCOMPAT_ASYNC_COMMIT 0x00000004u
+#define EXT4_JBD_INCOMPAT_CSUM_V2     0x00000008u  /* per-tag crc16, descriptor-tail crc32c */
+#define EXT4_JBD_INCOMPAT_CSUM_V3     0x00000010u  /* tag3 with full crc32c */
+
+/* descriptor-block-tag flags */
+#define EXT4_JBD_TAG_FLAG_ESCAPE     0x01u  /* block's first u32 was JBD_MAGIC; restore on replay */
+#define EXT4_JBD_TAG_FLAG_SAME_UUID  0x02u  /* tag omits uuid (use previous) */
+#define EXT4_JBD_TAG_FLAG_DELETED    0x04u
+#define EXT4_JBD_TAG_FLAG_LAST_TAG   0x08u
+
+/* Capacity caps — these gate how much memory the journal handle holds in
+ * DGROUP. A clean (non-dirty) journal needs almost nothing; only a
+ * RECOVER-flagged mount actually populates the maps. Going past these
+ * caps aborts replay (we fall back to on-disk state with a clear error,
+ * not silent corruption). */
+#define EXT4_JBD_REPLAY_MAP_MAX  256u  /* unique fs_blocks redirected */
+#define EXT4_JBD_REVOKE_MAP_MAX   64u  /* unique fs_blocks revoked */
+#define EXT4_JBD_EXTENT_MAX       16u  /* extents in journal-inode i_block walk */
+
+/* One entry in the replay map: an fs_block whose newest committed copy
+ * lives at journal block journal_blk. Sorted by fs_block for binary search. */
+struct ext4_jbd_replay_entry {
+    uint64_t fs_block;
+    uint32_t journal_blk;   /* index into the journal log, 0..maxlen-1 */
+    uint8_t  is_escape;     /* on read, restore first 4 bytes to JBD magic */
+    uint8_t  pad[3];
+};
+
+struct ext4_jbd_revoke_entry {
+    uint64_t fs_block;
+    uint32_t revoke_seq;    /* transactions older-or-equal to this are skipped */
+};
+
+/* Snapshot of the journal inode's extent layout. Lets us translate a
+ * journal-block index (0..maxlen-1) to an absolute fs_block without
+ * re-walking the extent tree on every read. */
+struct ext4_jbd_extent {
+    uint32_t logical;       /* journal-block index this extent starts at */
+    uint32_t length;        /* in journal blocks */
+    uint64_t physical;      /* absolute fs_block where this extent's data lives */
+};
+
+struct ext4_jbd {
+    uint8_t  present;       /* 0 = no journal handle (no s_journal_inum) */
+    uint8_t  replay_active; /* 0 = clean mount, no redirect needed */
+    uint8_t  pad[2];
+
+    uint32_t inum;          /* journal inode number */
+    uint32_t blocksize;     /* journal block size; matches fs block_size */
+    uint32_t maxlen;        /* total blocks in journal */
+    uint32_t first;         /* first log block (after the journal superblock) */
+    uint32_t sequence;      /* first-expected commit id */
+    uint32_t start;         /* log start block; 0 means clean — no replay needed */
+
+    uint32_t feature_incompat;
+    uint8_t  uuid[16];      /* journal-internal uuid; CRC32C seed */
+    uint8_t  csum_v2;       /* derived: incompat has CSUM_V2 */
+    uint8_t  csum_v3;       /* derived: incompat has CSUM_V3 */
+    uint8_t  has_64bit;     /* derived: tag carries blocknr_high */
+    uint8_t  pad2;
+
+    uint32_t extent_count;
+    struct ext4_jbd_extent extents[EXT4_JBD_EXTENT_MAX];
+
+    /* Populated by replay walk; consulted by reads. Both are kept
+     * sorted by fs_block. Counts are 0 on clean mount. */
+    uint32_t replay_count;
+    struct ext4_jbd_replay_entry replay[EXT4_JBD_REPLAY_MAP_MAX];
+
+    uint32_t revoke_count;
+    struct ext4_jbd_revoke_entry revoke[EXT4_JBD_REVOKE_MAP_MAX];
+};
+
+struct ext4_fs;
+
+/* Read inode #s_journal_inum, parse the journal superblock, populate
+ * jbd->extents/maxlen/start/sequence. Does NOT walk transactions yet
+ * (that's phase B). Returns 0 on success, negative on error.
+ * If sb has no journal_inum, returns 0 with jbd->present == 0.
+ * If parsing fails, returns negative AND fills err with a short reason. */
+int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len);
+
+#endif

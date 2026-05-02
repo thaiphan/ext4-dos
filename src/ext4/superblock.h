@@ -28,6 +28,8 @@ struct ext4_superblock {
     uint8_t  uuid[16];
     char     volume_name[17];
     char     last_mounted[65];
+    uint8_t  journal_uuid[16];   /* matches journal-internal UUID; used as CRC32C seed */
+    uint32_t journal_inum;       /* inode # of the journal file (typically 8) */
 };
 
 int ext4_superblock_parse(const uint8_t *buf, struct ext4_superblock *sb);
