@@ -136,6 +136,34 @@ int ext4_journal_checkpoint(struct ext4_fs *fs, char *err, uint32_t err_len);
 int ext4_journal_lookup(const struct ext4_fs *fs, uint64_t fs_block,
                         uint32_t *out_jblk, uint8_t *out_is_escape);
 
+/* A pending transaction. Caller fills block_count/fs_block/buf and
+ * passes to ext4_journal_commit. Buffers must remain live until commit
+ * returns. Cap is small — phase 1's first call site (in-place file
+ * write) uses 2 (data + inode metadata). */
+#define EXT4_JBD_TRANS_MAX_BLOCKS 8
+struct ext4_jbd_trans {
+    uint32_t block_count;
+    uint64_t fs_block[EXT4_JBD_TRANS_MAX_BLOCKS];
+    void    *buf[EXT4_JBD_TRANS_MAX_BLOCKS];
+};
+
+/* Emit a jbd2 transaction for the listed blocks: descriptor + data
+ * blocks + commit, all with valid CSUM_V2/V3 checksums if the journal
+ * uses them, then immediately checkpoint (flush data to fs_blocks,
+ * clean jsb, clear RECOVER).
+ *
+ * Phase 1 limitations:
+ *   - jsb.start must be 0 on entry (clean journal — caller should mount
+ *     writable so any pending replay is checkpointed first).
+ *   - FS must NOT have metadata_csum set (recomputing inode/block-group
+ *     checksums is phase 1c).
+ *   - Refuses blocks whose first u32 matches JBD_MAGIC; the ESCAPE-tag
+ *     handling for self-encoding data is also phase 1c.
+ *
+ * Returns 0 on success. err is filled with a short reason on failure. */
+int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
+                        char *err, uint32_t err_len);
+
 /* Read journal block jblk (a logical index into the log) into out_buf.
  * Translates via the journal inode's extent table. out_buf must be at
  * least block_size bytes. */

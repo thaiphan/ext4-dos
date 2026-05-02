@@ -74,7 +74,7 @@ vpath %.c tools src/blockdev src/ext4 src/partition src/util
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_crc32c_test
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_crc32c_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
@@ -89,6 +89,9 @@ $(HOST_DIR)/host_journal_test: tools/host_journal_test.c $(LIB_SRCS_HOST) | $(HO
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_checkpoint_test: tools/host_checkpoint_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
+$(HOST_DIR)/host_write_test: tools/host_write_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_crc32c_test: tools/host_crc32c_test.c src/util/crc32c.c | $(HOST_DIR)
@@ -123,7 +126,7 @@ $(DOS_DIR)/%.obj: %.c | $(DOS_DIR)
 $(DOS_DIR):
 	mkdir -p $@
 
-host-test: host-build tests/images/journal.img tests/images/journal-csum.img
+host-test: host-build tests/images/journal.img tests/images/journal-csum.img tests/images/write.img
 	@echo "==> running host_features_test"
 	@$(HOST_DIR)/host_features_test
 	@echo "==> running host_crc32c_test"
@@ -138,6 +141,9 @@ host-test: host-build tests/images/journal.img tests/images/journal-csum.img
 	@echo "==> running host_checkpoint_test (CSUM_V2, mutates working copy)"
 	@cp tests/images/journal-csum.img tests/images/journal-csum-flush.img
 	@$(HOST_DIR)/host_checkpoint_test tests/images/journal-csum-flush.img tests/images/journal-csum.expect
+	@echo "==> running host_write_test (mutates working copy)"
+	@cp tests/images/write.img tests/images/write-test.img
+	@$(HOST_DIR)/host_write_test tests/images/write-test.img
 
 host-stress: host-build tests/images/stress.img
 	@echo "==> running host_stress_test"
@@ -150,6 +156,9 @@ tests/images/journal.img: scripts/mkfixture-journal.py
 	$(PYTHON) $<
 
 tests/images/journal-csum.img: scripts/mkfixture-journal-csum.py
+	$(PYTHON) $<
+
+tests/images/write.img: scripts/mkfixture-write.py
 	$(PYTHON) $<
 
 dos-test: dos-build fixture-partitioned

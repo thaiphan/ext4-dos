@@ -27,4 +27,19 @@ int ext4_file_read_block(struct ext4_fs *fs, const struct ext4_inode *inode,
 int ext4_file_read_head(struct ext4_fs *fs, const struct ext4_inode *inode,
                         uint32_t length, void *out_buf);
 
+/* In-place file-block write through a journaled transaction. The
+ * logical block must be backed by an existing extent — phase 1 doesn't
+ * allocate. The supplied buffer must be exactly fs->sb.block_size bytes;
+ * caller-supplied data is copied into a stable DGROUP buffer before the
+ * commit, so the caller's buffer can be a transient stack/user-space
+ * area. The inode's mtime is bumped to `now_unix` and persisted.
+ *
+ * Returns 0 on success. err is filled on failure with a short reason
+ * (e.g. "metadata_csum write support is phase 1c", "block matches
+ * JBD_MAGIC", "logical block has no extent — allocation is phase 2"). */
+int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
+                          uint32_t inode_num, uint32_t logical_block,
+                          const void *new_data, uint32_t now_unix,
+                          char *err, uint32_t err_len);
+
 #endif

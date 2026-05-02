@@ -40,6 +40,18 @@ static int seq_diff(uint32_t a, uint32_t b) {
     return (int32_t)(a - b);
 }
 
+/* Big-endian writers — jbd2 wire format. */
+static void be32_pack(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >>  8);
+    p[3] = (uint8_t) v;
+}
+static void be16_pack(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t) v;
+}
+
 /* Translate a journal-internal block index (0..maxlen-1) to an absolute
  * fs block via the journal inode's extent table, then read it. */
 int ext4_journal_read_log_block(struct ext4_fs *fs, uint32_t jblk, void *out_buf) {
@@ -409,9 +421,29 @@ static int checkpoint_one_block(struct ext4_fs *fs, uint64_t fs_block,
     return bdev_write(fs->bd, sector, sectors, walk_buf);
 }
 
-/* Re-read the journal superblock, set s_start=0, recompute the jsb
- * checksum if CSUM_V2/V3 is enabled, write back. */
-static int rewrite_jsb_clean(struct ext4_fs *fs) {
+/* Write one block to the journal log via the journal-inode extent
+ * table. Symmetric to ext4_journal_read_log_block on the read side. */
+static int write_journal_block(struct ext4_fs *fs, uint32_t jblk, const void *buf) {
+    uint32_t i;
+    uint64_t phys;
+    uint32_t byte, sector, sectors;
+
+    for (i = 0; i < fs->jbd.extent_count; i++) {
+        const struct ext4_jbd_extent *e = &fs->jbd.extents[i];
+        if (jblk >= e->logical && jblk < e->logical + e->length) {
+            phys    = e->physical + (uint64_t)(jblk - e->logical);
+            byte    = (uint32_t)(phys * (uint64_t)fs->sb.block_size);
+            sector  = (uint32_t)(fs->partition_lba + byte / fs->bd->sector_size);
+            sectors = fs->sb.block_size / fs->bd->sector_size;
+            return bdev_write(fs->bd, sector, sectors, buf);
+        }
+    }
+    return -1;
+}
+
+/* Re-read the journal superblock, write s_start and s_sequence,
+ * recompute jsb checksum if CSUM_V2/V3 is enabled. */
+static int update_jsb(struct ext4_fs *fs, uint32_t new_start, uint32_t new_seq) {
     uint64_t byte;
     uint32_t sector, sectors;
     uint64_t first_phys;
@@ -425,9 +457,9 @@ static int rewrite_jsb_clean(struct ext4_fs *fs) {
     rc = bdev_read(fs->bd, sector, sectors, jsb_buf);
     if (rc) return rc;
 
-    /* s_start at offset 0x1C (big-endian) — clean log. */
-    jsb_buf[0x1C] = 0; jsb_buf[0x1D] = 0;
-    jsb_buf[0x1E] = 0; jsb_buf[0x1F] = 0;
+    /* s_sequence at 0x18, s_start at 0x1C (both big-endian). */
+    be32_pack(jsb_buf + 0x18, new_seq);
+    be32_pack(jsb_buf + 0x1C, new_start);
 
     if (fs->jbd.csum_v2 || fs->jbd.csum_v3) {
         uint32_t csum;
@@ -435,23 +467,20 @@ static int rewrite_jsb_clean(struct ext4_fs *fs) {
         jsb_buf[0xFE] = jsb_buf[0xFF] = 0;
         /* Whole SB, post-zeroing. Stored big-endian. */
         csum = crc32c(CRC32C_INIT, jsb_buf, fs->sb.block_size);
-        jsb_buf[0xFC] = (uint8_t)(csum >> 24);
-        jsb_buf[0xFD] = (uint8_t)(csum >> 16);
-        jsb_buf[0xFE] = (uint8_t)(csum >>  8);
-        jsb_buf[0xFF] = (uint8_t) csum;
+        be32_pack(jsb_buf + 0xFC, csum);
     }
 
     return bdev_write(fs->bd, sector, sectors, jsb_buf);
 }
 
-/* Re-read the FS superblock, clear EXT4_FEATURE_INCOMPAT_RECOVER,
+/* Re-read the FS superblock, set or clear EXT4_FEATURE_INCOMPAT_RECOVER,
  * recompute fs sb checksum if metadata_csum is enabled. */
-static int rewrite_fs_sb_clean(struct ext4_fs *fs) {
+static int update_fs_sb_recover(struct ext4_fs *fs, int set) {
     uint32_t feat_incompat;
     uint32_t sector, sectors;
-    /* The fs SB is always exactly 1024 bytes at byte offset 1024 of the
-     * partition. Use a 1 KiB slice of jsb_buf — DGROUP is precious in DOS
-     * small-model and jsb_buf is dormant by the time we checkpoint. */
+    /* The fs SB is exactly 1024 bytes at byte offset 1024 of the
+     * partition. Reuse jsb_buf — DGROUP is precious in DOS small-model
+     * and jsb_buf is dormant by the time we touch the fs SB. */
     uint8_t *sb = jsb_buf;
     int      rc;
 
@@ -461,8 +490,9 @@ static int rewrite_fs_sb_clean(struct ext4_fs *fs) {
     rc = bdev_read(fs->bd, sector, sectors, sb);
     if (rc) return rc;
 
-    feat_incompat  = le32(sb + 0x60);
-    feat_incompat &= ~(uint32_t)0x4u;   /* EXT4_FEATURE_INCOMPAT_RECOVER */
+    feat_incompat = le32(sb + 0x60);
+    if (set) feat_incompat |=  (uint32_t)0x4u;
+    else     feat_incompat &= ~(uint32_t)0x4u;
     sb[0x60] = (uint8_t) feat_incompat;
     sb[0x61] = (uint8_t)(feat_incompat >>  8);
     sb[0x62] = (uint8_t)(feat_incompat >> 16);
@@ -483,6 +513,211 @@ static int rewrite_fs_sb_clean(struct ext4_fs *fs) {
     }
 
     return bdev_write(fs->bd, sector, sectors, sb);
+}
+
+/* --- Phase 1b: emit a transaction (descriptor + data + commit) -------- */
+
+int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
+                        char *err, uint32_t err_len) {
+    /* walk_buf is the scratch for descriptor and commit blocks (used
+     * sequentially — descriptor is durable before we overwrite the
+     * scratch with the commit block). */
+    uint32_t this_seq, this_first;
+    uint32_t i;
+    uint32_t tag_bytes;
+    uint8_t  seq_be[4];
+    int      rc;
+
+    if (err && err_len) err[0] = '\0';
+    if (!fs->jbd.present) {
+        say(err, err_len, "no journal");
+        return -1;
+    }
+    if (!bdev_writable(fs->bd)) {
+        say(err, err_len, "bdev read-only");
+        return -2;
+    }
+    if (fs->jbd.start != 0) {
+        say(err, err_len, "journal not clean — checkpoint dirty journal first");
+        return -3;
+    }
+    if (trans->block_count == 0 || trans->block_count > EXT4_JBD_TRANS_MAX_BLOCKS) {
+        snprintf(err, err_len, "trans block_count %lu out of range",
+                 (unsigned long)trans->block_count);
+        return -4;
+    }
+    if (fs->sb.feature_ro_compat & 0x400u) {
+        say(err, err_len, "metadata_csum write support is phase 1c");
+        return -5;
+    }
+
+    /* Reject blocks whose first u32 matches JBD_MAGIC. ESCAPE handling
+     * (zero the first u32 in the journal copy + set ESCAPE flag + restore
+     * on read) is phase 1c; for in-place file writes this is rare. */
+    for (i = 0; i < trans->block_count; i++) {
+        const uint8_t *p = (const uint8_t *)trans->buf[i];
+        if (be32(p) == EXT4_JBD_MAGIC) {
+            say(err, err_len, "block first-u32 is JBD_MAGIC; ESCAPE not yet supported");
+            return -6;
+        }
+    }
+
+    this_seq   = fs->jbd.sequence;
+    this_first = fs->jbd.first;
+    tag_bytes  = jbd_tag_bytes(&fs->jbd);
+
+    /* Descriptor + N data + commit must fit in the log starting at
+     * jsb.first. (Phase 1 doesn't wrap the log.) */
+    if ((uint32_t)(this_first + 1u + trans->block_count + 1u) > fs->jbd.maxlen) {
+        say(err, err_len, "journal log too small for trans");
+        return -7;
+    }
+
+    /* Tag table must fit in one descriptor block. Capacity: blocksize
+     * minus bhdr (12) minus tail csum (4 if csum_v2/v3) minus first-tag
+     * UUID (16 bytes after the first tag). */
+    {
+        int32_t cap = (int32_t)fs->jbd.blocksize - 12 - 16;
+        if (fs->jbd.csum_v2 || fs->jbd.csum_v3) cap -= 4;
+        if ((int32_t)(trans->block_count * tag_bytes) > cap) {
+            say(err, err_len, "too many blocks for one descriptor");
+            return -8;
+        }
+    }
+
+    /* --- Build descriptor block in walk_buf --- */
+    memset(walk_buf, 0, fs->jbd.blocksize);
+    be32_pack(walk_buf + 0, EXT4_JBD_MAGIC);
+    be32_pack(walk_buf + 4, EXT4_JBD_BT_DESCRIPTOR);
+    be32_pack(walk_buf + 8, this_seq);
+
+    be32_pack(seq_be, this_seq);
+    {
+        uint32_t tag_off = 12;
+        for (i = 0; i < trans->block_count; i++) {
+            uint32_t flags = 0;
+            uint64_t fs_blk = trans->fs_block[i];
+
+            if (i + 1u == trans->block_count) flags |= EXT4_JBD_TAG_FLAG_LAST_TAG;
+            if (i > 0)                        flags |= EXT4_JBD_TAG_FLAG_SAME_UUID;
+
+            if (fs->jbd.csum_v3) {
+                /* tag3: blocknr(4) | flags(4) | blocknr_high(4) | csum(4) */
+                be32_pack(walk_buf + tag_off + 0, (uint32_t)fs_blk);
+                be32_pack(walk_buf + tag_off + 4, flags);
+                be32_pack(walk_buf + tag_off + 8, (uint32_t)(fs_blk >> 32));
+                /* csum filled below */
+            } else {
+                /* tag: blocknr(4) | csum16(2) | flags16(2) | blocknr_high(4 if 64bit) */
+                be32_pack(walk_buf + tag_off + 0, (uint32_t)fs_blk);
+                /* csum16 at +4..+5, filled below */
+                be16_pack(walk_buf + tag_off + 6, (uint16_t)flags);
+                if (fs->jbd.has_64bit) {
+                    be32_pack(walk_buf + tag_off + 8, (uint32_t)(fs_blk >> 32));
+                }
+            }
+
+            /* Per-tag csum: crc32c(uuid + seq_be + data_block).
+             * V3 stores the full 32-bit value in the tag's csum field;
+             * V2 truncates to the low 16 bits. */
+            if (fs->jbd.csum_v2 || fs->jbd.csum_v3) {
+                uint32_t per = crc32c(CRC32C_INIT, fs->jbd.uuid, 16);
+                per = crc32c(per, seq_be, 4);
+                per = crc32c(per, trans->buf[i], fs->jbd.blocksize);
+                if (fs->jbd.csum_v3) {
+                    be32_pack(walk_buf + tag_off + 12, per);
+                } else {
+                    be16_pack(walk_buf + tag_off + 4, (uint16_t)(per & 0xFFFFu));
+                }
+            }
+
+            tag_off += tag_bytes;
+            /* First tag carries the UUID immediately after; later tags
+             * use SAME_UUID. */
+            if (i == 0) {
+                memcpy(walk_buf + tag_off, fs->jbd.uuid, 16);
+                tag_off += 16;
+            }
+        }
+    }
+
+    /* Descriptor tail crc (CSUM_V2/V3 only). Tail field is the last 4
+     * bytes; CRC is over uuid + entire descriptor with tail zeroed. */
+    if (fs->jbd.csum_v2 || fs->jbd.csum_v3) {
+        uint32_t tail = crc32c(CRC32C_INIT, fs->jbd.uuid, 16);
+        tail = crc32c(tail, walk_buf, fs->jbd.blocksize);
+        be32_pack(walk_buf + fs->jbd.blocksize - 4u, tail);
+    }
+
+    /* Step 1: SET RECOVER on FS SB. After this, if we crash, next mount
+     * tries replay; finds either a valid commit (replays) or invalid
+     * (clears RECOVER on next clean unmount). */
+    rc = update_fs_sb_recover(fs, 1);
+    if (rc) { say(err, err_len, "set RECOVER failed"); return rc; }
+
+    /* Step 2: write descriptor at journal[first]. */
+    rc = write_journal_block(fs, this_first, walk_buf);
+    if (rc) { say(err, err_len, "descriptor write failed"); return rc; }
+
+    /* Step 3: write data blocks at journal[first+1..first+N]. */
+    for (i = 0; i < trans->block_count; i++) {
+        rc = write_journal_block(fs, this_first + 1u + i, trans->buf[i]);
+        if (rc) {
+            snprintf(err, err_len, "data write failed at #%lu (rc=%d)",
+                     (unsigned long)i, rc);
+            return rc;
+        }
+    }
+
+    /* --- Build commit block in walk_buf (overwrites descriptor in scratch) --- */
+    memset(walk_buf, 0, fs->jbd.blocksize);
+    be32_pack(walk_buf + 0, EXT4_JBD_MAGIC);
+    be32_pack(walk_buf + 4, EXT4_JBD_BT_COMMIT);
+    be32_pack(walk_buf + 8, this_seq);
+    if (fs->jbd.csum_v2 || fs->jbd.csum_v3) {
+        uint32_t commit_csum;
+        walk_buf[12] = 4u; /* chksum_type = JBD_CRC32C_CHKSUM */
+        walk_buf[13] = 4u; /* chksum_size */
+        /* chksum[0] at offset 16, currently zero. CRC over uuid + commit block. */
+        commit_csum = crc32c(CRC32C_INIT, fs->jbd.uuid, 16);
+        commit_csum = crc32c(commit_csum, walk_buf, fs->jbd.blocksize);
+        be32_pack(walk_buf + 16, commit_csum);
+    }
+
+    /* Step 4: write commit block at journal[first+1+N]. */
+    rc = write_journal_block(fs, this_first + 1u + trans->block_count, walk_buf);
+    if (rc) { say(err, err_len, "commit block write failed"); return rc; }
+
+    /* Step 5: update jsb on disk so a future mount sees our trans.
+     * Atomically: start=jsb.first, sequence=this_seq (so the walker's
+     * first-expected-seq matches the descriptor's seq). */
+    rc = update_jsb(fs, this_first, this_seq);
+    if (rc) { say(err, err_len, "jsb start/seq update failed"); return rc; }
+
+    /* Step 6: populate the in-memory replay map directly — we know
+     * exactly which fs_block went to which journal_blk, no need to
+     * re-walk the log we just wrote. */
+    fs->jbd.start         = this_first;
+    fs->jbd.replay_count  = (uint32_t)trans->block_count;
+    for (i = 0; i < trans->block_count; i++) {
+        fs->jbd.replay[i].fs_block    = trans->fs_block[i];
+        fs->jbd.replay[i].journal_blk = this_first + 1u + i;
+        fs->jbd.replay[i].is_escape   = 0;
+    }
+    fs->jbd.replay_active = 1;
+
+    /* Step 7: checkpoint — flushes data to fs_blocks, zeros jsb.start,
+     * clears RECOVER. After this the FS is clean. */
+    rc = ext4_journal_checkpoint(fs, err, err_len);
+    if (rc) return rc;
+
+    /* Step 8: bump in-memory sequence so future commits use seq+1. The
+     * on-disk jsb.sequence stays at this_seq (from step 5) — that's
+     * lwext4's "last_trans_id" convention. The next commit will overwrite
+     * jsb.sequence to its own (higher) seq in step 5. */
+    fs->jbd.sequence = this_seq + 1u;
+
+    return 0;
 }
 
 int ext4_journal_checkpoint(struct ext4_fs *fs, char *err, uint32_t err_len) {
@@ -509,12 +744,13 @@ int ext4_journal_checkpoint(struct ext4_fs *fs, char *err, uint32_t err_len) {
         }
     }
 
-    /* 2. Clean the journal head. */
-    rc = rewrite_jsb_clean(fs);
+    /* 2. Clean the journal head. Leave jsb.sequence as-is — its value
+     * only matters when start != 0. */
+    rc = update_jsb(fs, 0u, fs->jbd.sequence);
     if (rc) { say(err, err_len, "jsb rewrite failed"); return rc; }
 
     /* 3. Clear RECOVER on the FS SB. */
-    rc = rewrite_fs_sb_clean(fs);
+    rc = update_fs_sb_recover(fs, 0);
     if (rc) { say(err, err_len, "fs sb rewrite failed"); return rc; }
 
     /* 4. Drop the in-memory replay state. Reads now go straight to disk. */
