@@ -103,6 +103,8 @@ echo === Multi-file: COPY HELLO+NESTED to BOTH.TXT === >> A:\OUT.TXT
 COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT A:\BOTH.TXT >> A:\OUT.TXT
 echo === TYPE A:\BOTH.TXT (concatenation result) === >> A:\OUT.TXT
 TYPE A:\BOTH.TXT >> A:\OUT.TXT
+echo === Verify g_fs.sb integrity (canary) === >> A:\OUT.TXT
+A:\EXT4CHK.EXE /V >> A:\OUT.TXT
 echo === Subfunction call counts === >> A:\OUT.TXT
 A:\EXT4CNT.EXE >> A:\OUT.TXT
 echo === TSR diagnostic dump === >> A:\OUT.TXT
@@ -147,4 +149,25 @@ wait 2>/dev/null || true
 
 echo
 echo "===== OUT.TXT (from MS-DOS 4) ====="
-mtype -i "$TEST_IMG" ::OUT.TXT 2>/dev/null || echo "(no OUT.TXT in image)"
+OUT=$(mtype -i "$TEST_IMG" ::OUT.TXT 2>/dev/null)
+if [[ -z "$OUT" ]]; then
+    echo "(no OUT.TXT in image)" >&2
+    exit 1
+fi
+echo "$OUT"
+
+# Smoke-test assertions. Fail loudly if regressions land.
+fail=0
+if ! grep -q "Hello, ext4-dos!" <<<"$OUT"; then
+    echo "FAIL: TYPE Y:\\HELLO.TXT didn't return file content" >&2
+    fail=1
+fi
+if ! grep -q "56346624 bytes free" <<<"$OUT"; then
+    echo "FAIL: 'bytes free' wrong (expected 56346624) — kernel write may be hitting g_safe_*" >&2
+    fail=1
+fi
+if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
+    echo "FAIL: g_fs.sb integrity canary tripped — see 'verify:' lines above" >&2
+    fail=1
+fi
+exit $fail

@@ -57,6 +57,8 @@ echo === Multi-file: COPY HELLO+NESTED to BOTH.TXT === >> C:\OUT.TXT
 COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT C:\BOTH.TXT >> C:\OUT.TXT
 echo === TYPE C:\BOTH.TXT (concatenation result) === >> C:\OUT.TXT
 TYPE C:\BOTH.TXT >> C:\OUT.TXT
+echo === Verify g_fs.sb integrity (canary) === >> C:\OUT.TXT
+C:\EXT4CHK.EXE /V >> C:\OUT.TXT
 echo === Subfunction call counts === >> C:\OUT.TXT
 C:\EXT4CNT.EXE >> C:\OUT.TXT
 echo === FindFirst capture dump === >> C:\OUT.TXT
@@ -102,4 +104,25 @@ wait 2>/dev/null || true
 # Pull the captured output back out.
 echo
 echo "===== OUT.TXT (from FreeDOS) ====="
-mtype -i "$TEST_IMG@@$PARTITION_OFFSET" ::OUT.TXT 2>/dev/null || echo "(no OUT.TXT in image)"
+OUT=$(mtype -i "$TEST_IMG@@$PARTITION_OFFSET" ::OUT.TXT 2>/dev/null)
+if [[ -z "$OUT" ]]; then
+    echo "(no OUT.TXT in image)" >&2
+    exit 1
+fi
+echo "$OUT"
+
+# Smoke-test assertions. Match the MS-DOS 4 runner's checks.
+fail=0
+if ! grep -q "Hello, ext4-dos!" <<<"$OUT"; then
+    echo "FAIL: TYPE Y:\\HELLO.TXT didn't return file content" >&2
+    fail=1
+fi
+if ! grep -qE "56[,]?346[,]?624 bytes free" <<<"$OUT"; then
+    echo "FAIL: 'bytes free' wrong (expected 56,346,624) — kernel write may be hitting g_safe_*" >&2
+    fail=1
+fi
+if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
+    echo "FAIL: g_fs.sb integrity canary tripped — see 'verify:' lines above" >&2
+    fail=1
+fi
+exit $fail

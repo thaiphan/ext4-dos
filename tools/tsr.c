@@ -615,6 +615,36 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
         return;
     }
 
+    /* Canary probe — AX=11F0, BX=magic. Returns lo16 of LIVE g_fs.sb
+     * fields in CX/DX/SI/DI; AL=0xFF on success. ext4chk /V compares
+     * these against the install-time `_DATA` snapshots — if they
+     * disagree, a stray kernel write has hit g_fs.sb. See the
+     * "Defending against the residual kernel write" section in
+     * docs/dos-internals.md. */
+    if (r.w.ax == 0x11F0u && r.w.bx == EXT4_DOS_MAGIC_PROBE) {
+        if (g_fs_ready) {
+            r.w.cx = (uint16_t)(g_fs.sb.block_size & 0xFFFFul);
+            r.w.dx = (uint16_t)((uint32_t)g_fs.sb.blocks_count & 0xFFFFul);
+            r.w.si = (uint16_t)((uint32_t)g_fs.sb.free_blocks_count & 0xFFFFul);
+            r.w.di = (uint16_t)(g_fs.sb.inodes_per_group & 0xFFFFul);
+            r.h.al = 0xFFu;
+        } else {
+            r.h.al = 0u;
+        }
+        return;
+    }
+
+    /* Snapshot probe — AX=11EF, BX=magic. Returns lo16 of the
+     * install-time `_DATA`-segment snapshots; AL=0xFF on success.
+     * Used by ext4chk /V together with the canary above. */
+    if (r.w.ax == 0x11EFu && r.w.bx == EXT4_DOS_MAGIC_PROBE) {
+        r.w.cx = (uint16_t)(g_safe_block_size & 0xFFFFul);
+        r.w.dx = (uint16_t)(g_safe_blocks_count_lo & 0xFFFFul);
+        r.w.si = (uint16_t)(g_safe_free_blocks_count_lo & 0xFFFFul);
+        r.h.al = 0xFFu;
+        return;
+    }
+
     if (r.h.ah == 0x11u) {
         al = r.h.al;
         g_call_counts[al & 0x3F]++;

@@ -49,8 +49,8 @@ rm -f "$MSDOS4_DIR/config.sys.tmp"
 cat > "$MSDOS4_DIR/autoexec.bat.tmp" <<'EOF'
 @echo off
 echo --- TSR installed; printing addresses ---
-A:\EXT4CHK.EXE /D /B
-echo --- triggering bug ---
+A:\EXT4CHK.EXE /B
+echo --- triggering residual bug ---
 DIR Y:
 echo --- DONE ---
 EOF
