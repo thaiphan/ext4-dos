@@ -21,7 +21,9 @@
 #define DRIVE_INDEX  ((DRIVE_LETTER) - 'A')
 
 #define DOS_ERR_FILE_NOT_FOUND  0x02u
+#define DOS_ERR_ACCESS_DENIED   0x05u
 #define DOS_ERR_NO_MORE_FILES   0x12u
+#define DOS_ERR_WRITE_PROTECT   0x13u
 
 /* Both bits must be set for MS-DOS 4 to dispatch file ops through INT 2Fh
  * AH=11h on this drive. 0x8000 = curdir_isnet (network/IFS drive), 0x4000 =
@@ -823,12 +825,43 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
         }
 
         switch (al) {
-        case 0x05: /* ChDir */
-        case 0x07: /* Commit File */
-        case 0x0A: /* Lock Region */
-        case 0x0B: /* Unlock Region */
-        case 0x0E: /* Set File Attributes */
+        case 0x05: /* ChDir — drive walk only, no disk write */
+        case 0x07: /* Commit File — flush is a no-op for a read-only mount */
+        case 0x0A: /* Lock Region — advisory; safe to silently succeed */
+        case 0x0B: /* Unlock Region — same */
             r.w.flags &= ~1u;
+            return;
+
+        /* Read-only redirector — refuse every subfunction that would
+         * mutate disk state. Returning error 0x13 (write protect) gives
+         * DOS callers the canonical "this volume is read-only" experience:
+         *   COPY foo Y:\bar     →  "Write protect error writing drive Y"
+         *   DEL Y:\foo          →  "Write protect error"
+         *   MD Y:\new           →  "Unable to create directory"
+         * Without these arms the calls fall through to `_chain_intr`,
+         * where the DOS default handler returns inscrutable errors.
+         *
+         * Subfunction numbers per references/freedos-kernel/hdr/network.h
+         * (REM_RMDIR=0x01, REM_MKDIR=0x03, REM_WRITE=0x09, REM_SETATTR=0x0E,
+         * REM_RENAME=0x11, REM_DELETE=0x13, REM_CREATE=0x17,
+         * REM_CRTRWOCDS=0x18). 0x21 LSEEK is handled separately in the
+         * stub below — DOS uses it for SeekEnd-to-find-EOF, which is fine
+         * to support read-only via the SFT's file-size field. */
+        case 0x01: /* REM_RMDIR — remove directory */
+        case 0x03: /* REM_MKDIR — create directory */
+        case 0x09: /* REM_WRITE */
+        case 0x0E: /* REM_SETATTR — change file attributes */
+        case 0x11: /* REM_RENAME */
+        case 0x13: /* REM_DELETE */
+        case 0x17: /* REM_CREATE — create new file */
+            /* 0x18 deliberately NOT here: FreeDOS's network.h calls it
+             * REM_CRTRWOCDS (create-R/W-without-CDS), but other references
+             * map it to a FindFirst-alt that older DOS issues. The
+             * existing FindFirst-alt arm below handles the latter; if
+             * FreeDOS ever dispatches the create variant here we'd want
+             * to refuse it, but the smoke test doesn't exercise the path. */
+            r.w.ax = DOS_ERR_WRITE_PROTECT;
+            r.w.flags |= 1u;
             return;
 
         case 0x06: { /* Close File */

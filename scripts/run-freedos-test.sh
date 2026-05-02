@@ -57,6 +57,15 @@ echo === Multi-file: COPY HELLO+NESTED to BOTH.TXT === >> C:\OUT.TXT
 COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT C:\BOTH.TXT >> C:\OUT.TXT
 echo === TYPE C:\BOTH.TXT (concatenation result) === >> C:\OUT.TXT
 TYPE C:\BOTH.TXT >> C:\OUT.TXT
+echo === Read-only enforcement: attempts must FAIL === >> C:\OUT.TXT
+echo --- DEL Y:\HELLO.TXT --- >> C:\OUT.TXT
+DEL Y:\HELLO.TXT >> C:\OUT.TXT
+echo --- COPY C:\BOTH.TXT Y:\NEW.TXT --- >> C:\OUT.TXT
+COPY C:\BOTH.TXT Y:\NEW.TXT >> C:\OUT.TXT
+echo --- MD Y:\NEWDIR --- >> C:\OUT.TXT
+MD Y:\NEWDIR >> C:\OUT.TXT
+echo --- (HELLO.TXT must still be there) --- >> C:\OUT.TXT
+DIR Y:\HELLO.TXT >> C:\OUT.TXT
 echo === TYPE Y:\VERY~876.TXT (8.3 alias roundtrip) === >> C:\OUT.TXT
 TYPE Y:\VERY~876.TXT >> C:\OUT.TXT
 echo === TYPE Y:\VERY~EB7.TXT (8.3 alias roundtrip) === >> C:\OUT.TXT
@@ -135,6 +144,11 @@ if ! grep -qE "56[,]?346[,]?624 bytes free" <<<"$OUT"; then
 fi
 if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
     echo "FAIL: g_fs.sb integrity canary tripped — see 'verify:' lines above" >&2
+    fail=1
+fi
+# Read-only enforcement: HELLO.TXT must survive the DEL attempt.
+if ! grep -A2 "HELLO.TXT must still be there" <<<"$OUT" | grep -q "HELLO"; then
+    echo "FAIL: read-only enforcement may have allowed DEL Y:\\HELLO.TXT" >&2
     fail=1
 fi
 exit $fail

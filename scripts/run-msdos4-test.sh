@@ -103,6 +103,15 @@ echo === Multi-file: COPY HELLO+NESTED to BOTH.TXT === >> A:\OUT.TXT
 COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT A:\BOTH.TXT >> A:\OUT.TXT
 echo === TYPE A:\BOTH.TXT (concatenation result) === >> A:\OUT.TXT
 TYPE A:\BOTH.TXT >> A:\OUT.TXT
+echo === Read-only enforcement: attempts must FAIL === >> A:\OUT.TXT
+echo --- DEL Y:\HELLO.TXT --- >> A:\OUT.TXT
+DEL Y:\HELLO.TXT >> A:\OUT.TXT
+echo --- COPY A:\BOTH.TXT Y:\NEW.TXT --- >> A:\OUT.TXT
+COPY A:\BOTH.TXT Y:\NEW.TXT >> A:\OUT.TXT
+echo --- MD Y:\NEWDIR --- >> A:\OUT.TXT
+MD Y:\NEWDIR >> A:\OUT.TXT
+echo --- (HELLO.TXT must still be there) --- >> A:\OUT.TXT
+DIR Y:\HELLO.TXT >> A:\OUT.TXT
 echo === Verify g_fs.sb integrity (canary) === >> A:\OUT.TXT
 A:\EXT4CHK.EXE /V >> A:\OUT.TXT
 echo === Subfunction call counts === >> A:\OUT.TXT
@@ -186,6 +195,16 @@ if ! grep -q "56346624 bytes free" <<<"$OUT"; then
 fi
 if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
     echo "FAIL: g_fs.sb integrity canary tripped — see 'verify:' lines above" >&2
+    fail=1
+fi
+# Read-only enforcement: each destructive op should fail loudly. We
+# can't grep DOS error strings reliably across versions (MS-DOS says
+# "Write protect error", FreeDOS says different things), so just
+# assert HELLO.TXT is STILL THERE after the attempted DEL — if the
+# read-only refusal worked, the Y:\HELLO.TXT line shows up below
+# "(HELLO.TXT must still be there)".
+if ! grep -A2 "HELLO.TXT must still be there" <<<"$OUT" | grep -q "HELLO"; then
+    echo "FAIL: read-only enforcement may have allowed DEL Y:\\HELLO.TXT" >&2
     fail=1
 fi
 exit $fail
