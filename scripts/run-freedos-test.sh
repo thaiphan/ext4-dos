@@ -210,4 +210,34 @@ if ! grep -A4 "Re-check" <<<"$OUT" | grep -q "TSR not detected"; then
     echo "FAIL: TSR still detected after ext4 -u" >&2
     fail=1
 fi
+
+# Phase 1c regression net: the TSR's REM_WRITE path must produce an
+# e2fsck-clean partition. The inode-checksum-mismatch bug we caught
+# during phase 1c bring-up (stack-local crc32c buffers under SS!=DS)
+# was invisible to DIR/TYPE assertions — only e2fsck flagged it. With
+# metadata_csum on the partitioned fixture, this catches any future
+# regression in ext4_inode_recompute_csum and friends.
+E2FSCK="$(command -v e2fsck || true)"
+for c in /opt/homebrew/opt/e2fsprogs/sbin/e2fsck \
+         /usr/local/opt/e2fsprogs/sbin/e2fsck; do
+    [[ -x "$c" ]] && E2FSCK="$c" && break
+done
+if [[ -n "$E2FSCK" ]]; then
+    PART_IMG="$FREEDOS_DIR/post-write-part.img"
+    dd if="$EXT4_IMG" of="$PART_IMG" bs=512 skip=2048 status=none
+    # `set -e` would bail the whole script on e2fsck's non-zero exit;
+    # the if-else branch shape captures the rc instead of triggering it.
+    if "$E2FSCK" -fn "$PART_IMG" >"$FREEDOS_DIR/e2fsck.out" 2>&1; then
+        rm -f "$PART_IMG" "$FREEDOS_DIR/e2fsck.out"
+    else
+        E2RC=$?
+        echo "FAIL: e2fsck on post-write partition reported errors (rc=$E2RC):" >&2
+        cat "$FREEDOS_DIR/e2fsck.out" >&2
+        rm -f "$PART_IMG" "$FREEDOS_DIR/e2fsck.out"
+        fail=1
+    fi
+else
+    echo "WARN: e2fsck not found — skipping post-write integrity check" >&2
+fi
+
 exit $fail
