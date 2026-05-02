@@ -96,13 +96,11 @@ def main() -> None:
 
         offset_bytes = PART_START_LBA * SECTOR_SIZE
         size_1k_blocks = (part_sector_count * SECTOR_SIZE) // 1024
-        # ^metadata_csum — phase 1b refuses writes when metadata_csum is
-        # set (recomputing inode i_checksum on writes is phase 1c).
-        # Without this, freedos-test's REM_WRITE smoke test bails at -5.
+        # Default features (incl. metadata_csum) — phase 1c recomputes
+        # inode i_checksum on writes through ext4_inode_recompute_csum.
         subprocess.check_call(
             [
                 mkfs, "-F", "-b", "1024",
-                "-O", "^metadata_csum",
                 "-E", f"offset={offset_bytes}",
                 "-L", "ext4-dos-part",
                 "-d", tdir,

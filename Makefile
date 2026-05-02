@@ -129,7 +129,7 @@ $(DOS_DIR)/%.obj: %.c | $(DOS_DIR)
 $(DOS_DIR):
 	mkdir -p $@
 
-host-test: host-build tests/images/journal.img tests/images/journal-csum.img tests/images/write.img
+host-test: host-build tests/images/journal.img tests/images/journal-csum.img tests/images/write.img tests/images/write-csum.img
 	@echo "==> running host_features_test"
 	@$(HOST_DIR)/host_features_test
 	@echo "==> running host_crc32c_test"
@@ -144,9 +144,12 @@ host-test: host-build tests/images/journal.img tests/images/journal-csum.img tes
 	@echo "==> running host_checkpoint_test (CSUM_V2, mutates working copy)"
 	@cp tests/images/journal-csum.img tests/images/journal-csum-flush.img
 	@$(HOST_DIR)/host_checkpoint_test tests/images/journal-csum-flush.img tests/images/journal-csum.expect
-	@echo "==> running host_write_test (mutates working copy)"
+	@echo "==> running host_write_test (no-csum, mutates working copy)"
 	@cp tests/images/write.img tests/images/write-test.img
 	@$(HOST_DIR)/host_write_test tests/images/write-test.img
+	@echo "==> running host_write_test (metadata_csum, mutates working copy)"
+	@cp tests/images/write-csum.img tests/images/write-csum-test.img
+	@$(HOST_DIR)/host_write_test tests/images/write-csum-test.img
 
 host-stress: host-build tests/images/stress.img
 	@echo "==> running host_stress_test"
@@ -162,6 +165,9 @@ tests/images/journal-csum.img: scripts/mkfixture-journal-csum.py
 	$(PYTHON) $<
 
 tests/images/write.img: scripts/mkfixture-write.py
+	$(PYTHON) $<
+
+tests/images/write-csum.img: scripts/mkfixture-write-csum.py
 	$(PYTHON) $<
 
 dos-test: dos-build fixture-partitioned

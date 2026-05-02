@@ -546,21 +546,11 @@ int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
                  (unsigned long)trans->block_count);
         return -4;
     }
-    if (fs->sb.feature_ro_compat & 0x400u) {
-        say(err, err_len, "metadata_csum write support is phase 1c");
-        return -5;
-    }
-
-    /* Reject blocks whose first u32 matches JBD_MAGIC. ESCAPE handling
-     * (zero the first u32 in the journal copy + set ESCAPE flag + restore
-     * on read) is phase 1c; for in-place file writes this is rare. */
-    for (i = 0; i < trans->block_count; i++) {
-        const uint8_t *p = (const uint8_t *)trans->buf[i];
-        if (be32(p) == EXT4_JBD_MAGIC) {
-            say(err, err_len, "block first-u32 is JBD_MAGIC; ESCAPE not yet supported");
-            return -6;
-        }
-    }
+    /* metadata_csum is now handled — the *caller* is responsible for
+     * recomputing inode/etc. checksums on the metadata blocks they
+     * pass us (see ext4_inode_recompute_csum). The journal-layer csums
+     * (per-tag, descriptor tail, commit chksum[0]) are computed below
+     * regardless. */
 
     this_seq   = fs->jbd.sequence;
     this_first = fs->jbd.first;
@@ -597,9 +587,30 @@ int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
         for (i = 0; i < trans->block_count; i++) {
             uint32_t flags = 0;
             uint64_t fs_blk = trans->fs_block[i];
+            uint8_t *blk    = (uint8_t *)trans->buf[i];
+            int      escape;
 
             if (i + 1u == trans->block_count) flags |= EXT4_JBD_TAG_FLAG_LAST_TAG;
             if (i > 0)                        flags |= EXT4_JBD_TAG_FLAG_SAME_UUID;
+
+            /* ESCAPE: if the data block's first u32 happens to match
+             * JBD_MAGIC, we must zero those bytes in the journal copy
+             * (so the descriptor walker doesn't get confused) and set
+             * ESCAPE in the tag. The on-disk fs_block is restored from
+             * the journal copy via ext4_fs_read_block / checkpoint
+             * (which patches the magic back). We mutate the caller's
+             * buffer in place — by convention they pass scratch memory,
+             * not their canonical copy. */
+            escape = (be32(blk) == EXT4_JBD_MAGIC) ? 1 : 0;
+            if (escape) {
+                flags |= EXT4_JBD_TAG_FLAG_ESCAPE;
+                blk[0] = blk[1] = blk[2] = blk[3] = 0;
+            }
+            /* Stash the escape decision in replay[i].is_escape now —
+             * we'll fill the rest of replay[i] in step 6 below. The
+             * checkpoint reader patches the magic back when this flag
+             * is set. */
+            fs->jbd.replay[i].is_escape = (uint8_t)escape;
 
             if (fs->jbd.csum_v3) {
                 /* tag3: blocknr(4) | flags(4) | blocknr_high(4) | csum(4) */
@@ -694,17 +705,18 @@ int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
     rc = update_jsb(fs, this_first, this_seq);
     if (rc) { say(err, err_len, "jsb start/seq update failed"); return rc; }
 
-    /* Step 6: populate the in-memory replay map directly — we know
-     * exactly which fs_block went to which journal_blk, no need to
-     * re-walk the log we just wrote. */
+    /* Step 6: populate the in-memory replay map directly. is_escape
+     * was recorded into the same slot during the descriptor-build loop
+     * above (we wrote 1 there if we zeroed the prefix). */
     fs->jbd.start         = this_first;
     fs->jbd.replay_count  = (uint32_t)trans->block_count;
+    fs->jbd.replay_active = 1;
+    /* fs_block + journal_blk filled now; is_escape was already set
+     * during the per-tag loop. */
     for (i = 0; i < trans->block_count; i++) {
         fs->jbd.replay[i].fs_block    = trans->fs_block[i];
         fs->jbd.replay[i].journal_blk = this_first + 1u + i;
-        fs->jbd.replay[i].is_escape   = 0;
     }
-    fs->jbd.replay_active = 1;
 
     /* Step 7: checkpoint — flushes data to fs_blocks, zeros jsb.start,
      * clears RECOVER. After this the FS is clean. */

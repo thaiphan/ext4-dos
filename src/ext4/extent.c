@@ -178,6 +178,11 @@ int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
         p[3] = (uint8_t)(now_unix >> 24);
     }
 
+    /* Recompute the inode-level checksum (no-op if metadata_csum is
+     * off). Must come after every other byte change to the inode —
+     * mtime above, plus any future writes that touch other fields. */
+    ext4_inode_recompute_csum(fs, inode_num, inode_buf + offset_in_block);
+
     /* Copy caller's new data into DGROUP so the multi-step commit doesn't
      * hold a FAR pointer alive across BIOS calls. */
     memcpy(data_buf, new_data, fs->sb.block_size);
