@@ -34,8 +34,8 @@
 #define CDS_FLAG_REDIRECTED 0xC000u
 #define CDS_ENTRY_SIZE      88
 #define CDS_OFF_PATH        0x00
-#define CDS_OFF_FLAGS       0x43
-#define CDS_OFF_BACKSLASH   0x4F
+#define CDS_OFF_FLAGS       0x43   /* curdir_flags (word) */
+#define CDS_OFF_BACKSLASH   0x4F   /* curdir_end (word) */
 
 /* SDA field offsets per FreeDOS kernel.asm.  Should match MS-DOS 4-7. */
 #define SDA_DTA_OFF         0x0C   /* DWORD far ptr to user's DTA / Read buffer */
@@ -1030,7 +1030,35 @@ static int hook_cds(void) {
                DRIVE_LETTER, FP_SEG(cds), FP_OFF(cds), DRIVE_INDEX);
     }
 
-    for (i = 0; i < 67; i++) cds[CDS_OFF_PATH + i] = 0;
+    /* Zero the WHOLE 88-byte CDS slot — not just the 67-byte path field.
+     *
+     * MS-DOS 4's CDS extends past the path/flags/backslash fields with an
+     * "IFS" block:
+     *   off 0x51  curdir_type     byte (0=local FAT, 2=IFS, 4=netuse)
+     *   off 0x52  curdir_ifs_hdr  4-byte far ptr to a File System Header
+     *   off 0x56  curdir_fsda     2-byte File System Dependent area
+     *
+     * MS-DOS 4 uses the SAME bit value (0x8000) for `curdir_isnet` AND
+     * `curdir_isifs`. So when we set the redirector flag, the kernel's IFS
+     * dispatcher follows `curdir_ifs_hdr` as a far pointer to load segment
+     * registers — and if those bytes were left uninitialised, the kernel
+     * dereferences garbage and ends up with DS pointing at our DGROUP.
+     * Subsequent writes by kernel code (e.g. the FAT time-encoder around
+     * 0F30:0256 packing the directory entry's mtime) land inside our static
+     * data, corrupting whatever happens to live at the targeted DGROUP
+     * offset. The crash was layout-sensitive only because shifting our
+     * statics changed which field got hit (commonly g_fs.sb.block_size's
+     * upper word, which broke every subsequent ext4 sector calculation).
+     *
+     * Found via DOSBox-X heavy debugger `BPM` on &g_fs.sb.block_size. The
+     * trap fired in MS-DOS 4 kernel code (CS=0F30) with our DGROUP in DS.
+     * FreeDOS doesn't use curdir_ifs_hdr at all, which is why the bug only
+     * showed up under MS-DOS 4. See references/msdos4/v4.0/src/INC/CURDIR.INC.
+     *
+     * Just zeroing curdir_ifs_hdr (and the rest) is enough — leaving the
+     * IFS pointer at 0:0 makes the kernel skip the IFS dispatch path. */
+    for (i = 0; i < CDS_ENTRY_SIZE; i++) cds[i] = 0;
+
     cds[CDS_OFF_PATH + 0] = DRIVE_LETTER;
     cds[CDS_OFF_PATH + 1] = ':';
     cds[CDS_OFF_PATH + 2] = '\\';
