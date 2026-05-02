@@ -387,6 +387,145 @@ int ext4_journal_lookup(const struct ext4_fs *fs, uint64_t fs_block,
     return 0;
 }
 
+/* --- Phase 1a: hard checkpoint (write replay map back to disk) ----------- */
+
+/* Write one journal-recorded block back to its on-disk fs_block
+ * location. Restores the JBD magic if the tag was escaped. Reuses
+ * walk_buf — phase B's walker isn't running concurrently with this. */
+static int checkpoint_one_block(struct ext4_fs *fs, uint64_t fs_block,
+                                uint32_t jblk, uint8_t is_escape) {
+    uint32_t byte, sector, sectors;
+    int      rc;
+
+    rc = ext4_journal_read_log_block(fs, jblk, walk_buf);
+    if (rc) return rc;
+    if (is_escape) {
+        walk_buf[0] = 0xC0; walk_buf[1] = 0x3B;
+        walk_buf[2] = 0x39; walk_buf[3] = 0x98;
+    }
+    byte    = (uint32_t)(fs_block * (uint64_t)fs->sb.block_size);
+    sector  = (uint32_t)(fs->partition_lba + byte / fs->bd->sector_size);
+    sectors = fs->sb.block_size / fs->bd->sector_size;
+    return bdev_write(fs->bd, sector, sectors, walk_buf);
+}
+
+/* Re-read the journal superblock, set s_start=0, recompute the jsb
+ * checksum if CSUM_V2/V3 is enabled, write back. */
+static int rewrite_jsb_clean(struct ext4_fs *fs) {
+    uint64_t byte;
+    uint32_t sector, sectors;
+    uint64_t first_phys;
+    int      rc;
+
+    first_phys = fs->jbd.extents[0].physical;
+    byte    = first_phys * (uint64_t)fs->sb.block_size;
+    sector  = (uint32_t)(fs->partition_lba + byte / fs->bd->sector_size);
+    sectors = fs->sb.block_size / fs->bd->sector_size;
+
+    rc = bdev_read(fs->bd, sector, sectors, jsb_buf);
+    if (rc) return rc;
+
+    /* s_start at offset 0x1C (big-endian) — clean log. */
+    jsb_buf[0x1C] = 0; jsb_buf[0x1D] = 0;
+    jsb_buf[0x1E] = 0; jsb_buf[0x1F] = 0;
+
+    if (fs->jbd.csum_v2 || fs->jbd.csum_v3) {
+        uint32_t csum;
+        jsb_buf[0xFC] = jsb_buf[0xFD] = 0;
+        jsb_buf[0xFE] = jsb_buf[0xFF] = 0;
+        /* Whole SB, post-zeroing. Stored big-endian. */
+        csum = crc32c(CRC32C_INIT, jsb_buf, fs->sb.block_size);
+        jsb_buf[0xFC] = (uint8_t)(csum >> 24);
+        jsb_buf[0xFD] = (uint8_t)(csum >> 16);
+        jsb_buf[0xFE] = (uint8_t)(csum >>  8);
+        jsb_buf[0xFF] = (uint8_t) csum;
+    }
+
+    return bdev_write(fs->bd, sector, sectors, jsb_buf);
+}
+
+/* Re-read the FS superblock, clear EXT4_FEATURE_INCOMPAT_RECOVER,
+ * recompute fs sb checksum if metadata_csum is enabled. */
+static int rewrite_fs_sb_clean(struct ext4_fs *fs) {
+    uint32_t feat_incompat;
+    uint32_t sector, sectors;
+    /* The fs SB is always exactly 1024 bytes at byte offset 1024 of the
+     * partition. Use a 1 KiB slice of jsb_buf — DGROUP is precious in DOS
+     * small-model and jsb_buf is dormant by the time we checkpoint. */
+    uint8_t *sb = jsb_buf;
+    int      rc;
+
+    sector  = (uint32_t)(fs->partition_lba + 1024u / fs->bd->sector_size);
+    sectors = 1024u / fs->bd->sector_size;
+
+    rc = bdev_read(fs->bd, sector, sectors, sb);
+    if (rc) return rc;
+
+    feat_incompat  = le32(sb + 0x60);
+    feat_incompat &= ~(uint32_t)0x4u;   /* EXT4_FEATURE_INCOMPAT_RECOVER */
+    sb[0x60] = (uint8_t) feat_incompat;
+    sb[0x61] = (uint8_t)(feat_incompat >>  8);
+    sb[0x62] = (uint8_t)(feat_incompat >> 16);
+    sb[0x63] = (uint8_t)(feat_incompat >> 24);
+
+    /* metadata_csum is at feature_ro_compat bit 0x400 (offset 0x64). */
+    if (le32(sb + 0x64) & 0x400u) {
+        uint32_t csum;
+        sb[0x3FC] = sb[0x3FD] = sb[0x3FE] = sb[0x3FF] = 0;
+        /* Spec: crc32c covers bytes 0..0x3FB ONLY (size = offsetof(checksum)).
+         * NOT the same convention as jsb (which CRCs the whole 1 KiB
+         * with the chksum field zeroed). */
+        csum = crc32c(CRC32C_INIT, sb, 0x3FC);
+        sb[0x3FC] = (uint8_t) csum;
+        sb[0x3FD] = (uint8_t)(csum >>  8);
+        sb[0x3FE] = (uint8_t)(csum >> 16);
+        sb[0x3FF] = (uint8_t)(csum >> 24);
+    }
+
+    return bdev_write(fs->bd, sector, sectors, sb);
+}
+
+int ext4_journal_checkpoint(struct ext4_fs *fs, char *err, uint32_t err_len) {
+    uint32_t i;
+    int      rc;
+
+    if (err && err_len) err[0] = '\0';
+    if (!fs->jbd.replay_active) return 0;
+    if (!bdev_writable(fs->bd)) {
+        say(err, err_len, "bdev read-only; staying in soft-replay");
+        return -3; /* matches BDEV_ERR_RO */
+    }
+
+    /* 1. Flush each journaled block to its on-disk location. */
+    for (i = 0; i < fs->jbd.replay_count; i++) {
+        rc = checkpoint_one_block(fs,
+                                  fs->jbd.replay[i].fs_block,
+                                  fs->jbd.replay[i].journal_blk,
+                                  fs->jbd.replay[i].is_escape);
+        if (rc) {
+            snprintf(err, err_len, "checkpoint flush failed at #%lu (rc=%d)",
+                     (unsigned long)i, rc);
+            return rc;
+        }
+    }
+
+    /* 2. Clean the journal head. */
+    rc = rewrite_jsb_clean(fs);
+    if (rc) { say(err, err_len, "jsb rewrite failed"); return rc; }
+
+    /* 3. Clear RECOVER on the FS SB. */
+    rc = rewrite_fs_sb_clean(fs);
+    if (rc) { say(err, err_len, "fs sb rewrite failed"); return rc; }
+
+    /* 4. Drop the in-memory replay state. Reads now go straight to disk. */
+    fs->jbd.start            = 0;
+    fs->jbd.replay_count     = 0;
+    fs->jbd.revoke_count     = 0;
+    fs->jbd.replay_active    = 0;
+    fs->sb.feature_incompat &= ~(uint32_t)0x4u;
+    return 0;
+}
+
 int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len) {
     /* DGROUP static — see file header. */
     static struct ext4_inode jinode;

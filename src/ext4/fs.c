@@ -54,9 +54,17 @@ int ext4_fs_open(struct ext4_fs *fs, struct blockdev *bd, uint64_t partition_lba
      * block mount. Without a replay map we fall back to on-disk state,
      * which is the pre-replay world (data may be slightly stale for
      * files written just before a crash). Callers that care can inspect
-     * fs->jbd.present and fs->jbd.replay_active. */
+     * fs->jbd.present and fs->jbd.replay_active.
+     *
+     * If the bdev is writable, hard-checkpoint the replay map: flush
+     * journaled blocks to disk, clear RECOVER. After this the FS is
+     * e2fsck-clean and reads no longer need the redirect. On a read-only
+     * bdev we stay in soft-replay mode. */
     if (ext4_journal_init(fs, jerr, sizeof jerr) == 0 && fs->jbd.present) {
         (void)ext4_journal_replay(fs, jerr, sizeof jerr);
+        if (fs->jbd.replay_active && bdev_writable(fs->bd)) {
+            (void)ext4_journal_checkpoint(fs, jerr, sizeof jerr);
+        }
     }
 
     return 0;

@@ -120,6 +120,17 @@ int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len);
  * (we just see slightly stale data, same as the pre-replay world). */
 int ext4_journal_replay(struct ext4_fs *fs, char *err, uint32_t err_len);
 
+/* "Hard replay": apply the replay map to disk so the on-disk state
+ * matches the journaled state, then mark the journal clean (s_start=0,
+ * recompute jsb checksum) and clear EXT4_FEATURE_INCOMPAT_RECOVER on
+ * the FS superblock (recompute fs sb checksum if metadata_csum is on).
+ * After this the FS is e2fsck-clean and a future mount sees no journal
+ * to replay.
+ *
+ * No-op if replay_active == 0. Returns BDEV_ERR_RO if bdev is
+ * read-only — caller stays in soft-replay mode. */
+int ext4_journal_checkpoint(struct ext4_fs *fs, char *err, uint32_t err_len);
+
 /* Look up fs_block in the replay map. Returns 1 with *out_jblk and
  * *out_is_escape filled in if a journaled copy exists; 0 otherwise. */
 int ext4_journal_lookup(const struct ext4_fs *fs, uint64_t fs_block,

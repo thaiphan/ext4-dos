@@ -74,7 +74,7 @@ vpath %.c tools src/blockdev src/ext4 src/partition src/util
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_crc32c_test
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_crc32c_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
@@ -86,6 +86,9 @@ $(HOST_DIR)/host_stress_test: tools/host_stress_test.c $(LIB_SRCS_HOST) | $(HOST
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_journal_test: tools/host_journal_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
+$(HOST_DIR)/host_checkpoint_test: tools/host_checkpoint_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_crc32c_test: tools/host_crc32c_test.c src/util/crc32c.c | $(HOST_DIR)
@@ -129,6 +132,12 @@ host-test: host-build tests/images/journal.img tests/images/journal-csum.img
 	@$(HOST_DIR)/host_journal_test tests/images/journal.img tests/images/journal.expect
 	@echo "==> running host_journal_test (CSUM_V2 fixture)"
 	@$(HOST_DIR)/host_journal_test tests/images/journal-csum.img tests/images/journal-csum.expect
+	@echo "==> running host_checkpoint_test (no-csum, mutates working copy)"
+	@cp tests/images/journal.img tests/images/journal-flush.img
+	@$(HOST_DIR)/host_checkpoint_test tests/images/journal-flush.img tests/images/journal.expect
+	@echo "==> running host_checkpoint_test (CSUM_V2, mutates working copy)"
+	@cp tests/images/journal-csum.img tests/images/journal-csum-flush.img
+	@$(HOST_DIR)/host_checkpoint_test tests/images/journal-csum-flush.img tests/images/journal-csum.expect
 
 host-stress: host-build tests/images/stress.img
 	@echo "==> running host_stress_test"
