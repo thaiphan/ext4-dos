@@ -261,12 +261,164 @@ static uint32_t bitmap_compute_csum(const struct ext4_fs *fs,
     return crc;
 }
 
+/* DGROUP statics for block-allocation result — avoids SS!=DS out-pointer
+ * bugs; find_free_block sets these directly instead of returning them. */
+static uint64_t alloc_candidate;         /* physical block number */
+static uint64_t alloc_bitmap_phys;       /* bitmap block this was allocated from */
+static uint32_t alloc_group;             /* block group index */
+
+/* Initialize scratch_bitmap for a BLOCK_UNINIT group g: mark reserved
+ * blocks (SB backup/GDT prefix, block bitmap, inode bitmap, inode table)
+ * as used; the rest are free. All data comes from the read-only in-memory
+ * BGD cache (not scratch_bgd which may have pending writes). */
+static void init_uninit_bitmap(const struct ext4_fs *fs, uint32_t g) {
+    const uint8_t *bgd = fs->bgd_buf + (uint32_t)g * fs->bgd_size;
+    uint64_t group_first, bmap_phys, ibmap_phys, itable_phys;
+    uint32_t itable_size, bit, b;
+    uint64_t start, end;
+
+    memset(scratch_bitmap, 0, fs->sb.block_size);
+
+    group_first  = (uint64_t)fs->sb.first_data_block
+                 + (uint64_t)g * fs->sb.blocks_per_group;
+    bmap_phys    = ((fs->bgd_size >= 64u)
+                   ? ((uint64_t)le32(bgd + 0x20) << 32) : 0u) | le32(bgd + 0x00);
+    ibmap_phys   = ((fs->bgd_size >= 64u)
+                   ? ((uint64_t)le32(bgd + 0x24) << 32) : 0u) | le32(bgd + 0x04);
+    itable_phys  = ((fs->bgd_size >= 64u)
+                   ? ((uint64_t)le32(bgd + 0x28) << 32) : 0u) | le32(bgd + 0x08);
+    itable_size  = (fs->sb.inodes_per_group * fs->sb.inode_size
+                 + fs->sb.block_size - 1u) / fs->sb.block_size;
+
+    /* Mark [group_first .. bmap_phys-1] as used: SB backup + GDT. */
+    if (bmap_phys > group_first) {
+        end = bmap_phys - group_first;
+        if (end > fs->sb.blocks_per_group) end = fs->sb.blocks_per_group;
+        for (b = 0; b < (uint32_t)end; b++)
+            scratch_bitmap[b >> 3] |= (uint8_t)(1u << (b & 7u));
+    }
+
+    /* Mark block bitmap block. */
+    if (bmap_phys >= group_first) {
+        bit = (uint32_t)(bmap_phys - group_first);
+        if (bit < fs->sb.blocks_per_group)
+            scratch_bitmap[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
+    }
+
+    /* Mark inode bitmap block. */
+    if (ibmap_phys >= group_first) {
+        bit = (uint32_t)(ibmap_phys - group_first);
+        if (bit < fs->sb.blocks_per_group)
+            scratch_bitmap[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
+    }
+
+    /* Mark inode table blocks. */
+    if (itable_phys >= group_first) {
+        start = itable_phys - group_first;
+        end   = start + itable_size;
+        if (end > fs->sb.blocks_per_group) end = fs->sb.blocks_per_group;
+        for (b = (uint32_t)start; b < (uint32_t)end; b++)
+            scratch_bitmap[b >> 3] |= (uint8_t)(1u << (b & 7u));
+    }
+}
+
+/* Find and allocate any free block across all groups. On success:
+ *   - scratch_bgd holds the updated BGD block (modified group's entry)
+ *   - scratch_bitmap holds the modified block bitmap
+ *   - alloc_candidate / alloc_bitmap_phys / alloc_group are set
+ * On failure, err is populated and -1 returned. */
+static int find_free_block(struct ext4_fs *fs, char *err, uint32_t err_len) {
+    uint32_t g;
+    uint32_t scan_bit, bytes_in_bitmap;
+    uint64_t bgd_fs_block;
+    int      rc;
+
+    bgd_fs_block = (fs->sb.block_size > 1024u) ? 1u : 2u;
+
+    rc = ext4_fs_read_block(fs, bgd_fs_block, scratch_bgd);
+    if (rc) { say_simple(err, err_len, "BGD block read failed"); return -1; }
+
+    for (g = 0; g < fs->bgd_count; g++) {
+        uint8_t *bgd_entry = scratch_bgd + (uint32_t)g * fs->bgd_size;
+        uint16_t free_lo   = le16(bgd_entry + 0x0C);
+        uint32_t free_hi   = (fs->bgd_size >= 64u) ? le16(bgd_entry + 0x2C) : 0u;
+        uint8_t  bg_flags  = bgd_entry[0x12];
+        uint64_t bmap_phys;
+        int      found = 0;
+
+        if (free_lo == 0u && free_hi == 0u) continue;
+
+        bmap_phys = ((fs->bgd_size >= 64u)
+                     ? ((uint64_t)le32(bgd_entry + 0x20) << 32) : 0u)
+                  | (uint64_t)le32(bgd_entry + 0x00);
+
+        if (bg_flags & 0x1u) {
+            /* BLOCK_UNINIT: generate the bitmap instead of reading it. */
+            init_uninit_bitmap(fs, g);
+        } else {
+            if (ext4_fs_read_block(fs, bmap_phys, scratch_bitmap) != 0) continue;
+        }
+
+        /* Scan for a free bit. */
+        bytes_in_bitmap = fs->sb.blocks_per_group >> 3;
+        if (bytes_in_bitmap > EXT4_WRITE_BUF_SIZE) bytes_in_bitmap = EXT4_WRITE_BUF_SIZE;
+        for (scan_bit = 0; scan_bit < bytes_in_bitmap * 8u; scan_bit++) {
+            uint32_t byte = scan_bit >> 3;
+            uint8_t  mask = (uint8_t)(1u << (scan_bit & 7u));
+            if (!(scratch_bitmap[byte] & mask)) {
+                scratch_bitmap[byte] |= mask;
+                alloc_candidate   = (uint64_t)fs->sb.first_data_block
+                                  + (uint64_t)g * fs->sb.blocks_per_group
+                                  + scan_bit;
+                alloc_bitmap_phys = bmap_phys;
+                alloc_group       = g;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) continue;
+
+        /* Decrement free_blocks_count in this BGD entry. */
+        if (free_lo == 0u) { free_hi -= 1u; free_lo = 0xFFFFu; }
+        else                { free_lo -= 1u; }
+        bgd_entry[0x0C] = (uint8_t) free_lo;
+        bgd_entry[0x0D] = (uint8_t)(free_lo >> 8);
+        if (fs->bgd_size >= 64u) {
+            bgd_entry[0x2C] = (uint8_t) free_hi;
+            bgd_entry[0x2D] = (uint8_t)(free_hi >> 8);
+        }
+
+        /* Clear BLOCK_UNINIT if we initialized the bitmap ourselves. */
+        if (bg_flags & 0x1u) bgd_entry[0x12] &= ~(uint8_t)0x1u;
+
+        /* Recompute bitmap + BGD checksums. */
+        {
+            uint32_t bm_csum = bitmap_compute_csum(fs, scratch_bitmap);
+            bgd_entry[0x18] = (uint8_t)(bm_csum & 0xFFu);
+            bgd_entry[0x19] = (uint8_t)(bm_csum >>  8);
+            if (fs->bgd_size >= 64u) {
+                bgd_entry[0x38] = (uint8_t)(bm_csum >> 16);
+                bgd_entry[0x39] = (uint8_t)(bm_csum >> 24);
+            }
+        }
+        {
+            uint16_t bg_csum = bgd_compute_csum(fs, g, bgd_entry);
+            bgd_entry[0x1E] = (uint8_t) bg_csum;
+            bgd_entry[0x1F] = (uint8_t)(bg_csum >> 8);
+        }
+        return 0;
+    }
+
+    say_simple(err, err_len, "no free block in any group");
+    return -1;
+}
+
 int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
                            uint32_t inode_num, const void *new_data,
                            uint32_t now_unix, char *err, uint32_t err_len) {
     /* Reuses the file-scope scratch_* buffers — see file header. Five
-     * FS-block buffers come into play: scratch_data, scratch_bitmap,
-     * scratch_bgd, scratch_sb, scratch_inode_block. */
+     * FS-block buffers: scratch_data, scratch_bitmap, scratch_bgd,
+     * scratch_sb, scratch_inode_block. */
 
     /* Inode-locator math (mirrors ext4_inode_read). */
     uint32_t       group;
@@ -276,8 +428,7 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     uint64_t       inode_fs_block;
     uint32_t       inode_offset_in_block;
 
-    /* BGD/SB locator. */
-    uint64_t       bgd_fs_block;
+    /* SB locator. */
     uint64_t       sb_fs_block;
     uint32_t       sb_offset_in_block;
 
@@ -287,15 +438,7 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     uint32_t       ext_logical;
     uint16_t       ext_len;
     uint64_t       ext_phys;
-    uint64_t       candidate;
-    uint64_t       bitmap_block_phys;
-    uint32_t       bit_in_group;
-    uint16_t       free_blocks_lo;
-    uint32_t       free_blocks_hi32;
     uint64_t       sb_free_total;
-    uint16_t       new_csum_lo, new_csum_hi;
-    uint16_t       new_bg_csum;
-    uint8_t       *bgd_entry;
     uint8_t       *sb_in_block;
     uint8_t       *inode_in_block;
     uint32_t       new_size_lo;
@@ -303,7 +446,6 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     uint32_t       blocks_count_lo;
     uint16_t       blocks_count_hi;
     int            rc;
-    uint8_t        bg_flags_lo;
 
     if (err && err_len) err[0] = '\0';
     if (inode_num == 0) { say_simple(err, err_len, "inode 0 invalid"); return -1; }
@@ -329,8 +471,6 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
         say_simple(err, err_len, "extent entries 0 or >4 — defer");
         return -1;
     }
-    /* Read the LAST leaf (highest logical). Phase 2 first cut: assume
-     * leaves are in logical order, so the last is at index entries-1. */
     {
         const uint8_t *e = iblock + 12 + ((uint32_t)ext_entries - 1u) * 12u;
         ext_logical = le32(e + 0);
@@ -341,145 +481,116 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
         }
         ext_phys    = ((uint64_t)le16(e + 6) << 32) | (uint64_t)le32(e + 8);
     }
-    /* For appending, inode.size must equal the last leaf's logical-end
-     * boundary — otherwise there's a hole or stale state somewhere. */
     if ((uint64_t)inode_in->size !=
         (uint64_t)(ext_logical + ext_len) * fs->sb.block_size) {
         say_simple(err, err_len, "inode size doesn't match last extent end");
         return -1;
     }
 
-    candidate = ext_phys + (uint64_t)ext_len;
-
-    /* --- Pin to group 0 for now. Iterating groups is phase 2.5. --- */
-    if (candidate < fs->sb.first_data_block
-        || candidate >= (uint64_t)fs->sb.first_data_block + fs->sb.blocks_per_group) {
-        say_simple(err, err_len, "contiguous candidate outside group 0 — defer to phase 2.5");
-        return -1;
-    }
-    bit_in_group = (uint32_t)(candidate - fs->sb.first_data_block);
-
-    /* --- Read the BGD block (BGD table for our fs sits at block 1 or 2) --- */
-    bgd_fs_block = (fs->sb.block_size > 1024u) ? 1u : 2u;
-    rc = ext4_fs_read_block(fs, bgd_fs_block, scratch_bgd);
-    if (rc) {
-        say_simple(err, err_len, "BGD block read failed");
-        return -1;
-    }
-    bgd_entry = scratch_bgd + 0u; /* BGD entry 0 is at offset 0 of the block */
-
-    /* Refuse uninitialized bitmaps for now. */
-    bg_flags_lo = bgd_entry[0x12]; /* bg_flags low byte */
-    if (bg_flags_lo & 0x1u) {
-        say_simple(err, err_len, "group 0 BLOCK_UNINIT — bitmap init not handled");
-        return -1;
-    }
-
-    bitmap_block_phys = ((fs->bgd_size >= 64u)
-                         ? ((uint64_t)le32(bgd_entry + 0x20) << 32)
-                         : 0u)
-                      | (uint64_t)le32(bgd_entry + 0x00);
-
-    free_blocks_lo  = le16(bgd_entry + 0x0C);
-    if (fs->bgd_size >= 64u) {
-        free_blocks_hi32 = le16(bgd_entry + 0x2C);
-    } else {
-        free_blocks_hi32 = 0;
-    }
-
-    /* --- Read the bitmap block --- */
-    rc = ext4_fs_read_block(fs, bitmap_block_phys, scratch_bitmap);
-    if (rc) {
-        say_simple(err, err_len, "bitmap block read failed");
-        return -1;
-    }
-
-    /* Try the contiguous candidate first. If taken, scan the rest of
-     * group 0 for the first free bit — we'll append a new leaf entry
-     * for that block instead of extending the last one. */
+    /* --- Try contiguous block first; fall back to any-free-block scan --- */
     {
-        uint32_t byte = bit_in_group >> 3;
-        uint8_t  mask = (uint8_t)(1u << (bit_in_group & 7u));
-        if (scratch_bitmap[byte] & mask) {
-            /* Not contiguous-free. Need a slot for a new leaf entry. */
+        uint32_t target_group;
+        uint64_t contig = ext_phys + (uint64_t)ext_len;  /* contiguous candidate */
+        int contig_in_range;
+
+        /* Determine which group the contiguous candidate falls in. */
+        contig_in_range = (contig >= (uint64_t)fs->sb.first_data_block &&
+                           contig <  (uint64_t)fs->sb.first_data_block
+                                   + (uint64_t)fs->bgd_count * fs->sb.blocks_per_group);
+        if (contig_in_range) {
+            target_group = (uint32_t)((contig - fs->sb.first_data_block)
+                                      / fs->sb.blocks_per_group);
+        } else {
+            target_group = fs->bgd_count; /* signal: don't try contiguous */
+        }
+
+        /* If contiguous candidate is viable, try it as a "prefer" hint by
+         * temporarily checking its bit — if free, great; otherwise fall
+         * through to the general scanner which tries every group. The
+         * general scanner in find_free_block will pick the first free bit
+         * (which may or may not be contiguous). */
+        if (target_group < fs->bgd_count) {
+            /* Need a new leaf slot if candidate turns out non-contiguous. */
             if (ext_entries >= 4u) {
-                say_simple(err, err_len, "i_block leaf table full and not contiguous — defer");
-                return -1;
-            }
-            {
-                /* Linear scan from index 0 over the group's blocks_per_group
-                 * bits. Skip first_data_block worth of bits at the start
-                 * (those represent reserved/already-allocated low blocks). */
-                uint32_t scan_bit;
-                int      found = 0;
-                uint32_t bytes_in_bitmap = fs->sb.blocks_per_group >> 3;
-                if (bytes_in_bitmap > EXT4_WRITE_BUF_SIZE) bytes_in_bitmap = EXT4_WRITE_BUF_SIZE;
-                for (scan_bit = 0; scan_bit < bytes_in_bitmap * 8u; scan_bit++) {
-                    uint32_t b = scan_bit >> 3;
-                    uint8_t  m = (uint8_t)(1u << (scan_bit & 7u));
-                    if (!(scratch_bitmap[b] & m)) {
-                        bit_in_group = scan_bit;
-                        candidate    = (uint64_t)fs->sb.first_data_block + scan_bit;
-                        scratch_bitmap[b] |= m;
-                        found = 1;
-                        break;
-                    }
+                /* Contiguous is the ONLY option without a new leaf — check
+                 * the bit directly. */
+                uint64_t bgd_fs_block = (fs->sb.block_size > 1024u) ? 1u : 2u;
+                uint8_t *bgd_entry;
+                uint64_t bmap_phys;
+                uint32_t bit = (uint32_t)((contig - fs->sb.first_data_block)
+                                          % fs->sb.blocks_per_group);
+
+                rc = ext4_fs_read_block(fs, bgd_fs_block, scratch_bgd);
+                if (rc) { say_simple(err, err_len, "BGD block read failed"); return -1; }
+                bgd_entry = scratch_bgd + (uint32_t)target_group * fs->bgd_size;
+                bmap_phys = ((fs->bgd_size >= 64u)
+                             ? ((uint64_t)le32(bgd_entry + 0x20) << 32) : 0u)
+                           | (uint64_t)le32(bgd_entry + 0x00);
+
+                if (bgd_entry[0x12] & 0x1u) {
+                    /* UNINIT — contiguous bit is guaranteed free. */
+                    init_uninit_bitmap(fs, target_group);
+                } else {
+                    rc = ext4_fs_read_block(fs, bmap_phys, scratch_bitmap);
+                    if (rc) { say_simple(err, err_len, "bitmap read failed"); return -1; }
                 }
-                if (!found) {
-                    say_simple(err, err_len, "no free block in group 0");
+                if (scratch_bitmap[bit >> 3] & (uint8_t)(1u << (bit & 7u))) {
+                    say_simple(err, err_len, "leaf table full and contiguous block taken");
                     return -1;
                 }
+                /* Allocate it. */
+                scratch_bitmap[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
+                alloc_candidate   = contig;
+                alloc_bitmap_phys = bmap_phys;
+                alloc_group       = target_group;
+                if (bgd_entry[0x12] & 0x1u) bgd_entry[0x12] &= ~(uint8_t)0x1u;
+                {
+                    uint16_t fl = le16(bgd_entry + 0x0C);
+                    uint32_t fh = (fs->bgd_size >= 64u) ? le16(bgd_entry + 0x2C) : 0u;
+                    if (fl == 0u) { fh -= 1u; fl = 0xFFFFu; } else fl -= 1u;
+                    bgd_entry[0x0C] = (uint8_t)fl;
+                    bgd_entry[0x0D] = (uint8_t)(fl >> 8);
+                    if (fs->bgd_size >= 64u) {
+                        bgd_entry[0x2C] = (uint8_t)fh;
+                        bgd_entry[0x2D] = (uint8_t)(fh >> 8);
+                    }
+                }
+                {
+                    uint32_t bm_csum = bitmap_compute_csum(fs, scratch_bitmap);
+                    bgd_entry[0x18] = (uint8_t)(bm_csum & 0xFFu);
+                    bgd_entry[0x19] = (uint8_t)(bm_csum >>  8);
+                    if (fs->bgd_size >= 64u) {
+                        bgd_entry[0x38] = (uint8_t)(bm_csum >> 16);
+                        bgd_entry[0x39] = (uint8_t)(bm_csum >> 24);
+                    }
+                }
+                {
+                    uint16_t bc = bgd_compute_csum(fs, target_group, bgd_entry);
+                    bgd_entry[0x1E] = (uint8_t)bc;
+                    bgd_entry[0x1F] = (uint8_t)(bc >> 8);
+                }
+            } else {
+                /* Leaf table has room — use the general scanner which will
+                 * try every group and pick the first free bit. */
+                if (find_free_block(fs, err, err_len) != 0) return -1;
             }
         } else {
-            scratch_bitmap[byte] |= mask;
+            /* Contiguous candidate is out of range — general scanner. */
+            if (ext_entries >= 4u) {
+                say_simple(err, err_len, "leaf table full and no room for new leaf");
+                return -1;
+            }
+            if (find_free_block(fs, err, err_len) != 0) return -1;
         }
     }
 
-    /* --- Read the FS SB block --- */
+    /* --- Read the FS SB block + decrement its free_blocks_count --- */
     sb_fs_block         = (fs->sb.block_size > 1024u) ? 0u : 1u;
     sb_offset_in_block  = (fs->sb.block_size > 1024u) ? 1024u : 0u;
     rc = ext4_fs_read_block(fs, sb_fs_block, scratch_sb);
-    if (rc) {
-        say_simple(err, err_len, "fs sb block read failed");
-        return -1;
-    }
+    if (rc) { say_simple(err, err_len, "fs sb block read failed"); return -1; }
     sb_in_block = scratch_sb + sb_offset_in_block;
 
-    /* --- Decrement free_blocks_count in BGD entry --- */
-    if (free_blocks_lo == 0u && free_blocks_hi32 == 0u) {
-        say_simple(err, err_len, "BGD reports no free blocks");
-        return -1;
-    }
-    if (free_blocks_lo == 0u) {
-        free_blocks_hi32 -= 1u;
-        free_blocks_lo    = 0xFFFFu;
-    } else {
-        free_blocks_lo -= 1u;
-    }
-    bgd_entry[0x0C] = (uint8_t) free_blocks_lo;
-    bgd_entry[0x0D] = (uint8_t)(free_blocks_lo >> 8);
-    if (fs->bgd_size >= 64u) {
-        bgd_entry[0x2C] = (uint8_t) free_blocks_hi32;
-        bgd_entry[0x2D] = (uint8_t)(free_blocks_hi32 >> 8);
-    }
-
-    /* Recompute bitmap csum + write into BGD entry; recompute BGD csum. */
-    {
-        uint32_t bm_csum = bitmap_compute_csum(fs, scratch_bitmap);
-        new_csum_lo = (uint16_t)(bm_csum & 0xFFFFu);
-        new_csum_hi = (uint16_t)(bm_csum >> 16);
-    }
-    bgd_entry[0x18] = (uint8_t) new_csum_lo;
-    bgd_entry[0x19] = (uint8_t)(new_csum_lo >> 8);
-    if (fs->bgd_size >= 64u) {
-        bgd_entry[0x38] = (uint8_t) new_csum_hi;
-        bgd_entry[0x39] = (uint8_t)(new_csum_hi >> 8);
-    }
-    new_bg_csum = bgd_compute_csum(fs, /*bgid=*/0u, bgd_entry);
-    bgd_entry[0x1E] = (uint8_t) new_bg_csum;
-    bgd_entry[0x1F] = (uint8_t)(new_bg_csum >> 8);
-
-    /* --- Decrement fs sb free_blocks_count (LE 64-bit) --- */
     {
         uint32_t lo = le32(sb_in_block + 0x0C);
         uint32_t hi = (fs->sb.feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT)
@@ -540,39 +651,34 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     inode_in_block = scratch_inode_block + inode_offset_in_block;
 
     /* Update the extent tree. Two cases:
-     *   (a) candidate == ext_phys + ext_len  → contiguous; bump last
-     *       leaf's ee_len by 1
-     *   (b) else → append a new leaf entry at index ext_entries. The
-     *       precondition check above already refused entries >= 4 in
-     *       this case. */
-    if (candidate == ext_phys + (uint64_t)ext_len) {
-        /* Contiguous: bump last leaf's ee_len. */
+     *   (a) alloc_candidate == ext_phys + ext_len → contiguous; bump last
+     *       leaf's ee_len by 1 (works even when ext_entries == 4)
+     *   (b) else → append a new leaf at index ext_entries; the
+     *       find_free_block caller path above refused ext_entries >= 4. */
+    if (alloc_candidate == ext_phys + (uint64_t)ext_len) {
         uint8_t *e = inode_in_block + 0x28 + 12u
                    + ((uint32_t)ext_entries - 1u) * 12u;
         uint16_t new_len = (uint16_t)(le16(e + 4) + 1u);
         e[4] = (uint8_t) new_len;
         e[5] = (uint8_t)(new_len >> 8);
     } else {
-        /* New leaf at index ext_entries. */
         uint8_t *iblk = inode_in_block + 0x28;
         uint8_t *e    = iblk + 12u + (uint32_t)ext_entries * 12u;
         uint32_t new_logical = ext_logical + (uint32_t)ext_len;
         uint16_t new_entries = (uint16_t)(ext_entries + 1u);
-        /* Header: bump entries count at iblock+2. */
         iblk[2] = (uint8_t) new_entries;
         iblk[3] = (uint8_t)(new_entries >> 8);
-        /* Leaf: ee_block (LE u32), ee_len (LE u16, init bit clear), ee_start_hi (LE u16), ee_start_lo (LE u32). */
         e[0]  = (uint8_t) new_logical;
         e[1]  = (uint8_t)(new_logical >>  8);
         e[2]  = (uint8_t)(new_logical >> 16);
         e[3]  = (uint8_t)(new_logical >> 24);
-        e[4]  = 1u; e[5] = 0u;     /* length = 1, init = 1 (high bit clear) */
-        e[6]  = (uint8_t) (uint16_t)(candidate >> 32);
-        e[7]  = (uint8_t)((uint16_t)(candidate >> 32) >> 8);
-        e[8]  = (uint8_t) candidate;
-        e[9]  = (uint8_t)(candidate >>  8);
-        e[10] = (uint8_t)(candidate >> 16);
-        e[11] = (uint8_t)(candidate >> 24);
+        e[4]  = 1u; e[5] = 0u;
+        e[6]  = (uint8_t) (uint16_t)(alloc_candidate >> 32);
+        e[7]  = (uint8_t)((uint16_t)(alloc_candidate >> 32) >> 8);
+        e[8]  = (uint8_t) alloc_candidate;
+        e[9]  = (uint8_t)(alloc_candidate >>  8);
+        e[10] = (uint8_t)(alloc_candidate >> 16);
+        e[11] = (uint8_t)(alloc_candidate >> 24);
     }
 
     /* Bump i_size_lo and i_size_hi by block_size. Phase 2 only touches
@@ -613,11 +719,11 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     memcpy(scratch_data, new_data, fs->sb.block_size);
 
     scratch_trans.block_count = 5u;
-    scratch_trans.fs_block[0] = candidate;       /* the new data block */
+    scratch_trans.fs_block[0] = alloc_candidate;
     scratch_trans.buf[0]      = scratch_data;
-    scratch_trans.fs_block[1] = bitmap_block_phys;
+    scratch_trans.fs_block[1] = alloc_bitmap_phys;
     scratch_trans.buf[1]      = scratch_bitmap;
-    scratch_trans.fs_block[2] = bgd_fs_block;
+    scratch_trans.fs_block[2] = (fs->sb.block_size > 1024u) ? 1u : 2u;
     scratch_trans.buf[2]      = scratch_bgd;
     scratch_trans.fs_block[3] = sb_fs_block;
     scratch_trans.buf[3]      = scratch_sb;
@@ -631,7 +737,7 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
      * new mtime, size, and extent tree without re-reading the inode. */
     inode_in->mtime = now_unix;
     inode_in->size  = new_size_total;
-    if (candidate == ext_phys + (uint64_t)ext_len) {
+    if (alloc_candidate == ext_phys + (uint64_t)ext_len) {
         uint8_t *e = inode_in->i_block + 12u
                    + ((uint32_t)ext_entries - 1u) * 12u;
         uint16_t new_len = (uint16_t)(le16(e + 4) + 1u);
@@ -649,12 +755,12 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
         e[2]  = (uint8_t)(new_logical >> 16);
         e[3]  = (uint8_t)(new_logical >> 24);
         e[4]  = 1u; e[5] = 0u;
-        e[6]  = (uint8_t) (uint16_t)(candidate >> 32);
-        e[7]  = (uint8_t)((uint16_t)(candidate >> 32) >> 8);
-        e[8]  = (uint8_t) candidate;
-        e[9]  = (uint8_t)(candidate >>  8);
-        e[10] = (uint8_t)(candidate >> 16);
-        e[11] = (uint8_t)(candidate >> 24);
+        e[6]  = (uint8_t) (uint16_t)(alloc_candidate >> 32);
+        e[7]  = (uint8_t)((uint16_t)(alloc_candidate >> 32) >> 8);
+        e[8]  = (uint8_t) alloc_candidate;
+        e[9]  = (uint8_t)(alloc_candidate >>  8);
+        e[10] = (uint8_t)(alloc_candidate >> 16);
+        e[11] = (uint8_t)(alloc_candidate >> 24);
     }
     return 0;
 }

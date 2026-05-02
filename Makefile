@@ -74,7 +74,7 @@ vpath %.c tools src/blockdev src/ext4 src/partition src/util
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_crc32c_test
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_xgroup_test $(HOST_DIR)/host_crc32c_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
@@ -92,6 +92,9 @@ $(HOST_DIR)/host_checkpoint_test: tools/host_checkpoint_test.c $(LIB_SRCS_HOST) 
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_write_test: tools/host_write_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
+$(HOST_DIR)/host_xgroup_test: tools/host_xgroup_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_crc32c_test: tools/host_crc32c_test.c src/util/crc32c.c | $(HOST_DIR)
@@ -129,7 +132,7 @@ $(DOS_DIR)/%.obj: %.c | $(DOS_DIR)
 $(DOS_DIR):
 	mkdir -p $@
 
-host-test: host-build tests/images/journal.img tests/images/journal-csum.img tests/images/write.img tests/images/write-csum.img
+host-test: host-build tests/images/journal.img tests/images/journal-csum.img tests/images/write.img tests/images/write-csum.img tests/images/xgroup.img
 	@echo "==> running host_features_test"
 	@$(HOST_DIR)/host_features_test
 	@echo "==> running host_crc32c_test"
@@ -150,6 +153,9 @@ host-test: host-build tests/images/journal.img tests/images/journal-csum.img tes
 	@echo "==> running host_write_test (metadata_csum, mutates working copy)"
 	@cp tests/images/write-csum.img tests/images/write-csum-test.img
 	@$(HOST_DIR)/host_write_test tests/images/write-csum-test.img
+	@echo "==> running host_xgroup_test (cross-group allocation)"
+	@cp tests/images/xgroup.img tests/images/xgroup-test.img
+	@$(HOST_DIR)/host_xgroup_test tests/images/xgroup-test.img
 
 host-stress: host-build tests/images/stress.img
 	@echo "==> running host_stress_test"
@@ -168,6 +174,9 @@ tests/images/write.img: scripts/mkfixture-write.py
 	$(PYTHON) $<
 
 tests/images/write-csum.img: scripts/mkfixture-write-csum.py
+	$(PYTHON) $<
+
+tests/images/xgroup.img: scripts/mkfixture-xgroup.py
 	$(PYTHON) $<
 
 dos-test: dos-build fixture-partitioned
