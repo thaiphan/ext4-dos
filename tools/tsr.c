@@ -235,6 +235,15 @@ struct ff_capture {
     uint16_t read_call_count;
     uint16_t write_call_count;
     uint16_t close_call_count;
+    /* Last write attempt diagnostics — populated by REM_WRITE so
+     * ext4dmp can show what happened (rc/err on refusal, success
+     * params for the last accepted write). */
+    int16_t  last_write_rc;
+    char     last_write_err[64];
+    uint8_t  last_write_was_extend; /* 0 = in-place, 1 = extend */
+    uint32_t last_write_pos;
+    uint16_t last_write_count;
+    uint32_t last_write_file_size;
     int16_t  last_open_rc;
     uint8_t  last_open_path[64];
     uint32_t last_open_inode_num;
@@ -1159,14 +1168,15 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             file_size = (uint32_t)slot->inode.size;
             count     = r.w.cx;
 
-            /* Phase 1b limits: count == one whole FS block, pos block-
-             * aligned, no extend. Anything else falls back to
-             * WRITE_PROTECT (canonical "Write protect error writing
-             * drive Y" for DOS callers). Phases 2+ relax these. */
+            /* Phase 1b/2 shape: count == one whole FS block, pos block-
+             * aligned. Either in-place (pos+count <= file_size, calls
+             * write_block) or pure append (pos == file_size, calls
+             * extend_block by exactly one block). Anything else
+             * (partial-block, mid-file write that grows, sparse hole)
+             * still falls back to WRITE_PROTECT. */
             if (count == 0u
                 || (uint32_t)count != bs
                 || (pos & (bs - 1u)) != 0u
-                || pos + (uint32_t)count > file_size
                 || bs > sizeof g_write_buf) {
                 r.w.ax = DOS_ERR_WRITE_PROTECT;
                 r.w.flags |= 1u;
@@ -1179,9 +1189,10 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             buf_seg  = *(uint16_t __far *)(g_sda + SDA_DTA_OFF + 2);
             user_buf = (uint8_t __far *)MK_FP(buf_seg, buf_off);
 
-            /* FAR -> DGROUP copy. ext4_file_write_block expects a near
-             * pointer (DS-relative) so the bdev_write FAR conversion
-             * inside int13_bdev_write produces the right segment. */
+            /* FAR -> DGROUP copy. ext4_file_write_block / extend_block
+             * expect a near pointer (DS-relative) so the bdev_write
+             * FAR conversion inside int13_bdev_write produces the
+             * right segment. */
             for (i = 0; i < count; i++) g_write_buf[i] = user_buf[i];
 
             logical  = pos / bs;
@@ -1189,9 +1200,36 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
              * monotonically. Phase 1c can swap in a real time source. */
             now_unix = slot->inode.mtime + 1u;
 
-            rc = ext4_file_write_block(&g_fs, &slot->inode, slot->inode_num,
-                                       logical, g_write_buf, now_unix,
-                                       werr, sizeof werr);
+            g_ff_capture.last_write_pos       = pos;
+            g_ff_capture.last_write_count     = count;
+            g_ff_capture.last_write_file_size = file_size;
+            werr[0] = '\0';
+
+            if (pos + (uint32_t)count <= file_size) {
+                g_ff_capture.last_write_was_extend = 0u;
+                rc = ext4_file_write_block(&g_fs, &slot->inode, slot->inode_num,
+                                           logical, g_write_buf, now_unix,
+                                           werr, sizeof werr);
+            } else if (pos == file_size) {
+                /* Pure single-block append. extend_block bumps inode size. */
+                g_ff_capture.last_write_was_extend = 1u;
+                rc = ext4_file_extend_block(&g_fs, &slot->inode, slot->inode_num,
+                                            g_write_buf, now_unix,
+                                            werr, sizeof werr);
+            } else {
+                /* Sparse-hole or non-contiguous extend — phase 2.5+. */
+                g_ff_capture.last_write_rc = -42;
+                memcpy(g_ff_capture.last_write_err, "sparse-hole or non-contiguous extend", 36);
+                g_ff_capture.last_write_err[36] = '\0';
+                r.w.ax = DOS_ERR_WRITE_PROTECT;
+                r.w.flags |= 1u;
+                return;
+            }
+            g_ff_capture.last_write_rc = (int16_t)rc;
+            /* Copy 64 bytes unconditionally — if werr has content the
+             * dump's printable-only print will show it; if it doesn't,
+             * we'll see all-zero in the hex dump. */
+            memcpy(g_ff_capture.last_write_err, werr, sizeof g_ff_capture.last_write_err);
             if (rc != 0) {
                 r.w.ax = DOS_ERR_WRITE_PROTECT;
                 r.w.flags |= 1u;
@@ -1199,6 +1237,10 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             }
 
             *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = pos + count;
+            /* Reflect any size change back into the SFT so DOS shows the
+             * new size on close (extend_block updated slot->inode.size). */
+            *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF) =
+                (uint32_t)slot->inode.size;
             r.w.cx = count;
             r.w.flags &= ~1u;
             return;

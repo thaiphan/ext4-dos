@@ -246,21 +246,21 @@ static uint16_t bgd_compute_csum(const struct ext4_fs *fs, uint32_t bgid,
     return (uint16_t)(crc & 0xFFFFu);
 }
 
-/* Compute the bitmap checksum (lo/hi halves) over the first
- * blocks_per_group/8 bytes of the bitmap. */
-static void bitmap_compute_csum(const struct ext4_fs *fs,
-                                const uint8_t *bitmap_bytes,
-                                uint16_t *out_lo, uint16_t *out_hi) {
+/* Compute the bitmap checksum (low 16 in low half of return, high 16
+ * in high half) over the first blocks_per_group/8 bytes of the bitmap.
+ * Returns 0 if metadata_csum isn't on. Output is a return value, NOT an
+ * out-pointer — out-pointers to stack locals fail in TSR interrupt
+ * context (SS != DS, near-pointer writes land in DGROUP at the wrong
+ * offset). Same lesson as ext4_inode_recompute_csum's static byte
+ * arrays. */
+static uint32_t bitmap_compute_csum(const struct ext4_fs *fs,
+                                    const uint8_t *bitmap_bytes) {
     uint32_t crc;
     uint32_t span = fs->sb.blocks_per_group / 8u;
-    if (!(fs->sb.feature_ro_compat & 0x400u)) {
-        *out_lo = 0; *out_hi = 0;
-        return;
-    }
-    crc      = crc32c(CRC32C_INIT, fs->sb.uuid, 16);
-    crc      = crc32c(crc, bitmap_bytes, span);
-    *out_lo  = (uint16_t)(crc & 0xFFFFu);
-    *out_hi  = (uint16_t)(crc >> 16);
+    if (!(fs->sb.feature_ro_compat & 0x400u)) return 0;
+    crc = crc32c(CRC32C_INIT, fs->sb.uuid, 16);
+    crc = crc32c(crc, bitmap_bytes, span);
+    return crc;
 }
 
 int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
@@ -310,8 +310,7 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     if (err && err_len) err[0] = '\0';
     if (inode_num == 0) { say_simple(err, err_len, "inode 0 invalid"); return -1; }
     if (fs->sb.block_size > EXT4_WRITE_BUF_SIZE) {
-        snprintf(err, err_len, "block_size %lu > write cap %u (DOS DGROUP)",
-                 (unsigned long)fs->sb.block_size, (unsigned)EXT4_WRITE_BUF_SIZE);
+        say_simple(err, err_len, "block_size > write cap (DOS DGROUP)");
         return -1;
     }
 
@@ -325,17 +324,17 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
         return -1;
     }
     if (ext_depth != 0) {
-        snprintf(err, err_len, "extent tree depth %u — phase 2 only handles leaf",
-                 (unsigned)ext_depth);
+        say_simple(err, err_len, "extent tree depth>0 — only leaf supported");
         return -1;
     }
-    if (ext_entries != 1) {
-        snprintf(err, err_len, "%u leaf extents — phase 2 only handles single-extent",
-                 (unsigned)ext_entries);
+    if (ext_entries == 0 || ext_entries > 4) {
+        say_simple(err, err_len, "extent entries 0 or >4 — defer");
         return -1;
     }
+    /* Read the LAST leaf (highest logical). Phase 2 first cut: assume
+     * leaves are in logical order, so the last is at index entries-1. */
     {
-        const uint8_t *e = iblock + 12;
+        const uint8_t *e = iblock + 12 + ((uint32_t)ext_entries - 1u) * 12u;
         ext_logical = le32(e + 0);
         ext_len     = le16(e + 4);
         if (ext_len & 0x8000u) {
@@ -344,12 +343,11 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
         }
         ext_phys    = ((uint64_t)le16(e + 6) << 32) | (uint64_t)le32(e + 8);
     }
-    if ((uint64_t)inode_in->size != (uint64_t)ext_logical * fs->sb.block_size
-                                  + (uint64_t)ext_len * fs->sb.block_size) {
-        /* The single extent doesn't cover all of inode.size — there'd
-         * be a hole or stale state. Refuse rather than guess. */
-        snprintf(err, err_len, "inode size %lu doesn't match extent coverage",
-                 (unsigned long)inode_in->size);
+    /* For appending, inode.size must equal the last leaf's logical-end
+     * boundary — otherwise there's a hole or stale state somewhere. */
+    if ((uint64_t)inode_in->size !=
+        (uint64_t)(ext_logical + ext_len) * fs->sb.block_size) {
+        say_simple(err, err_len, "inode size doesn't match last extent end");
         return -1;
     }
 
@@ -367,7 +365,7 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     bgd_fs_block = (fs->sb.block_size > 1024u) ? 1u : 2u;
     rc = ext4_fs_read_block(fs, bgd_fs_block, scratch_bgd);
     if (rc) {
-        snprintf(err, err_len, "BGD block read failed (rc=%d)", rc);
+        say_simple(err, err_len, "BGD block read failed");
         return -1;
     }
     bgd_entry = scratch_bgd + 0u; /* BGD entry 0 is at offset 0 of the block */
@@ -375,7 +373,7 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     /* Refuse uninitialized bitmaps for now. */
     bg_flags_lo = bgd_entry[0x12]; /* bg_flags low byte */
     if (bg_flags_lo & 0x1u) {
-        say_simple(err, err_len, "group 0 BLOCK_UNINIT — bitmap initialization not handled");
+        say_simple(err, err_len, "group 0 BLOCK_UNINIT — bitmap init not handled");
         return -1;
     }
 
@@ -394,20 +392,49 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     /* --- Read the bitmap block --- */
     rc = ext4_fs_read_block(fs, bitmap_block_phys, scratch_bitmap);
     if (rc) {
-        snprintf(err, err_len, "bitmap block read failed (rc=%d)", rc);
+        say_simple(err, err_len, "bitmap block read failed");
         return -1;
     }
 
-    /* Check the candidate bit (LE bit order: byte = bit/8, bit = bit%8). */
+    /* Try the contiguous candidate first. If taken, scan the rest of
+     * group 0 for the first free bit — we'll append a new leaf entry
+     * for that block instead of extending the last one. */
     {
         uint32_t byte = bit_in_group >> 3;
         uint8_t  mask = (uint8_t)(1u << (bit_in_group & 7u));
         if (scratch_bitmap[byte] & mask) {
-            snprintf(err, err_len, "candidate block %lu already allocated",
-                     (unsigned long)candidate);
-            return -1;
+            /* Not contiguous-free. Need a slot for a new leaf entry. */
+            if (ext_entries >= 4u) {
+                say_simple(err, err_len, "i_block leaf table full and not contiguous — defer");
+                return -1;
+            }
+            {
+                /* Linear scan from index 0 over the group's blocks_per_group
+                 * bits. Skip first_data_block worth of bits at the start
+                 * (those represent reserved/already-allocated low blocks). */
+                uint32_t scan_bit;
+                int      found = 0;
+                uint32_t bytes_in_bitmap = fs->sb.blocks_per_group >> 3;
+                if (bytes_in_bitmap > EXT4_WRITE_BUF_SIZE) bytes_in_bitmap = EXT4_WRITE_BUF_SIZE;
+                for (scan_bit = 0; scan_bit < bytes_in_bitmap * 8u; scan_bit++) {
+                    uint32_t b = scan_bit >> 3;
+                    uint8_t  m = (uint8_t)(1u << (scan_bit & 7u));
+                    if (!(scratch_bitmap[b] & m)) {
+                        bit_in_group = scan_bit;
+                        candidate    = (uint64_t)fs->sb.first_data_block + scan_bit;
+                        scratch_bitmap[b] |= m;
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) {
+                    say_simple(err, err_len, "no free block in group 0");
+                    return -1;
+                }
+            }
+        } else {
+            scratch_bitmap[byte] |= mask;
         }
-        scratch_bitmap[byte] |= mask;
     }
 
     /* --- Read the FS SB block --- */
@@ -415,7 +442,7 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     sb_offset_in_block  = (fs->sb.block_size > 1024u) ? 1024u : 0u;
     rc = ext4_fs_read_block(fs, sb_fs_block, scratch_sb);
     if (rc) {
-        snprintf(err, err_len, "fs sb block read failed (rc=%d)", rc);
+        say_simple(err, err_len, "fs sb block read failed");
         return -1;
     }
     sb_in_block = scratch_sb + sb_offset_in_block;
@@ -439,7 +466,11 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     }
 
     /* Recompute bitmap csum + write into BGD entry; recompute BGD csum. */
-    bitmap_compute_csum(fs, scratch_bitmap, &new_csum_lo, &new_csum_hi);
+    {
+        uint32_t bm_csum = bitmap_compute_csum(fs, scratch_bitmap);
+        new_csum_lo = (uint16_t)(bm_csum & 0xFFFFu);
+        new_csum_hi = (uint16_t)(bm_csum >> 16);
+    }
     bgd_entry[0x18] = (uint8_t) new_csum_lo;
     bgd_entry[0x19] = (uint8_t)(new_csum_lo >> 8);
     if (fs->bgd_size >= 64u) {
@@ -505,19 +536,45 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
 
     rc = ext4_fs_read_block(fs, inode_fs_block, scratch_inode_block);
     if (rc) {
-        snprintf(err, err_len, "inode block read failed (rc=%d)", rc);
+        say_simple(err, err_len, "inode block read failed");
         return -1;
     }
     inode_in_block = scratch_inode_block + inode_offset_in_block;
 
-    /* Bump the leaf extent's ee_len by 1 (preserving the high bit which
-     * marks initialized vs uninitialized — we already refused the
-     * uninitialized case so the high bit is 0). */
-    {
-        uint8_t *e = inode_in_block + 0x28 + 12; /* iblock + 12 = first leaf */
+    /* Update the extent tree. Two cases:
+     *   (a) candidate == ext_phys + ext_len  → contiguous; bump last
+     *       leaf's ee_len by 1
+     *   (b) else → append a new leaf entry at index ext_entries. The
+     *       precondition check above already refused entries >= 4 in
+     *       this case. */
+    if (candidate == ext_phys + (uint64_t)ext_len) {
+        /* Contiguous: bump last leaf's ee_len. */
+        uint8_t *e = inode_in_block + 0x28 + 12u
+                   + ((uint32_t)ext_entries - 1u) * 12u;
         uint16_t new_len = (uint16_t)(le16(e + 4) + 1u);
         e[4] = (uint8_t) new_len;
         e[5] = (uint8_t)(new_len >> 8);
+    } else {
+        /* New leaf at index ext_entries. */
+        uint8_t *iblk = inode_in_block + 0x28;
+        uint8_t *e    = iblk + 12u + (uint32_t)ext_entries * 12u;
+        uint32_t new_logical = ext_logical + (uint32_t)ext_len;
+        uint16_t new_entries = (uint16_t)(ext_entries + 1u);
+        /* Header: bump entries count at iblock+2. */
+        iblk[2] = (uint8_t) new_entries;
+        iblk[3] = (uint8_t)(new_entries >> 8);
+        /* Leaf: ee_block (LE u32), ee_len (LE u16, init bit clear), ee_start_hi (LE u16), ee_start_lo (LE u32). */
+        e[0]  = (uint8_t) new_logical;
+        e[1]  = (uint8_t)(new_logical >>  8);
+        e[2]  = (uint8_t)(new_logical >> 16);
+        e[3]  = (uint8_t)(new_logical >> 24);
+        e[4]  = 1u; e[5] = 0u;     /* length = 1, init = 1 (high bit clear) */
+        e[6]  = (uint8_t) (uint16_t)(candidate >> 32);
+        e[7]  = (uint8_t)((uint16_t)(candidate >> 32) >> 8);
+        e[8]  = (uint8_t) candidate;
+        e[9]  = (uint8_t)(candidate >>  8);
+        e[10] = (uint8_t)(candidate >> 16);
+        e[11] = (uint8_t)(candidate >> 24);
     }
 
     /* Bump i_size_lo and i_size_hi by block_size. Phase 2 only touches
@@ -572,14 +629,34 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     rc = ext4_journal_commit(fs, &scratch_trans, err, err_len);
     if (rc) return rc;
 
-    /* Update caller's parsed inode. */
+    /* Update caller's parsed inode struct so subsequent reads see the
+     * new mtime, size, and extent tree without re-reading the inode. */
     inode_in->mtime = now_unix;
     inode_in->size  = new_size_total;
-    {
-        uint8_t *e = inode_in->i_block + 12;
+    if (candidate == ext_phys + (uint64_t)ext_len) {
+        uint8_t *e = inode_in->i_block + 12u
+                   + ((uint32_t)ext_entries - 1u) * 12u;
         uint16_t new_len = (uint16_t)(le16(e + 4) + 1u);
         e[4] = (uint8_t) new_len;
         e[5] = (uint8_t)(new_len >> 8);
+    } else {
+        uint8_t *iblk = inode_in->i_block;
+        uint8_t *e    = iblk + 12u + (uint32_t)ext_entries * 12u;
+        uint32_t new_logical = ext_logical + (uint32_t)ext_len;
+        uint16_t new_entries = (uint16_t)(ext_entries + 1u);
+        iblk[2] = (uint8_t) new_entries;
+        iblk[3] = (uint8_t)(new_entries >> 8);
+        e[0]  = (uint8_t) new_logical;
+        e[1]  = (uint8_t)(new_logical >>  8);
+        e[2]  = (uint8_t)(new_logical >> 16);
+        e[3]  = (uint8_t)(new_logical >> 24);
+        e[4]  = 1u; e[5] = 0u;
+        e[6]  = (uint8_t) (uint16_t)(candidate >> 32);
+        e[7]  = (uint8_t)((uint16_t)(candidate >> 32) >> 8);
+        e[8]  = (uint8_t) candidate;
+        e[9]  = (uint8_t)(candidate >>  8);
+        e[10] = (uint8_t)(candidate >> 16);
+        e[11] = (uint8_t)(candidate >> 24);
     }
     return 0;
 }

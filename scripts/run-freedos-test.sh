@@ -12,12 +12,13 @@ DOS_DIR="build/dos"
 FREEDOS_DIR="tests/freedos"
 SOURCE_IMG="$FREEDOS_DIR/FD14LITE.img"
 TEST_IMG="$FREEDOS_DIR/test.img"
-EXT4_IMG="tests/images/disk.img"
+EXT4_SRC_IMG="tests/images/disk.img"
+EXT4_IMG="$FREEDOS_DIR/test-ext4.img"  # working copy — TSR writes mutate this, not the source
 PARTITION_OFFSET=32256
 WAIT_SECONDS="${WAIT_SECONDS:-30}"
 
-if [[ ! -f "$EXT4_IMG" ]]; then
-    echo "ERROR: $EXT4_IMG not found. Run: make fixture-partitioned" >&2
+if [[ ! -f "$EXT4_SRC_IMG" ]]; then
+    echo "ERROR: $EXT4_SRC_IMG not found. Run: make fixture-partitioned" >&2
     exit 1
 fi
 
@@ -35,8 +36,11 @@ for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe ext4wr.exe; do
     fi
 done
 
-# Fresh copy of the FreeDOS image — never touch the source.
-cp "$SOURCE_IMG" "$TEST_IMG"
+# Fresh working copies. The ext4 image gets mutated by the TSR's
+# REM_WRITE path now that phase 1+ writes go through int13; we don't
+# want those persisting into the source fixture.
+cp "$SOURCE_IMG"      "$TEST_IMG"
+cp "$EXT4_SRC_IMG"    "$EXT4_IMG"
 
 # Custom FDAUTO.BAT: skip the FreeDOS installer chain and run our TSR test
 # sequence with output captured to C:\OUT.TXT.
@@ -59,12 +63,14 @@ echo === Multi-file: COPY HELLO+NESTED to BOTH.TXT === >> C:\OUT.TXT
 COPY /B Y:\HELLO.TXT+Y:\SUBDIR\NESTED.TXT C:\BOTH.TXT >> C:\OUT.TXT
 echo === TYPE C:\BOTH.TXT (concatenation result) === >> C:\OUT.TXT
 TYPE C:\BOTH.TXT >> C:\OUT.TXT
-echo === Phase 1b in-place write: Y:\TARGET.TXT before === >> C:\OUT.TXT
+echo === Phase 1b/2 writes: Y:\TARGET.TXT before === >> C:\OUT.TXT
 TYPE Y:\TARGET.TXT >> C:\OUT.TXT
-echo --- run ext4wr (one block of 'B' over the existing 'A's) --- >> C:\OUT.TXT
+echo --- run ext4wr (in-place B + extend C) --- >> C:\OUT.TXT
 C:\EXT4WR.EXE >> C:\OUT.TXT
-echo === Y:\TARGET.TXT after write === >> C:\OUT.TXT
+echo === Y:\TARGET.TXT after write (expect 'B'*1024 + 'C'*1024) === >> C:\OUT.TXT
 TYPE Y:\TARGET.TXT >> C:\OUT.TXT
+echo === DIR Y:\TARGET.TXT (expect size 2048 — extended) === >> C:\OUT.TXT
+DIR Y:\TARGET.TXT >> C:\OUT.TXT
 echo === Read-only enforcement: attempts must FAIL === >> C:\OUT.TXT
 echo --- DEL Y:\HELLO.TXT --- >> C:\OUT.TXT
 DEL Y:\HELLO.TXT >> C:\OUT.TXT
@@ -171,22 +177,35 @@ if ! grep -A2 "HELLO.TXT must still be there" <<<"$OUT" | grep -q "HELLO"; then
     echo "FAIL: read-only enforcement may have allowed DEL Y:\\HELLO.TXT" >&2
     fail=1
 fi
-# Phase 1b REM_WRITE wiring: ext4wr reports the byte count, and the
-# post-write TYPE has long runs of 'B' (not 'A'). DOS TYPE doesn't
-# emit a newline so the next echo concatenates onto the same line —
-# pattern-match for >=100 consecutive 'B' and no >=100 consecutive 'A'
-# in the post-write block.
-if ! grep -q "Wrote 1024 bytes" <<<"$OUT"; then
-    echo "FAIL: ext4wr didn't report 1024 bytes written (REM_WRITE wiring)" >&2
+# Phase 1b + 2 REM_WRITE wiring: ext4wr reports both writes, and the
+# post-write TYPE shows 'B' followed by 'C' (no 'A' left). DOS TYPE
+# doesn't emit a trailing newline so the next echo line concatenates;
+# pattern-match for ≥100 consecutive each of 'B' and 'C', and no 'A'.
+if ! grep -q "In-place wrote 1024 bytes" <<<"$OUT"; then
+    echo "FAIL: ext4wr didn't report in-place 1024 bytes written" >&2
     fail=1
 fi
-WRITE_AFTER=$(grep -F -A1 'Y:\TARGET.TXT after write' <<<"$OUT" | tail -1)
+if ! grep -q "Extend wrote 1024 bytes" <<<"$OUT"; then
+    echo "FAIL: ext4wr didn't report extend 1024 bytes written" >&2
+    fail=1
+fi
+WRITE_AFTER=$(grep -F -A1 'Y:\TARGET.TXT after write (expect' <<<"$OUT" | tail -1)
 if ! grep -qE 'B{100}' <<<"$WRITE_AFTER"; then
     echo "FAIL: TARGET.TXT after write missing 100+ consecutive 'B' bytes" >&2
     fail=1
 fi
+if ! grep -qE 'C{100}' <<<"$WRITE_AFTER"; then
+    echo "FAIL: TARGET.TXT after write missing 100+ consecutive 'C' bytes (extend not applied)" >&2
+    fail=1
+fi
 if grep -qE 'A{100}' <<<"$WRITE_AFTER"; then
     echo "FAIL: TARGET.TXT after write still has 100+ consecutive 'A' bytes" >&2
+    fail=1
+fi
+# DIR after extend should show 2048 bytes (was 1024). Allow comma or
+# no comma for the size formatting.
+if ! grep -F -A8 'DIR Y:\TARGET.TXT (expect size 2048' <<<"$OUT" | grep -qE "TARGET[[:space:]]+TXT[[:space:]]+2[,]?048"; then
+    echo "FAIL: DIR Y:\\TARGET.TXT after extend didn't show size 2048" >&2
     fail=1
 fi
 # Wildcard: DIR Y:\*.TXT must list HELLO.TXT and skip SUBDIR (no extension).

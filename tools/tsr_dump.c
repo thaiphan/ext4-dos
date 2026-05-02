@@ -56,7 +56,14 @@ struct ff_capture {
 #pragma pack(pop)
     uint16_t open_call_count;
     uint16_t read_call_count;
+    uint16_t write_call_count;
     uint16_t close_call_count;
+    int16_t  last_write_rc;
+    char     last_write_err[64];
+    uint8_t  last_write_was_extend;
+    uint32_t last_write_pos;
+    uint16_t last_write_count;
+    uint32_t last_write_file_size;
     int16_t  last_open_rc;
     uint8_t  last_open_path[64];
     uint32_t last_open_inode_num;
@@ -111,10 +118,27 @@ int main(void) {
      * which doesn't trip the AL=0x1B-only valid flag. */
     {
         unsigned j;
-        printf("\nOpen/Read/Close diagnostics (always-on):\n");
+        printf("\nOpen/Read/Write/Close diagnostics (always-on):\n");
         printf("  Open calls    : %u\n", cap->open_call_count);
         printf("  Read calls    : %u\n", cap->read_call_count);
+        printf("  Write calls   : %u\n", cap->write_call_count);
         printf("  Close calls   : %u\n", cap->close_call_count);
+        printf("  last write rc : %d (was_extend=%u, pos=%lu count=%u file_size=%lu)\n",
+               (int)cap->last_write_rc,
+               (unsigned)cap->last_write_was_extend,
+               (unsigned long)cap->last_write_pos,
+               cap->last_write_count,
+               (unsigned long)cap->last_write_file_size);
+        printf("  last write err: '");
+        {
+            int j;
+            for (j = 0; j < 64; j++) {
+                uint8_t c = (uint8_t)cap->last_write_err[j];
+                if (c == 0) break;
+                putchar((c >= 0x20 && c < 0x7F) ? (char)c : '?');
+            }
+        }
+        printf("'\n");
         printf("  last open rc  : %d\n", (int)cap->last_open_rc);
         printf("  last open path: '");
         for (j = 0; j < 64 && cap->last_open_path[j]; j++) {
