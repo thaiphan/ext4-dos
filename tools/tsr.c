@@ -1032,8 +1032,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
          * REM_CRTRWOCDS=0x18). 0x21 LSEEK is handled separately in the
          * stub below — DOS uses it for SeekEnd-to-find-EOF, which is fine
          * to support read-only via the SFT's file-size field. */
-        case 0x01: /* REM_RMDIR — remove directory */
-        case 0x03: /* REM_MKDIR — create directory */
+        case 0x01: /* REM_RMDIR — remove directory (Phase 4.5) */
         case 0x0E: /* REM_SETATTR — change file attributes */
         case 0x11: /* REM_RENAME */
         case 0x13: /* REM_DELETE */
@@ -1047,6 +1046,72 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             r.w.ax = DOS_ERR_WRITE_PROTECT;
             r.w.flags |= 1u;
             return;
+
+        case 0x03: { /* REM_MKDIR — create a new directory (Phase 4). */
+            static char path_buf[128];
+            static char werr[64];
+            uint32_t parent_ino;
+            uint32_t new_ino;
+            int      rc_path, p, base_idx;
+            uint8_t  name_len;
+            uint32_t now_unix;
+
+            if (!g_fs_ready) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            rc_path = dos_to_ext4_path(path_buf, sizeof path_buf);
+            if (rc_path != 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            /* Refuse if it already exists. */
+            if (path_lookup_with_alias(&g_fs, path_buf) != 0) {
+                r.w.ax = 5u; /* ACCESS_DENIED */
+                r.w.flags |= 1u;
+                return;
+            }
+            /* Split path into parent + basename. */
+            base_idx = 0;
+            for (p = 0; path_buf[p]; p++)
+                if (path_buf[p] == '/') base_idx = p + 1;
+            if (base_idx <= 1) {
+                parent_ino = 2u;
+            } else {
+                static char parent_path[128];
+                int j;
+                for (j = 0; j + 1 < base_idx && j < 127; j++)
+                    parent_path[j] = path_buf[j];
+                parent_path[j] = '\0';
+                parent_ino = ext4_path_lookup(&g_fs, parent_path);
+                if (parent_ino == 0) {
+                    r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                    r.w.flags |= 1u;
+                    return;
+                }
+            }
+            name_len = 0;
+            while (path_buf[base_idx + name_len]) name_len++;
+            if (name_len == 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            now_unix = 0x6A000000u;
+            werr[0] = '\0';
+            new_ino = ext4_dir_create(&g_fs, parent_ino,
+                                      path_buf + base_idx, name_len,
+                                      now_unix, werr, sizeof werr);
+            if (new_ino == 0) {
+                r.w.ax = DOS_ERR_WRITE_PROTECT;
+                r.w.flags |= 1u;
+                return;
+            }
+            r.w.flags &= ~1u;
+            return;
+        }
 
         case 0x06: { /* Close File */
             struct open_slot *slot;

@@ -79,11 +79,15 @@ echo === Phase 3.6 multi-block: COPY Y:\TARGET.TXT Y:\NEWBIG.TXT === >> C:\OUT.T
 COPY Y:\TARGET.TXT Y:\NEWBIG.TXT >> C:\OUT.TXT
 echo === DIR Y:\NEWBIG.TXT (expect size 2048) === >> C:\OUT.TXT
 DIR Y:\NEWBIG.TXT >> C:\OUT.TXT
-echo === DEL/MD must still FAIL (Phase 3 doesn't add delete or mkdir) === >> C:\OUT.TXT
+echo === Phase 4 mkdir: MD Y:\NEWDIR === >> C:\OUT.TXT
+MD Y:\NEWDIR >> C:\OUT.TXT
+echo === DIR Y:\NEWDIR (must exist) === >> C:\OUT.TXT
+DIR Y:\NEWDIR >> C:\OUT.TXT
+echo === DEL/RD must still FAIL (no unlink/rmdir yet) === >> C:\OUT.TXT
 echo --- DEL Y:\HELLO.TXT --- >> C:\OUT.TXT
 DEL Y:\HELLO.TXT >> C:\OUT.TXT
-echo --- MD Y:\NEWDIR --- >> C:\OUT.TXT
-MD Y:\NEWDIR >> C:\OUT.TXT
+echo --- RD Y:\NEWDIR --- >> C:\OUT.TXT
+RD Y:\NEWDIR >> C:\OUT.TXT
 echo --- (HELLO.TXT must still be there) --- >> C:\OUT.TXT
 DIR Y:\HELLO.TXT >> C:\OUT.TXT
 echo === TYPE Y:\VERY~876.TXT (8.3 alias roundtrip) === >> C:\OUT.TXT
@@ -181,6 +185,11 @@ fi
 # CX=0 pre-extend (TARGET.TXT is 2048 bytes = 2 blocks).
 if ! grep -F -A8 'DIR Y:\NEWBIG.TXT' <<<"$OUT" | grep -qE "NEWBIG[[:space:]]+TXT[[:space:]]+2[,]?048"; then
     echo "FAIL: Y:\\NEWBIG.TXT not 2048 bytes after multi-block COPY (Phase 3.6)" >&2
+    fail=1
+fi
+# Phase 4: MD Y:\NEWDIR must produce a visible directory.
+if ! grep -F -A8 'DIR Y:\NEWDIR' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
+    echo "FAIL: Y:\\NEWDIR not visible as DIR after MD (Phase 4)" >&2
     fail=1
 fi
 if ! grep -qE "56[,]?345[,]?600 bytes free" <<<"$OUT"; then

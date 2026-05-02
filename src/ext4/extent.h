@@ -73,6 +73,19 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
  *
  * The inode's size is bumped by exactly one block; mtime is set to
  * `now_unix`; the in-memory inode_in is updated to reflect both. */
+/* Create a new directory under parent_ino.  Allocates a fresh inode
+ * (mode S_IFDIR|0755, links=2), writes a data block containing the
+ * dot and dotdot entries, inserts a linear dir entry in parent_ino,
+ * and bumps parent's link count.  Uses two journal transactions (one
+ * for inode alloc, one for block alloc + wiring) so that
+ * find_free_inode and find_free_block don't share scratch buffers.
+ * Refuses htree parent directories (phase 4.5 adds htree support).
+ * Returns new inode number on success, 0 on failure with err set. */
+uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
+                         const char *name, uint8_t name_len,
+                         uint32_t now_unix,
+                         char *err, uint32_t err_len);
+
 /* append_bytes: how many valid bytes are in new_data (≤ block_size).
  * Zeros fill the rest of the block on disk; inode.size advances by
  * append_bytes, not block_size. Pass block_size for a full-block extend. */
