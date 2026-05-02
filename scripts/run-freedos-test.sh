@@ -43,8 +43,8 @@ cp "$SOURCE_IMG" "$TEST_IMG"
 cat > "$FREEDOS_DIR/fdauto-test.bat" <<'EOF'
 @echo off
 SET PATH=C:\FREEDOS\BIN
-echo === LOAD TSR (drive 0x81 = ext4 disk) === > C:\OUT.TXT
-C:\EXT4.EXE 0x81 >> C:\OUT.TXT
+echo === LOAD TSR (drive 0x81 = ext4 disk, pin to Y:) === > C:\OUT.TXT
+C:\EXT4.EXE 0x81 Y: >> C:\OUT.TXT
 echo === AFTER TSR === >> C:\OUT.TXT
 C:\EXT4CHK.EXE >> C:\OUT.TXT
 echo === FindFirst Y: (raw INT 21h) === >> C:\OUT.TXT
@@ -83,6 +83,12 @@ echo === Uninstall: EXT4 -U === >> C:\OUT.TXT
 C:\EXT4.EXE -u >> C:\OUT.TXT
 echo --- Re-check (should report not-installed) --- >> C:\OUT.TXT
 C:\EXT4CHK.EXE >> C:\OUT.TXT
+echo === AUTO-DETECT (no args) === >> C:\OUT.TXT
+C:\EXT4.EXE >> C:\OUT.TXT
+echo --- Re-check (auto-detect should land on D: = first free slot) --- >> C:\OUT.TXT
+C:\EXT4CHK.EXE >> C:\OUT.TXT
+DIR D: >> C:\OUT.TXT
+C:\EXT4.EXE -u >> C:\OUT.TXT
 echo === DONE === >> C:\OUT.TXT
 fdapm poweroff
 EOF

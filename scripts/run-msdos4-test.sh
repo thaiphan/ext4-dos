@@ -84,7 +84,7 @@ cp "$SOURCE_IMG" "$TEST_IMG"
 # ============================================================================
 cat > "$MSDOS4_DIR/config.sys.tmp" <<'EOF'
 LASTDRIVE=Z
-INSTALL=A:\EXT4.EXE -q 0x81
+INSTALL=A:\EXT4.EXE -q 0x81 Y:
 EOF
 awk 'BEGIN{ORS="\r\n"} {print}' "$MSDOS4_DIR/config.sys.tmp" > "$MSDOS4_DIR/config.sys"
 rm -f "$MSDOS4_DIR/config.sys.tmp"

@@ -2,7 +2,7 @@
 
 A 16-bit DOS TSR that exposes an ext4 partition as a drive letter, so DOS programs (`DIR`, `TYPE`, file managers, etc.) can read it the same way they read a FAT drive.
 
-Targets FreeDOS 1.4 and MS-DOS 4.0. Both verified end-to-end: `DIR Y:` lists ext4 entries with real timestamps and free space, `TYPE Y:\HELLO.TXT` reads file content. Read-only for v1; write support is explicitly a separate later project.
+Targets FreeDOS 1.4 and MS-DOS 4.0. Both verified end-to-end: `DIR D:` lists ext4 entries with real timestamps and free space, `TYPE D:\HELLO.TXT` reads file content. Read-only for v1; write support is explicitly a separate later project.
 
 ## Download
 
@@ -21,31 +21,42 @@ The `ext4` prefix marks them as belonging to the ext4 module; future modules (LF
 
 ## Usage
 
-Plug a disk with an ext4 partition into your DOS machine, copy `EXT4.EXE` somewhere on your DOS path, then:
+The expected zero-config setup. Add one line to `CONFIG.SYS`:
 
 ```text
-C:\> EXT4 0x81           Load TSR. 0x81 = first hard disk (BIOS drive number).
-                         0x80 is C:; use 0x82 for the third disk, etc.
-ext4-dos TSR
-  drive Y: marked as redirector ...
-  ext4 mounted: drive 0x81, partition LBA 2048
-  volume     : my-linux-disk
-  blocks     : 4194304 (block size 4096)
+LASTDRIVE=Z
+INSTALL=C:\EXT4.EXE -q
+```
 
-C:\> DIR Y:              ext4 root listing — real timestamps, real sizes.
-C:\> TYPE Y:\README.MD   Read a file.
-C:\> COPY Y:\DATA\*.TXT C:\BACKUP\   Copy files off. Wildcards and subdirs work.
-C:\> CD Y:\PROJECTS      Change into ext4 directories like normal.
+Reboot. Every boot, the TSR scans BIOS hard disks 0x80..0x83 for an ext4 partition, picks the first free drive letter (typically D:), mounts there, and prints a banner showing what it found. From then on:
 
-C:\> EXT4 -U             Uninstall. Frees the TSR's memory; Y: drive disappears.
+```text
+C:\> DIR D:              ext4 root listing — real timestamps, real sizes.
+C:\> TYPE D:\README.MD   Read a file.
+C:\> COPY D:\DATA\*.TXT C:\BACKUP\    Copy files off. Wildcards and subdirs work.
+C:\> CD D:\PROJECTS      Change into ext4 directories like normal.
+
+C:\> EXT4 -U             Uninstall. Frees TSR memory; the drive disappears.
 ext4-dos uninstalled
 ```
 
-The drive letter is fixed at `Y:` in v1. Read-only: `DEL`, `COPY *.* Y:\`, `MD Y:\NEW`, etc., all fail cleanly with "Write protect error" — the disk is never modified.
+This mirrors how MSCDEX exposes a CD-ROM. The auto-pick chooses the lowest free slot at or above D:, so the letter is stable as long as your other drivers are.
 
-For `CONFIG.SYS`-time loading, use `INSTALL=C:\EXT4.EXE -q 0x81` — `-q` suppresses the install banner. Requires `LASTDRIVE=Y` (or later) in `CONFIG.SYS` so DOS reserves a CDS slot for the redirector.
+Read-only: `DEL`, `COPY *.* D:\`, `MD D:\NEW`, etc. all fail cleanly with "Write protect error" — the disk is never modified.
 
-Long filenames on disk are exposed as 8.3 short names with deterministic `~HHH` aliases (where `HHH` is a hex hash). `DIR Y:` shows you the alias; `TYPE Y:\VERY~876.TXT` opens the underlying long-named file. The mapping is stable across runs.
+Long filenames on disk are exposed as 8.3 short names with deterministic `~HHH` aliases (where `HHH` is a hex hash). `DIR` shows you the alias; `TYPE D:\VERY~876.TXT` opens the underlying long-named file. The mapping is stable across runs.
+
+### Manual overrides
+
+If auto-detection picks the wrong disk (multiple ext4 partitions) or you want a specific letter:
+
+```text
+C:\> EXT4 0x82           Mount the third BIOS hard disk (auto-pick letter).
+C:\> EXT4 Z:             Auto-scan for ext4, mount at Z: (override letter).
+C:\> EXT4 0x81 Z:        Pin both: drive 0x81 mounted at Z:.
+```
+
+Drive letters require the trailing `:` (so `Z` alone is treated as nothing — only `Z:` is parsed). Numbers can be decimal or `0x`-prefixed. `LASTDRIVE=` in `CONFIG.SYS` must be high enough to cover the letter you want.
 
 ## Known limitations
 

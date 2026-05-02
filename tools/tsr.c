@@ -17,8 +17,14 @@
 
 #define EXT4_DOS_MAGIC_PROBE 0xE4D0u
 #define EXT4_DOS_MAGIC_REPLY 0xE4D5u
-#define DRIVE_LETTER 'Y'
-#define DRIVE_INDEX  ((DRIVE_LETTER) - 'A')
+
+/* Drive letter is no longer a compile-time constant — TSR auto-picks the
+ * first free CDS slot at install time (or honors a user override). Stored
+ * here as a single byte ('A'..'Z') and one byte index (0..25). Both must
+ * live in DGROUP because the resident handler reads them in interrupt
+ * context where SS!=DS. */
+static uint8_t g_drive_letter = 0;     /* 'A'..'Z'; 0 = uninitialised */
+static uint8_t g_drive_index  = 0;     /* g_drive_letter - 'A' */
 
 #define DOS_ERR_FILE_NOT_FOUND  0x02u
 #define DOS_ERR_ACCESS_DENIED   0x05u
@@ -336,7 +342,7 @@ static uint32_t unix_to_dos(uint32_t unix_secs) {
 static int dos_to_ext4_path(char *out, int out_size) {
     const char __far *src = (const char __far *)(g_sda + SDA_PRI_PATH_OFF);
     int j;
-    if (src[0] != DRIVE_LETTER || src[1] != ':') return -1;
+    if (src[0] != g_drive_letter || src[1] != ':') return -1;
     src += 2;
     if (out_size < 2) return -1;
 
@@ -807,7 +813,7 @@ static int do_findfirst_or_next(uint16_t entry_index) {
 
     /* Update SDB header. dm_drive needs bit 7 (network) so FreeDOS routes
      * subsequent FindNext via REM_FINDNEXT instead of dos_findnext. */
-    sdb[DM_DRIVE_OFF]      = (uint8_t)(DRIVE_INDEX | 0x80u);
+    sdb[DM_DRIVE_OFF]      = (uint8_t)(g_drive_index | 0x80u);
     sdb[DM_ATTR_SRCH_OFF]  = g_sda[SDA_SATTR_OFF];
     *(uint16_t __far *)(sdb + DM_ENTRY_OFF) = (uint16_t)(entry_index + 1);
 
@@ -1071,7 +1077,7 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
              * byte (read/write/share bits) but make sure the high byte is
              * clean. Kernel pre-set the low byte just before our call. */
             *(uint16_t __far *)(sft + SFT_DEVINFO_OFF) =
-                (uint16_t)(0x8000u | DRIVE_INDEX);
+                (uint16_t)(0x8000u | g_drive_index);
             /* path_buf is the static dos_to_ext4_path output. Find the
              * char right after the last '/' — that's the basename's
              * first character, which the helper takes by value. */
@@ -1234,11 +1240,11 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                 uint8_t        c0  = src[0];
                 /* Case-insensitive Y: match. */
                 if (c0 >= 'a' && c0 <= 'z') c0 = (uint8_t)(c0 - 0x20);
-                if (c0 == DRIVE_LETTER && src[1] == ':') {
+                if (c0 == g_drive_letter && src[1] == ':') {
                     uint8_t __far *dst = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
                     int             i;
-                    /* Force the drive letter to uppercase canonical 'Y:'. */
-                    dst[0] = DRIVE_LETTER;
+                    /* Force the drive letter to uppercase canonical form. */
+                    dst[0] = g_drive_letter;
                     dst[1] = ':';
                     for (i = 2; i < 67; i++) {
                         dst[i] = src[i];
@@ -1370,14 +1376,14 @@ static int hook_cds(void) {
         printf("  LASTDRIVE byte at LOL+0x21 = %u\n", (unsigned)lastdrive);
     }
 
-    if ((unsigned)lastdrive <= DRIVE_INDEX) {
-        printf("  WARN: LASTDRIVE byte too low; trying %c: anyway\n", DRIVE_LETTER);
+    if ((unsigned)lastdrive <= g_drive_index) {
+        printf("  WARN: LASTDRIVE byte too low; trying %c: anyway\n", g_drive_letter);
     }
 
-    cds = cds_array + (unsigned)DRIVE_INDEX * CDS_ENTRY_SIZE;
+    cds = cds_array + (unsigned)g_drive_index * CDS_ENTRY_SIZE;
     if (!g_quiet) {
         printf("  %c:CDS  : %04x:%04x  (slot %u)\n",
-               DRIVE_LETTER, FP_SEG(cds), FP_OFF(cds), DRIVE_INDEX);
+               g_drive_letter, FP_SEG(cds), FP_OFF(cds), g_drive_index);
     }
 
     /* Zero the WHOLE 88-byte CDS slot — not just the 67-byte path field.
@@ -1409,7 +1415,7 @@ static int hook_cds(void) {
      * IFS pointer at 0:0 makes the kernel skip the IFS dispatch path. */
     for (i = 0; i < CDS_ENTRY_SIZE; i++) cds[i] = 0;
 
-    cds[CDS_OFF_PATH + 0] = DRIVE_LETTER;
+    cds[CDS_OFF_PATH + 0] = g_drive_letter;
     cds[CDS_OFF_PATH + 1] = ':';
     cds[CDS_OFF_PATH + 2] = '\\';
     cds[CDS_OFF_PATH + 3] = 0;
@@ -1421,14 +1427,59 @@ static int hook_cds(void) {
     return 0;
 }
 
-static int mount_ext4(uint8_t drive) {
+/* Walk the CDS array and pick the first slot whose flags == 0 (no
+ * driver currently owns it — neither physical FAT nor another
+ * redirector). Start at D: so we don't disturb floppies/system drive.
+ * Returns 'A'..'Z' on success, 0 if no free slot was found below
+ * LASTDRIVE. */
+static uint8_t pick_drive_letter(void) {
+    char __far *lol = get_lol();
+    uint16_t cds_off = *(uint16_t __far *)(lol + 0x16);
+    uint16_t cds_seg = *(uint16_t __far *)(lol + 0x18);
+    char __far *cds_array = (char __far *)MK_FP(cds_seg, cds_off);
+    uint8_t lastdrive = *(uint8_t __far *)(lol + 0x21);
+    uint8_t i;
+
+    /* lastdrive is the count, not the highest index — slots are
+     * 0..lastdrive-1. Start at D: (index 3): A:/B: are floppies, C: is
+     * the boot disk, all of which DOS pre-flags. */
+    for (i = 3; i < lastdrive; i++) {
+        char __far *slot = cds_array + (unsigned)i * CDS_ENTRY_SIZE;
+        uint16_t    flags = *(uint16_t __far *)(slot + CDS_OFF_FLAGS);
+        if (flags == 0) {
+            return (uint8_t)('A' + i);
+        }
+    }
+    return 0;
+}
+
+static int mount_ext4(uint8_t drive, int quiet_fail);
+
+/* Probe BIOS hard-disk drive numbers 0x80..0x83 for an ext4 partition.
+ * First match wins. Returns 0 + writes drive number to *out on success;
+ * non-zero on failure. */
+static int scan_for_ext4(uint8_t *out_drive) {
+    uint8_t d;
+    for (d = 0x80; d <= 0x83; d++) {
+        if (mount_ext4(d, 1) == 0) {
+            *out_drive = d;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* `quiet_fail` suppresses the diagnostic printfs and rolls back the bdev
+ * on any failure path — used by scan_for_ext4 when probing 0x80..0x83
+ * (most candidates are expected to fail). */
+static int mount_ext4(uint8_t drive, int quiet_fail) {
     struct mbr_table mbr;
     int rc;
     int i;
 
     g_bdev = int13_bdev_open(drive);
     if (!g_bdev) {
-        printf("  int13_bdev_open(0x%02x) failed\n", drive);
+        if (!quiet_fail) printf("  int13_bdev_open(0x%02x) failed\n", drive);
         return -1;
     }
 
@@ -1442,16 +1493,26 @@ static int mount_ext4(uint8_t drive) {
             }
         }
         if (g_partition_lba == 0) {
-            printf("  drive 0x%02x has MBR but no Linux partition\n", drive);
+            if (!quiet_fail) printf("  drive 0x%02x has MBR but no Linux partition\n", drive);
+            int13_bdev_close(g_bdev);
+            g_bdev = NULL;
             return -2;
         }
-    } else {
+    } else if (!quiet_fail) {
         printf("  drive 0x%02x: no MBR; treating as bare ext4\n", drive);
+    } else if (rc != 0) {
+        /* In a scan, "no MBR" usually means "not a real disk" — bail
+         * quickly rather than feeding garbage to ext4_fs_open. */
+        int13_bdev_close(g_bdev);
+        g_bdev = NULL;
+        return -2;
     }
 
     rc = ext4_fs_open(&g_fs, g_bdev, g_partition_lba);
     if (rc != 0) {
-        printf("  ext4_fs_open failed (rc=%d)\n", rc);
+        if (!quiet_fail) printf("  ext4_fs_open failed (rc=%d)\n", rc);
+        int13_bdev_close(g_bdev);
+        g_bdev = NULL;
         return -3;
     }
 
@@ -1545,26 +1606,91 @@ static int do_uninstall(void) {
 }
 
 int main(int argc, char **argv) {
-    uint8_t drive = 0x81;
-    char err[100];
-    int ai;
-    int uninstall = 0;
+    uint8_t drive = 0;            /* 0 = unset, scan for one */
+    int     drive_specified = 0;
+    int     letter_specified = 0;
+    char    err[100];
+    int     ai;
+    int     uninstall = 0;
 
-    /* Parse args: [-q] [-u] [drive_num].
-     *   -q : suppress install banner (used by CONFIG.SYS INSTALL=)
-     *   -u : uninstall mode — unhook a resident copy and free its memory
-     * Lenient about leading dash/slash since MS-DOS 4 INSTALL= flattens
-     * args differently from a normal exec. */
+    /* Parse args: [-q] [-u] [drive_num] [drive_letter:]
+     *   -q       : suppress install banner (used by CONFIG.SYS INSTALL=)
+     *   -u       : uninstall mode
+     *   <num>    : BIOS hard-disk number (e.g. 0x81). If omitted, scan
+     *              0x80..0x83 for the first ext4 partition.
+     *   <X:>     : drive letter to mount under (e.g. Z:). If omitted,
+     *              auto-pick the first free CDS slot (D: or later).
+     * Drive letters require the trailing ':' so they don't collide with
+     * the bare-letter '-q'/'-u' flags MS-DOS 4 INSTALL= sometimes feeds
+     * us with the dash flattened off. */
     for (ai = 1; ai < argc; ai++) {
         const char *a = argv[ai];
-        while (*a == '-' || *a == '/') a++;
-        if      (a[0] == 'q' || a[0] == 'Q') g_quiet = 1;
-        else if (a[0] == 'u' || a[0] == 'U') uninstall = 1;
-        else if (a[0] >= '0' && a[0] <= '9') drive = (uint8_t)strtoul(a, NULL, 0);
+        if (a[0] == '-' || a[0] == '/') {
+            const char *f = a + 1;
+            if      (f[0] == 'q' || f[0] == 'Q') g_quiet = 1;
+            else if (f[0] == 'u' || f[0] == 'U') uninstall = 1;
+        } else if (a[0] >= '0' && a[0] <= '9') {
+            drive = (uint8_t)strtoul(a, NULL, 0);
+            drive_specified = 1;
+        } else if (((a[0] >= 'A' && a[0] <= 'Z') ||
+                    (a[0] >= 'a' && a[0] <= 'z')) && a[1] == ':') {
+            uint8_t letter = a[0];
+            if (letter >= 'a') letter = (uint8_t)(letter - 0x20);
+            g_drive_letter   = letter;
+            g_drive_index    = (uint8_t)(letter - 'A');
+            letter_specified = 1;
+        }
     }
 
     if (uninstall) {
         return do_uninstall();
+    }
+
+    if (!g_quiet) {
+        printf("ext4-dos TSR\n");
+    }
+
+    /* Pick a drive letter (auto or honor override). Need this BEFORE
+     * mount_ext4 so post-mount messages can name the letter. */
+    if (!letter_specified) {
+        uint8_t letter = pick_drive_letter();
+        if (letter == 0) {
+            printf("  ERROR: no free CDS slot found. Add LASTDRIVE=Z to\n"
+                   "         CONFIG.SYS to give DOS more drive-letter slots,\n"
+                   "         or pass an explicit slot like 'EXT4 Z:'.\n");
+            return 1;
+        }
+        g_drive_letter = letter;
+        g_drive_index  = (uint8_t)(letter - 'A');
+    }
+
+    /* Mount BEFORE hooking the CDS — if mount fails, leave the system
+     * untouched rather than installing a no-op redirector that returns
+     * "file not found" for every Y: lookup. */
+    if (drive_specified) {
+        if (mount_ext4(drive, 0) != 0) {
+            printf("  ERROR: ext4 mount failed on drive 0x%02x. Refusing to\n"
+                   "         install (would leave %c: redirected to nothing).\n",
+                   drive, g_drive_letter);
+            return 1;
+        }
+    } else {
+        if (scan_for_ext4(&drive) != 0) {
+            printf("  ERROR: no ext4 partition found on BIOS drives 0x80..0x83.\n"
+                   "         Plug in an ext4 disk, or pass an explicit drive\n"
+                   "         number like 'EXT4 0x81' if your BIOS uses a\n"
+                   "         non-standard numbering.\n");
+            return 1;
+        }
+        if (!g_quiet) {
+            printf("  scanned BIOS drives 0x80..0x83, mounted 0x%02x\n", drive);
+        }
+    }
+
+    if (ext4_features_check_supported(&g_fs.sb, err, sizeof err) != 0) {
+        printf("  ERROR: ext4 mount has unsupported feature: %s\n", err);
+        printf("         Refusing to install rather than risk silent misreads.\n");
+        return 1;
     }
 
     if (hook_cds() != 0) {
@@ -1574,20 +1700,9 @@ int main(int argc, char **argv) {
     g_sda = get_sda();
 
     if (!g_quiet) {
-        printf("ext4-dos TSR\n");
         printf("  drive %c: marked as redirector (flag 0x%04x)\n",
-               DRIVE_LETTER, CDS_FLAG_REDIRECTED);
+               g_drive_letter, CDS_FLAG_REDIRECTED);
         printf("  SDA at %04x:%04x\n", FP_SEG(g_sda), FP_OFF(g_sda));
-    }
-
-    if (mount_ext4(drive) == 0) {
-        if (ext4_features_check_supported(&g_fs.sb, err, sizeof err) != 0) {
-            printf("  WARN: ext4 mount has unsupported feature: %s\n", err);
-            printf("        TSR will respond file-not-found for all entries.\n");
-            g_fs_ready = 0;
-        }
-    } else {
-        printf("  WARN: ext4 mount failed; TSR will respond file-not-found.\n");
     }
 
     prev_int2f = _dos_getvect(0x2F);
