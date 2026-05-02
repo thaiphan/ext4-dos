@@ -559,7 +559,9 @@ int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
     uint32_t this_seq, this_first;
     uint32_t i;
     uint32_t tag_bytes;
-    uint8_t  seq_be[4];
+    /* Static: crc32c() receives a near pointer; stack lives at SS != DS
+     * in DOS interrupt context, so this must be in DGROUP. */
+    static uint8_t seq_be[4];
     int      rc;
 
     if (err && err_len) err[0] = '\0';
