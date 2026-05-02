@@ -71,7 +71,7 @@ vpath %.c tools src/blockdev src/ext4 src/partition
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
@@ -80,6 +80,9 @@ $(HOST_DIR)/host_features_test: tools/host_features_test.c src/ext4/features.c |
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_stress_test: tools/host_stress_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
+$(HOST_DIR)/host_journal_test: tools/host_journal_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR):
@@ -111,9 +114,11 @@ $(DOS_DIR)/%.obj: %.c | $(DOS_DIR)
 $(DOS_DIR):
 	mkdir -p $@
 
-host-test: host-build
+host-test: host-build tests/images/journal.img
 	@echo "==> running host_features_test"
 	@$(HOST_DIR)/host_features_test
+	@echo "==> running host_journal_test"
+	@$(HOST_DIR)/host_journal_test tests/images/journal.img tests/images/journal.expect
 
 host-stress: host-build tests/images/stress.img
 	@echo "==> running host_stress_test"
@@ -121,6 +126,9 @@ host-stress: host-build tests/images/stress.img
 
 tests/images/stress.img: scripts/mkfixture-stress.py
 	python3 scripts/mkfixture-stress.py
+
+tests/images/journal.img: scripts/mkfixture-journal.py
+	$(PYTHON) $<
 
 dos-test: dos-build fixture-partitioned
 	@bash scripts/run-dosbox.sh

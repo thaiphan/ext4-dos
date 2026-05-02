@@ -50,12 +50,14 @@ int ext4_fs_open(struct ext4_fs *fs, struct blockdev *bd, uint64_t partition_lba
     rc = bdev_read(bd, bgd_sector, sectors_to_read, fs->bgd_buf);
     if (rc) return -5;
 
-    /* Journal init is best-effort in phase A: a parse failure should not
-     * block mount, since v1 read-only continues to work without replay
-     * (we just see slightly stale data, the same as before). Only the
-     * impossible cases (e.g. wrong block size) actually warrant attention,
-     * and those callers can inspect fs->jbd.present. */
-    (void)ext4_journal_init(fs, jerr, sizeof jerr);
+    /* Journal init + replay is best-effort: a parse failure should not
+     * block mount. Without a replay map we fall back to on-disk state,
+     * which is the pre-replay world (data may be slightly stale for
+     * files written just before a crash). Callers that care can inspect
+     * fs->jbd.present and fs->jbd.replay_active. */
+    if (ext4_journal_init(fs, jerr, sizeof jerr) == 0 && fs->jbd.present) {
+        (void)ext4_journal_replay(fs, jerr, sizeof jerr);
+    }
 
     return 0;
 }

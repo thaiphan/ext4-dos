@@ -102,10 +102,32 @@ struct ext4_jbd {
 struct ext4_fs;
 
 /* Read inode #s_journal_inum, parse the journal superblock, populate
- * jbd->extents/maxlen/start/sequence. Does NOT walk transactions yet
- * (that's phase B). Returns 0 on success, negative on error.
- * If sb has no journal_inum, returns 0 with jbd->present == 0.
+ * jbd->extents/maxlen/start/sequence. Does NOT walk transactions
+ * (that's ext4_journal_replay). Returns 0 on success, negative on
+ * error. If sb has no journal_inum, returns 0 with jbd->present == 0.
  * If parsing fails, returns negative AND fills err with a short reason. */
 int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len);
+
+/* Walk the on-disk log and build the {fs_block -> journal_blk} replay
+ * map (and the revoke map). After this returns successfully with
+ * jbd->replay_active == 1, the read hook can redirect reads of
+ * journaled blocks to their newest committed copy in the log.
+ *
+ * No-op if jbd->present == 0 or jbd->start == 0 (clean log).
+ *
+ * Returns 0 on success. On parse error / capacity exceeded, returns
+ * negative and leaves replay_active == 0 — callers can still mount
+ * (we just see slightly stale data, same as the pre-replay world). */
+int ext4_journal_replay(struct ext4_fs *fs, char *err, uint32_t err_len);
+
+/* Look up fs_block in the replay map. Returns 1 with *out_jblk and
+ * *out_is_escape filled in if a journaled copy exists; 0 otherwise. */
+int ext4_journal_lookup(const struct ext4_fs *fs, uint64_t fs_block,
+                        uint32_t *out_jblk, uint8_t *out_is_escape);
+
+/* Read journal block jblk (a logical index into the log) into out_buf.
+ * Translates via the journal inode's extent table. out_buf must be at
+ * least block_size bytes. */
+int ext4_journal_read_log_block(struct ext4_fs *fs, uint32_t jblk, void *out_buf);
 
 #endif
