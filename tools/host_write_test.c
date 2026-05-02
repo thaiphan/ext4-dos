@@ -116,6 +116,57 @@ int main(int argc, char **argv) {
                "/control.txt was accidentally modified");
     }
 
+    /* Phase 2: extend /target.txt by exactly one block of 'C' bytes.
+     * Reuses the same working copy — the post-1b inode now has 1024
+     * bytes; we expect a 2048-byte file with block 0 'B' and block 1
+     * 'C' afterwards. */
+    {
+        static uint8_t ext_block[1024];
+        static uint8_t verify[1024];
+        uint64_t orig_size;
+        memset(ext_block, 'C', sizeof ext_block);
+        rc = ext4_inode_read(&fs, target_ino, &inode);
+        ASSERT(rc == 0, "re-read inode for extend rc=%d", rc);
+        orig_size = inode.size;
+
+        rc = ext4_file_extend_block(&fs, &inode, target_ino, ext_block,
+                                    now + 1u, err, sizeof err);
+        ASSERT(rc == 0, "ext4_file_extend_block rc=%d err='%s'", rc, err);
+
+        ASSERT(inode.size == orig_size + 1024u,
+               "inode.size after extend expected %lu, got %lu",
+               (unsigned long)(orig_size + 1024u),
+               (unsigned long)inode.size);
+
+        /* Re-read inode from disk to confirm persistence. */
+        rc = ext4_inode_read(&fs, target_ino, &inode);
+        ASSERT(rc == 0, "re-read inode post-extend rc=%d", rc);
+        ASSERT(inode.size == orig_size + 1024u,
+               "on-disk inode.size after extend expected %lu, got %lu",
+               (unsigned long)(orig_size + 1024u),
+               (unsigned long)inode.size);
+
+        /* Block 0 should still be 'B' (from the phase 1b write). */
+        rc = ext4_file_read_block(&fs, &inode, 0, verify);
+        ASSERT(rc == 0, "read /target.txt block 0 post-extend rc=%d", rc);
+        {
+            int bad = 0;
+            size_t i;
+            for (i = 0; i < sizeof verify; i++) if (verify[i] != 'B') bad++;
+            ASSERT(bad == 0, "block 0 has %d non-'B' bytes after extend", bad);
+        }
+
+        /* Block 1 should be 'C' (the just-extended block). */
+        rc = ext4_file_read_block(&fs, &inode, 1, verify);
+        ASSERT(rc == 0, "read /target.txt block 1 (extended) rc=%d", rc);
+        {
+            int bad = 0;
+            size_t i;
+            for (i = 0; i < sizeof verify; i++) if (verify[i] != 'C') bad++;
+            ASSERT(bad == 0, "extended block 1 has %d non-'C' bytes", bad);
+        }
+    }
+
     if (failures == 0) {
         printf("host_write_test: all asserts passed (wrote 1024B of 'B' to /target.txt, "
                "mtime %lu->%lu, journal clean post-commit)\n",

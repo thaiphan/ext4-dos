@@ -40,10 +40,15 @@
  * DGROUP. A clean (non-dirty) journal needs almost nothing; only a
  * RECOVER-flagged mount actually populates the maps. Going past these
  * caps aborts replay (we fall back to on-disk state with a clear error,
- * not silent corruption). */
-#define EXT4_JBD_REPLAY_MAP_MAX  256u  /* unique fs_blocks redirected */
-#define EXT4_JBD_REVOKE_MAP_MAX   64u  /* unique fs_blocks revoked */
-#define EXT4_JBD_EXTENT_MAX       16u  /* extents in journal-inode i_block walk */
+ * not silent corruption).
+ *
+ * Sized down from earlier (256/64/16) once phase 2 added 5 more
+ * fs-block scratch buffers — DGROUP is finite in DOS small-model. A
+ * journal flush of a few hundred journaled blocks is rare; if it
+ * happens the walker bails and we serve on-disk state. */
+#define EXT4_JBD_REPLAY_MAP_MAX   64u  /* unique fs_blocks redirected */
+#define EXT4_JBD_REVOKE_MAP_MAX   32u  /* unique fs_blocks revoked */
+#define EXT4_JBD_EXTENT_MAX        8u  /* extents in journal-inode i_block walk */
 
 /* One entry in the replay map: an fs_block whose newest committed copy
  * lives at journal block journal_blk. Sorted by fs_block for binary search. */

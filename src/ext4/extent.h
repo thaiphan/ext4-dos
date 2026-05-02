@@ -35,11 +35,34 @@ int ext4_file_read_head(struct ext4_fs *fs, const struct ext4_inode *inode,
  * area. The inode's mtime is bumped to `now_unix` and persisted.
  *
  * Returns 0 on success. err is filled on failure with a short reason
- * (e.g. "metadata_csum write support is phase 1c", "block matches
- * JBD_MAGIC", "logical block has no extent — allocation is phase 2"). */
+ * (e.g. "block matches JBD_MAGIC", "logical block has no extent —
+ * allocation is phase 2"). */
 int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
                           uint32_t inode_num, uint32_t logical_block,
                           const void *new_data, uint32_t now_unix,
                           char *err, uint32_t err_len);
+
+/* Append exactly one new block to the end of the file, populating it
+ * with `new_data` (block_size bytes). Phase 2 first cut: only the
+ * "extend last leaf extent by 1" path is supported, and only when the
+ * physically-next block (last_extent.physical + last_extent.length)
+ * is free in group 0's bitmap. Builds a single 5-block transaction
+ * (data + bitmap + BGD + fs sb + inode) and commits it.
+ *
+ * Refuses (with err) when:
+ *   - file is empty (no extent to extend; use ext4_file_write_block
+ *     after explicit allocate — not yet covered)
+ *   - inode's extent tree has depth > 0 (deeper trees not handled)
+ *   - inode has more than one leaf extent (would need a new leaf or
+ *     to walk to last leaf — not yet handled)
+ *   - the contiguous candidate block isn't free (would need to scan
+ *     other groups — not yet handled)
+ *   - the candidate block is in a group with BLOCK_UNINIT bitmap
+ *
+ * The inode's size is bumped by exactly one block; mtime is set to
+ * `now_unix`; the in-memory inode_in is updated to reflect both. */
+int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
+                           uint32_t inode_num, const void *new_data,
+                           uint32_t now_unix, char *err, uint32_t err_len);
 
 #endif
