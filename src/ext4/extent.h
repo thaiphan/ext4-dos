@@ -86,6 +86,14 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
                          uint32_t now_unix,
                          char *err, uint32_t err_len);
 
+/* Rename a file or directory in-place within parent_ino.  Updates the
+ * directory entry name to new_name (must fit within the entry's current
+ * rec_len).  Same-parent only — cross-directory rename is phase RENAME+1.
+ * Returns 0 on success, -1 on failure. */
+int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
+                const char *new_name, uint8_t new_name_len,
+                char *err, uint32_t err_len);
+
 /* Remove a regular file from parent_ino.  Frees each data block (one
  * 3-block journal transaction per block), then frees the inode + removes
  * the parent dir entry in a final 6-block transaction.  Refuses

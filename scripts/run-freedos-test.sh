@@ -83,6 +83,10 @@ echo === Phase 3.6 multi-block: COPY Y:\TARGET.TXT Y:\NEWBIG.TXT === >> C:\OUT.T
 COPY Y:\TARGET.TXT Y:\NEWBIG.TXT >> C:\OUT.TXT
 echo === DIR Y:\NEWBIG.TXT (expect size 2048) === >> C:\OUT.TXT
 DIR Y:\NEWBIG.TXT >> C:\OUT.TXT
+echo === RENAME: REN Y:\NEWBIG.TXT RENAMED.TXT === >> C:\OUT.TXT
+REN Y:\NEWBIG.TXT RENAMED.TXT >> C:\OUT.TXT
+echo === DIR Y:\RENAMED.TXT (must exist, same size) === >> C:\OUT.TXT
+DIR Y:\RENAMED.TXT >> C:\OUT.TXT
 echo === Phase 4 mkdir: MD Y:\NEWDIR === >> C:\OUT.TXT
 MD Y:\NEWDIR >> C:\OUT.TXT
 echo === DIR Y:\NEWDIR (must exist) === >> C:\OUT.TXT
@@ -190,6 +194,11 @@ fi
 # CX=0 pre-extend (TARGET.TXT is 2048 bytes = 2 blocks).
 if ! grep -F -A8 'DIR Y:\NEWBIG.TXT' <<<"$OUT" | grep -qE "NEWBIG[[:space:]]+TXT[[:space:]]+2[,]?048"; then
     echo "FAIL: Y:\\NEWBIG.TXT not 2048 bytes after multi-block COPY (Phase 3.6)" >&2
+    fail=1
+fi
+# RENAME: NEWBIG.TXT -> RENAMED.TXT must show up at the same size.
+if ! grep -F -A8 'DIR Y:\RENAMED.TXT' <<<"$OUT" | grep -qE "RENAMED[[:space:]]+TXT[[:space:]]+2[,]?048"; then
+    echo "FAIL: Y:\\RENAMED.TXT not 2048 bytes after REN (RENAME)" >&2
     fail=1
 fi
 # Phase 4: MD Y:\NEWDIR must produce a visible directory.

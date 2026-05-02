@@ -47,7 +47,8 @@ static uint8_t g_drive_index  = 0;     /* g_drive_letter - 'A' */
 
 /* SDA field offsets per FreeDOS kernel.asm.  Should match MS-DOS 4-7. */
 #define SDA_DTA_OFF         0x0C   /* DWORD far ptr to user's DTA / Read buffer */
-#define SDA_PRI_PATH_OFF    0x9E   /* qualified pattern (128 bytes) */
+#define SDA_PRI_PATH_OFF    0x9E   /* qualified source path (128 bytes) */
+#define SDA_SEC_PATH_OFF    0x11E  /* qualified dest path for RENAME (128 bytes) */
 #define SDA_TMP_DM_OFF      0x19E  /* sda_tmp_dm: 21-byte SDB header */
 #define SDA_SEARCH_DIR_OFF  0x1B3  /* SearchDir: 32-byte FAT dir entry */
 #define SDA_SATTR_OFF       0x24D  /* attribute mask byte */
@@ -1132,8 +1133,101 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             return;
         }
 
+        case 0x11: { /* REM_RENAME — rename within same directory. */
+            static char src_path[128];
+            static char dst_path[128];
+            static char parent_path[128];
+            static char new_name[128];
+            static char werr[64];
+            uint32_t file_ino, parent_ino;
+            int p, base_src, base_dst, j;
+            uint8_t nm_len;
+            /* Dest path comes from the SDA secondary path buffer. */
+            {
+                const char __far *dsrc = (const char __far *)(g_sda + SDA_SEC_PATH_OFF);
+                if (dsrc[0] != g_drive_letter || dsrc[1] != ':') {
+                    r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                    r.w.flags |= 1u;
+                    return;
+                }
+                dsrc += 2;
+                dst_path[0] = '/'; j = 1;
+                if (*dsrc == '\\' || *dsrc == '/') dsrc++;
+                while (*dsrc && j < 127) {
+                    char c = *dsrc;
+                    if (c == '\\') c = '/';
+                    else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+                    dst_path[j++] = c; dsrc++;
+                }
+                dst_path[j] = '\0';
+            }
+            if (!g_fs_ready || dos_to_ext4_path(src_path, sizeof src_path) != 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            file_ino = path_lookup_with_alias(&g_fs, src_path);
+            if (file_ino == 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            /* Resolve source parent. */
+            base_src = 0;
+            for (p = 0; src_path[p]; p++)
+                if (src_path[p] == '/') base_src = p + 1;
+            if (base_src <= 1) {
+                parent_ino = 2u;
+            } else {
+                for (j = 0; j + 1 < base_src && j < 127; j++)
+                    parent_path[j] = src_path[j];
+                parent_path[j] = '\0';
+                parent_ino = ext4_path_lookup(&g_fs, parent_path);
+                if (parent_ino == 0) {
+                    r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                    r.w.flags |= 1u;
+                    return;
+                }
+            }
+            /* Extract dest basename and verify it's same parent. */
+            base_dst = 0;
+            for (p = 0; dst_path[p]; p++)
+                if (dst_path[p] == '/') base_dst = p + 1;
+            /* Only same-parent renames supported for now. */
+            if (base_dst != base_src ||
+                memcmp(src_path, dst_path, (unsigned)base_src) != 0) {
+                r.w.ax = DOS_ERR_WRITE_PROTECT; /* cross-dir: not supported */
+                r.w.flags |= 1u;
+                return;
+            }
+            /* Refuse if dest already exists. */
+            if (path_lookup_with_alias(&g_fs, dst_path) != 0) {
+                r.w.ax = 5u; /* ACCESS_DENIED */
+                r.w.flags |= 1u;
+                return;
+            }
+            nm_len = 0;
+            while (dst_path[base_dst + nm_len]) nm_len++;
+            if (nm_len == 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            for (j = 0; j < nm_len && j < 127; j++)
+                new_name[j] = dst_path[base_dst + j];
+            new_name[j] = '\0';
+            werr[0] = '\0';
+            if (ext4_rename(&g_fs, parent_ino, file_ino,
+                            new_name, nm_len, werr, sizeof werr) != 0) {
+                r.w.ax = DOS_ERR_WRITE_PROTECT;
+                r.w.flags |= 1u;
+                return;
+            }
+            r.w.flags &= ~1u;
+            return;
+        }
+
         case 0x0E: /* REM_SETATTR — change file attributes */
-        case 0x11: /* REM_RENAME */
         /* 0x17 = REM_CREATE: now handled above — do not fall through here */
             /* 0x18 deliberately NOT here: FreeDOS's network.h calls it
              * REM_CRTRWOCDS (create-R/W-without-CDS), but other references

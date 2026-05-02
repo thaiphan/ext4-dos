@@ -2190,6 +2190,139 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
     return 0;
 }
 
+/* Phase RENAME: in-place directory-entry rename ------------------------- */
+
+int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
+                const char *new_name, uint8_t new_name_len,
+                char *err, uint32_t err_len) {
+    static struct ext4_inode par_inode;
+    static uint64_t dir_phys;   /* DGROUP — extent_lookup out-pointer */
+
+    uint32_t parent_gen;
+    uint64_t parent_dir_block;
+    uint32_t entry_off;
+    uint16_t entry_rec;
+    uint32_t new_real_sz;
+    uint64_t parent_inode_fs_block;
+    uint32_t parent_inode_offset;
+    int rc;
+
+    if (err && err_len) err[0] = '\0';
+    if (fs->sb.block_size > EXT4_WRITE_BUF_SIZE) {
+        say_simple(err, err_len, "block_size > write cap"); return -1;
+    }
+    if (new_name_len == 0) {
+        say_simple(err, err_len, "new name empty"); return -1;
+    }
+    new_real_sz = (8u + (uint32_t)new_name_len + 3u) & ~(uint32_t)3u;
+
+    /* Read parent inode to scan its dir blocks. */
+    if (ext4_inode_read(fs, parent_ino, &par_inode) != 0) {
+        say_simple(err, err_len, "parent inode read failed"); return -1;
+    }
+
+    /* Get parent generation for dir-block tail csum. */
+    {
+        uint32_t g0 = (parent_ino-1u)/fs->sb.inodes_per_group;
+        uint32_t id0= (parent_ino-1u)%fs->sb.inodes_per_group;
+        const uint8_t *b0 = fs->bgd_buf + g0 * fs->bgd_size;
+        uint64_t it = ((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
+        uint64_t ib = (uint64_t)id0 * fs->sb.inode_size;
+        if (ext4_fs_read_block(fs, it + ib/fs->sb.block_size, scratch_inode_block) != 0) {
+            say_simple(err, err_len, "parent inode block read (gen)"); return -1;
+        }
+        parent_gen = le32(scratch_inode_block + (uint32_t)(ib%fs->sb.block_size) + 0x64);
+    }
+
+    /* Scan parent dir for the entry pointing to file_ino. */
+    {
+        uint32_t nblks = (uint32_t)((par_inode.size+fs->sb.block_size-1u)/fs->sb.block_size);
+        uint32_t b; int found = 0;
+        entry_off = 0; entry_rec = 0; parent_dir_block = 0;
+        for (b = 0; b < nblks && !found; b++) {
+            uint32_t off;
+            if (ext4_extent_lookup(fs, par_inode.i_block, b, &dir_phys) != 0) continue;
+            parent_dir_block = dir_phys;
+            if (ext4_fs_read_block(fs, parent_dir_block, scratch_parent_dir) != 0) continue;
+            off = 0;
+            while (off + 8u <= fs->sb.block_size) {
+                uint16_t rec = le16(scratch_parent_dir + off + 4);
+                uint32_t ino = le32(scratch_parent_dir + off);
+                if (rec < 8u || rec > fs->sb.block_size - off) break;
+                if (scratch_parent_dir[off+7]==0xDEu && rec==12u && ino==0u) {
+                    off += rec; continue;
+                }
+                if (ino == file_ino) {
+                    entry_off = off; entry_rec = rec; found = 1; break;
+                }
+                off += rec;
+            }
+        }
+        if (!found) { say_simple(err, err_len, "entry not found in parent"); return -1; }
+    }
+
+    /* Verify new name fits within the existing entry's allocated space. */
+    if (new_real_sz > (uint32_t)entry_rec) {
+        say_simple(err, err_len, "new name too long for entry slot"); return -1;
+    }
+
+    /* Update the entry in scratch_parent_dir: name_len + name bytes.
+     * inode, rec_len, and file_type are unchanged. */
+    scratch_parent_dir[entry_off + 6] = new_name_len;
+    /* Zero old name bytes beyond new length to avoid stale data leaking. */
+    {
+        uint32_t old_nl = scratch_parent_dir[entry_off + 6]; /* already updated */
+        uint32_t clear_start = 8u + new_name_len;
+        uint32_t clear_end   = 8u + (uint32_t)(entry_rec - 8u); /* conservative */
+        uint32_t k;
+        (void)old_nl;
+        for (k = clear_start; k < clear_end && k < fs->sb.block_size - entry_off; k++)
+            scratch_parent_dir[entry_off + k] = 0;
+        memcpy(scratch_parent_dir + entry_off + 8u, new_name, new_name_len);
+    }
+    if (fs->sb.feature_ro_compat & 0x400u) {
+        uint32_t tail=fs->sb.block_size-12u; uint32_t cs;
+        scratch_parent_dir[tail+0]=scratch_parent_dir[tail+1]=0;
+        scratch_parent_dir[tail+2]=scratch_parent_dir[tail+3]=0;
+        scratch_parent_dir[tail+4]=12u; scratch_parent_dir[tail+5]=0u;
+        scratch_parent_dir[tail+6]=0u; scratch_parent_dir[tail+7]=0xDEu;
+        scratch_parent_dir[tail+8]=scratch_parent_dir[tail+9]=0;
+        scratch_parent_dir[tail+10]=scratch_parent_dir[tail+11]=0;
+        cs=dir_block_csum(fs,parent_ino,parent_gen,scratch_parent_dir);
+        scratch_parent_dir[tail+8]=(uint8_t)cs; scratch_parent_dir[tail+9]=(uint8_t)(cs>>8);
+        scratch_parent_dir[tail+10]=(uint8_t)(cs>>16); scratch_parent_dir[tail+11]=(uint8_t)(cs>>24);
+    }
+
+    /* Update parent inode mtime. */
+    {
+        uint32_t g=(parent_ino-1u)/fs->sb.inodes_per_group;
+        uint32_t id=(parent_ino-1u)%fs->sb.inodes_per_group;
+        const uint8_t *b0=fs->bgd_buf+g*fs->bgd_size;
+        uint64_t it=((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
+        uint64_t ib=(uint64_t)id*fs->sb.inode_size;
+        parent_inode_fs_block=it+ib/fs->sb.block_size;
+        parent_inode_offset=(uint32_t)(ib%fs->sb.block_size);
+    }
+    if (ext4_fs_read_block(fs, parent_inode_fs_block, scratch_inode_block) != 0) {
+        say_simple(err, err_len, "parent inode block read failed"); return -1;
+    }
+    {
+        uint8_t *pi=scratch_inode_block+parent_inode_offset;
+        uint32_t t=par_inode.mtime+1u;
+        pi[0x10]=(uint8_t)t; pi[0x11]=(uint8_t)(t>>8);
+        pi[0x12]=(uint8_t)(t>>16); pi[0x13]=(uint8_t)(t>>24);
+        ext4_inode_recompute_csum(fs, parent_ino, pi);
+    }
+
+    scratch_trans.block_count = 2u;
+    scratch_trans.fs_block[0] = parent_dir_block;      scratch_trans.buf[0] = scratch_parent_dir;
+    scratch_trans.fs_block[1] = parent_inode_fs_block; scratch_trans.buf[1] = scratch_inode_block;
+    rc = ext4_journal_commit(fs, &scratch_trans, err, err_len);
+    if (rc) return -1;
+
+    return 0;
+}
+
 int ext4_file_read_head(struct ext4_fs *fs, const struct ext4_inode *inode,
                         uint32_t length, void *out_buf) {
     static uint8_t blk[EXT4_EXT_NODE_BUF];
