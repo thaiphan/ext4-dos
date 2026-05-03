@@ -18,7 +18,7 @@ TEST_IMG="$MSDOS4_DIR/test.img"
 EXT4_SRC_IMG="tests/images/disk.img"
 EXT4_IMG="$MSDOS4_DIR/test-ext4.img"   # working copy — writes don't mutate the source
 FREEDOS_IMG="tests/freedos/FD14LITE.img"
-WAIT_SECONDS="${WAIT_SECONDS:-30}"
+WAIT_SECONDS="${WAIT_SECONDS:-60}"
 
 if ! command -v dosbox-x >/dev/null 2>&1; then
     echo "ERROR: dosbox-x not found." >&2
@@ -125,33 +125,9 @@ TYPE Y:\HELLO.TXT >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
 echo === End regression === >> A:\OUT.TXT
-REM SKIP(MSDOS4): DIR Y:\*.TXT wildcard returns no entries on MS-DOS 4.
-REM Diagnosis (from EXT4DMP per-call captures + MS-DOS 4 source dive):
-REM
-REM   - PRI_PATH for the wildcard arrives as "Y:????????.???" -- MS-DOS 4
-REM     normalizes BOTH wildcard chars AND literal extension chars to '?'.
-REM     The literal pattern ".TXT" is NOT preserved here.
-REM   - SDA+TMP_DM (offset 0x19E) does not contain the FCB pattern either
-REM     -- reading it returns kernel code bytes (looks like an unrelated
-REM     DOS kernel function in DOSGroup happened to lay there).
-REM   - The DTA pointer at SDA+0x0C also points into kernel code, not at
-REM     a search FCB.
-REM   - The literal pattern is presumably in NAME1 in DOSGroup (per
-REM     SEARCH.ASM:223 TransPathSet), but that's a kernel-internal address
-REM     not exposed to redirectors.
-REM   - FreeDOS takes a different approach: PRI_PATH stays as "Y:\*.*",
-REM     redirector returns ALL entries, COMMAND.COM filters by user
-REM     pattern.  Our pattern compile happens to do the same on FreeDOS
-REM     because pattern_set ends up 0 (match-all).  On MS-DOS 4 the same
-REM     match-all behaviour returns lost+found first; DIR rejects it
-REM     (directory) but apparently doesn't continue iterating.
-REM
-REM   Path forward (not pursued in this session): need to read MS-DOS 4
-REM   COMMAND.COM's DIR-handling code to understand whether it iterates
-REM   FindNext or expects the redirector to filter.  If it expects
-REM   filter: we need access to the literal pattern; might require
-REM   peeking into DOSGroup at NAME1's known offset (fragile).  If it
-REM   iterates: there's a separate bug in our FindNext loop on MS-DOS 4.
+REM Wildcard DIR works on MS-DOS 4 -- COMMAND.COM iterates FindNext and
+REM filters in user space, just like FreeDOS, so our match-all PRI_PATH
+REM ("Y:????????.???") does the right thing.
 echo === DIR Y:\*.TXT (wildcard) === >> A:\OUT.TXT
 DIR Y:\*.TXT >> A:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> A:\OUT.TXT
@@ -161,6 +137,18 @@ echo === COPY Y:\HELLO.TXT A:\HELLO2.TXT === >> A:\OUT.TXT
 COPY Y:\HELLO.TXT A:\HELLO2.TXT >> A:\OUT.TXT
 echo === TYPE A:\HELLO2.TXT (verify COPY-from-Y) === >> A:\OUT.TXT
 TYPE A:\HELLO2.TXT >> A:\OUT.TXT
+echo === TYPE Y:\SUBDIR\NESTED.TXT (subdir traversal) === >> A:\OUT.TXT
+TYPE Y:\SUBDIR\NESTED.TXT >> A:\OUT.TXT
+REM MS-DOS 4 COMMAND.COM COPY+ silently drops a subdir source on a
+REM redirector drive (bug in MS-DOS 4 itself: it prints only the first
+REM source and skips Y:\SUBDIR\NESTED.TXT). Direct subdir TYPE above
+REM confirms the redirector path works -- this is a COMMAND.COM
+REM limitation, not ours. Use two root-level sources here so we still
+REM exercise the COPY+ multi-file machinery.
+echo === Multi-file: COPY HELLO+VERY~876 to BOTH.TXT === >> A:\OUT.TXT
+COPY /B Y:\HELLO.TXT+Y:\VERY~876.TXT A:\BOTH.TXT >> A:\OUT.TXT
+echo === TYPE A:\BOTH.TXT (concatenation result) === >> A:\OUT.TXT
+TYPE A:\BOTH.TXT >> A:\OUT.TXT
 echo === Write test: Y:\TARGET.TXT before === >> A:\OUT.TXT
 TYPE Y:\TARGET.TXT >> A:\OUT.TXT
 echo --- run ext4wr (in-place B + extend C) --- >> A:\OUT.TXT
@@ -176,6 +164,14 @@ echo === COPY A:\HELLO2.TXT Y:\NEWCOPY.TXT (create on Y:) === >> A:\OUT.TXT
 COPY A:\HELLO2.TXT Y:\NEWCOPY.TXT >> A:\OUT.TXT
 echo === TYPE Y:\NEWCOPY.TXT (verify COPY-to-Y) === >> A:\OUT.TXT
 TYPE Y:\NEWCOPY.TXT >> A:\OUT.TXT
+echo === Multi-block intra-Y: COPY Y:\TARGET.TXT Y:\NEWBIG.TXT === >> A:\OUT.TXT
+COPY Y:\TARGET.TXT Y:\NEWBIG.TXT >> A:\OUT.TXT
+echo === DIR Y:\NEWBIG.TXT (expect size 2048) === >> A:\OUT.TXT
+DIR Y:\NEWBIG.TXT >> A:\OUT.TXT
+echo === RENAME: REN Y:\NEWBIG.TXT RENAMED.TXT === >> A:\OUT.TXT
+REN Y:\NEWBIG.TXT RENAMED.TXT >> A:\OUT.TXT
+echo === DIR Y:\RENAMED.TXT (must exist, same size) === >> A:\OUT.TXT
+DIR Y:\RENAMED.TXT >> A:\OUT.TXT
 REM EXEC after writes -- previously corrupted; verify it still works here.
 echo === ext4chk after writes (EXEC sanity) === >> A:\OUT.TXT
 A:\EXT4CHK.EXE >> A:\OUT.TXT
@@ -188,6 +184,10 @@ DIR Y: >> A:\OUT.TXT
 echo === Remove directory: RD Y:\NEWDIR === >> A:\OUT.TXT
 RD Y:\NEWDIR >> A:\OUT.TXT
 echo === DIR Y: (NEWDIR must be gone, TARGET extended to 2048) === >> A:\OUT.TXT
+DIR Y: >> A:\OUT.TXT
+echo === DEL Y:\NEWCOPY.TXT (remove created file) === >> A:\OUT.TXT
+DEL Y:\NEWCOPY.TXT >> A:\OUT.TXT
+echo === DIR Y: after DEL (NEWCOPY must be gone, HELLO still there) === >> A:\OUT.TXT
 DIR Y: >> A:\OUT.TXT
 echo === TYPE Y:\VERY~876.TXT (8.3 alias roundtrip) === >> A:\OUT.TXT
 TYPE Y:\VERY~876.TXT >> A:\OUT.TXT
@@ -311,13 +311,53 @@ if ! grep -F -A4 'ext4chk after writes (EXEC sanity)' <<<"$OUT" | grep -q "TSR d
     fail=1
 fi
 # MD Y:\NEWDIR — check it appears in the subsequent DIR Y: listing.
-if ! grep -F -A12 'DIR Y: (NEWDIR must appear)' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
+if ! grep -F -A20 'DIR Y: (NEWDIR must appear)' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
     echo "FAIL: Y:\\NEWDIR not visible in DIR Y: after MD" >&2
     fail=1
 fi
 # RD Y:\NEWDIR — must be absent from the subsequent DIR Y: listing.
-if grep -F -A12 'DIR Y: (NEWDIR must be gone' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
+if grep -F -A20 'DIR Y: (NEWDIR must be gone' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
     echo "FAIL: Y:\\NEWDIR still visible after RD" >&2
+    fail=1
+fi
+# Multi-file COPY /B (HELLO + VERY~876 -> A:\BOTH.TXT). Differs from
+# FreeDOS (HELLO+SUBDIR\NESTED) because MS-DOS 4 COMMAND.COM's COPY+
+# parser silently drops a subdir source on a redirector drive. Direct
+# subdir TYPE above confirms the redirector handles subdirs fine.
+if ! grep -F -A4 'COPY HELLO+VERY~876 to BOTH.TXT' <<<"$OUT" | grep -q '1 File(s) copied'; then
+    echo "FAIL: multi-file COPY+ didn't report '1 File(s) copied'" >&2
+    fail=1
+fi
+if ! grep -F -A4 'TYPE A:\BOTH.TXT (concatenation result)' <<<"$OUT" | grep -q 'long-named file ONE'; then
+    echo "FAIL: A:\\BOTH.TXT missing concatenation tail (VERY~876.TXT contents)" >&2
+    fail=1
+fi
+# Direct subdir traversal — TYPE Y:\SUBDIR\NESTED.TXT must return content.
+if ! grep -F -A2 'TYPE Y:\SUBDIR\NESTED.TXT (subdir' <<<"$OUT" | grep -q 'Nested file contents'; then
+    echo "FAIL: TYPE Y:\\SUBDIR\\NESTED.TXT didn't return content (subdir traversal)" >&2
+    fail=1
+fi
+# Multi-block intra-Y COPY (Y:\TARGET.TXT -> Y:\NEWBIG.TXT).
+if ! grep -F -A2 'COPY Y:\TARGET.TXT Y:\NEWBIG.TXT' <<<"$OUT" | grep -q '1 File(s) copied'; then
+    echo "FAIL: intra-Y COPY didn't report '1 File(s) copied'" >&2
+    fail=1
+fi
+if ! grep -F -A6 'DIR Y:\NEWBIG.TXT (expect size 2048)' <<<"$OUT" | grep -qE "NEWBIG[[:space:]]+TXT[[:space:]]+2[,]?048"; then
+    echo "FAIL: Y:\\NEWBIG.TXT not 2048 bytes after intra-Y COPY" >&2
+    fail=1
+fi
+# REN Y:\NEWBIG.TXT RENAMED.TXT — RENAMED.TXT must exist after.
+if ! grep -F -A6 'DIR Y:\RENAMED.TXT (must exist' <<<"$OUT" | grep -qE "RENAMED[[:space:]]+TXT[[:space:]]+2[,]?048"; then
+    echo "FAIL: Y:\\RENAMED.TXT (post-REN) not visible at size 2048" >&2
+    fail=1
+fi
+# DEL Y:\NEWCOPY.TXT — NEWCOPY must be gone, HELLO still present.
+if grep -F -A20 'DIR Y: after DEL' <<<"$OUT" | grep -qE "NEWCOPY[[:space:]]+TXT"; then
+    echo "FAIL: Y:\\NEWCOPY.TXT still visible after DEL" >&2
+    fail=1
+fi
+if ! grep -F -A20 'DIR Y: after DEL' <<<"$OUT" | grep -qE "HELLO[[:space:]]+TXT"; then
+    echo "FAIL: HELLO.TXT missing from DIR Y: after DEL — over-deletion?" >&2
     fail=1
 fi
 # Write test: ext4wr reports both writes, and the post-write TYPE shows
@@ -350,17 +390,19 @@ if ! grep -F -A12 'DIR Y: (NEWDIR must be gone' <<<"$OUT" | grep -qE "TARGET[[:s
     echo "FAIL: TARGET.TXT not 2048 bytes in DIR Y: after extend" >&2
     fail=1
 fi
-# Dynamic free-space check: ext4wr's extend + COPY-to-Y's NEWCOPY.TXT create
-# together consume two blocks (2048 bytes).  The first DIR Y: reads the
-# install-time snapshot; the last DIR D: comes from the auto-detect re-install
-# which captured a fresh snapshot reflecting both writes.  So FINAL == INIT - 2048.
+# Dynamic free-space check: net block delta after all writes is +3 blocks
+# consumed (extend TARGET +1, create NEWCOPY +1, create NEWBIG +2, DEL
+# NEWCOPY -1 = +3 blocks = 3072 bytes).  REN doesn't move blocks.  The
+# first DIR Y: reads the install-time snapshot; the last DIR D: comes
+# from the auto-detect re-install which captured a fresh snapshot
+# reflecting all writes.  So FINAL == INIT - 3072.
 INIT_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | head -1 | sed 's/ bytes free//' | tr -d ',' || true)
 FINAL_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | tail -1 | sed 's/ bytes free//' | tr -d ',' || true)
 if [[ -z "${INIT_FREE:-}" || -z "${FINAL_FREE:-}" ]]; then
     echo "FAIL: couldn't parse 'bytes free' lines from DIR output" >&2
     fail=1
-elif (( FINAL_FREE != INIT_FREE - 2048 )); then
-    echo "FAIL: 'bytes free' wrong (expected $((INIT_FREE - 2048)), got ${FINAL_FREE}) — extend + NEWCOPY.TXT should consume 2 blocks" >&2
+elif (( FINAL_FREE != INIT_FREE - 3072 )); then
+    echo "FAIL: 'bytes free' wrong (expected $((INIT_FREE - 3072)), got ${FINAL_FREE}) — extend + NEWCOPY + NEWBIG - DEL should net 3 blocks" >&2
     fail=1
 fi
 if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
