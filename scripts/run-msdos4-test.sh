@@ -156,35 +156,29 @@ echo === DIR Y:\*.TXT (wildcard) === >> A:\OUT.TXT
 DIR Y:\*.TXT >> A:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
-REM SKIP(MSDOS4): COPY Y:\... A:\... -- COMMAND.COM's internal COPY
-REM produces no output (no "0 file(s) copied", no source name) and no
-REM HELLO2.TXT is created.  Standalone ext4prb /c (which mimics COPY's
-REM exact INT 21h sequence: ExtOpen + GetTimes + GetXASize + IOCTL +
-REM Read) succeeds, so the redirector path itself is fine.  Ruled out:
-REM
-REM   * IOCTL DX bit 15 (sf_isnet) -- COPY only tests DL bit 7.
-REM   * sf_UID/sf_PID at SFT offsets 0x2F/0x31 -- now zeroed at REM_OPEN
-REM     to match kernel SFNFree convention; doesn't change COPY behavior.
-REM
-REM Open succeeds (Open count +1 during COPY), IOCTL hook fires once on
-REM the source handle, but no Read or Close from COPY follow.  Something
-REM specific to COMMAND.COM's COPY-internal context (vs a standalone EXE
-REM doing identical INT 21h calls) blocks it.  Needs heavy-debugger trace
-REM to identify -- see scripts/run-msdos4-copy-debug.sh.
+REM COPY Y:\... A:\... -- now works as of commit 071ae29 (AH=3Bh ChDir intercept).
+echo === COPY Y:\HELLO.TXT A:\HELLO2.TXT === >> A:\OUT.TXT
+COPY Y:\HELLO.TXT A:\HELLO2.TXT >> A:\OUT.TXT
+echo === TYPE A:\HELLO2.TXT (verify COPY-from-Y) === >> A:\OUT.TXT
+TYPE A:\HELLO2.TXT >> A:\OUT.TXT
 echo === Write test: Y:\TARGET.TXT before === >> A:\OUT.TXT
 TYPE Y:\TARGET.TXT >> A:\OUT.TXT
 echo --- run ext4wr (in-place B + extend C) --- >> A:\OUT.TXT
 A:\EXT4WR.EXE >> A:\OUT.TXT
 echo === Y:\TARGET.TXT after write (expect 'B'*1024 + 'C'*1024) === >> A:\OUT.TXT
 TYPE Y:\TARGET.TXT >> A:\OUT.TXT
-REM SKIP(MSDOS4): DIR Y:\TARGET.TXT shows volume header only on MS-DOS 4 --
-REM single-file DIR doesn't list the entry.  Verify size via the normal DIR Y:
-REM listing further down instead.
-REM SKIP(MSDOS4): COPY A:\... Y:\... (file creation on Y: via COPY) -- MS-DOS 4
-REM COMMAND.COM refuses writes to remote drives at the OS level (returns
-REM "0 File(s) copied"), so NEWCOPY.TXT/NEWBIG.TXT/RENAMED.TXT/DEL all hit
-REM that wall.  File creation on Y: is reachable only via direct INT 21h
-REM (which is what ext4wr does).
+REM DIR Y:\TARGET.TXT (single-file) -- now works as of the COPY-from-Y fix
+REM (same root cause: ChDir on Y:\ was the gating bug).
+echo === DIR Y:\TARGET.TXT (single-file) === >> A:\OUT.TXT
+DIR Y:\TARGET.TXT >> A:\OUT.TXT
+REM COPY A:\... Y:\... (file creation on Y: via COPY) -- now works.
+echo === COPY A:\HELLO2.TXT Y:\NEWCOPY.TXT (create on Y:) === >> A:\OUT.TXT
+COPY A:\HELLO2.TXT Y:\NEWCOPY.TXT >> A:\OUT.TXT
+echo === TYPE Y:\NEWCOPY.TXT (verify COPY-to-Y) === >> A:\OUT.TXT
+TYPE Y:\NEWCOPY.TXT >> A:\OUT.TXT
+REM EXEC after writes -- previously corrupted; verify it still works here.
+echo === ext4chk after writes (EXEC sanity) === >> A:\OUT.TXT
+A:\EXT4CHK.EXE >> A:\OUT.TXT
 echo === Make directory: MD Y:\NEWDIR === >> A:\OUT.TXT
 MD Y:\NEWDIR >> A:\OUT.TXT
 REM Under MS-DOS 4, DIR Y:\NEWDIR lists the *contents* of NEWDIR,
@@ -288,8 +282,34 @@ if ! grep -q "long-named file TWO" <<<"$OUT"; then
     echo "FAIL: TYPE Y:\\VERY~EB7.TXT (8.3 alias) didn't return file content" >&2
     fail=1
 fi
-# SKIP(MSDOS4): NEWCOPY content / NEWBIG size / RENAMED size — depend on
-# COPY-to-Y file creation, refused by MS-DOS 4 COMMAND.COM (architectural).
+# COPY-from-Y assertion (commit 071ae29 AH=3Bh ChDir intercept).
+if ! grep -F -A2 'COPY Y:\HELLO.TXT A:\HELLO2.TXT' <<<"$OUT" | grep -q '1 File(s) copied'; then
+    echo "FAIL: COPY Y:\\HELLO.TXT A:\\HELLO2.TXT didn't report '1 File(s) copied'" >&2
+    fail=1
+fi
+if ! grep -F -A2 'TYPE A:\HELLO2.TXT (verify COPY-from-Y)' <<<"$OUT" | grep -q "Hello, ext4-dos!"; then
+    echo "FAIL: A:\\HELLO2.TXT contents wrong after COPY-from-Y" >&2
+    fail=1
+fi
+# Single-file DIR Y:\TARGET.TXT — should list the file (was previously broken).
+if ! grep -F -A6 'DIR Y:\TARGET.TXT (single-file)' <<<"$OUT" | grep -qE "TARGET[[:space:]]+TXT[[:space:]]+2[,]?048"; then
+    echo "FAIL: DIR Y:\\TARGET.TXT didn't show TARGET.TXT entry" >&2
+    fail=1
+fi
+# COPY-to-Y assertion — file creation on Y: via COMMAND.COM COPY.
+if ! grep -F -A2 'COPY A:\HELLO2.TXT Y:\NEWCOPY.TXT' <<<"$OUT" | grep -q '1 File(s) copied'; then
+    echo "FAIL: COPY A:\\HELLO2.TXT Y:\\NEWCOPY.TXT didn't report '1 File(s) copied'" >&2
+    fail=1
+fi
+if ! grep -F -A2 'TYPE Y:\NEWCOPY.TXT (verify COPY-to-Y)' <<<"$OUT" | grep -q "Hello, ext4-dos!"; then
+    echo "FAIL: Y:\\NEWCOPY.TXT contents missing after COPY-to-Y" >&2
+    fail=1
+fi
+# EXEC after writes — previously broken; ext4chk run after MD/RD/COPY-to-Y must work.
+if ! grep -F -A4 'ext4chk after writes (EXEC sanity)' <<<"$OUT" | grep -q "TSR detected: AL=0xff"; then
+    echo "FAIL: EXEC of A:\\EXT4CHK.EXE corrupted by prior writes" >&2
+    fail=1
+fi
 # MD Y:\NEWDIR — check it appears in the subsequent DIR Y: listing.
 if ! grep -F -A12 'DIR Y: (NEWDIR must appear)' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
     echo "FAIL: Y:\\NEWDIR not visible in DIR Y: after MD" >&2
@@ -330,17 +350,17 @@ if ! grep -F -A12 'DIR Y: (NEWDIR must be gone' <<<"$OUT" | grep -qE "TARGET[[:s
     echo "FAIL: TARGET.TXT not 2048 bytes in DIR Y: after extend" >&2
     fail=1
 fi
-# Dynamic free-space check: extend consumed exactly one block (1024 bytes).
-# The first DIR Y: reads the install-time snapshot; the last DIR D: comes from
-# the auto-detect re-install which captured a fresh snapshot reflecting the
-# write.  So FINAL == INIT - 1024.
+# Dynamic free-space check: ext4wr's extend + COPY-to-Y's NEWCOPY.TXT create
+# together consume two blocks (2048 bytes).  The first DIR Y: reads the
+# install-time snapshot; the last DIR D: comes from the auto-detect re-install
+# which captured a fresh snapshot reflecting both writes.  So FINAL == INIT - 2048.
 INIT_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | head -1 | sed 's/ bytes free//' | tr -d ',' || true)
 FINAL_FREE=$(grep -oE '[0-9,]+ bytes free' <<<"$OUT" | tail -1 | sed 's/ bytes free//' | tr -d ',' || true)
 if [[ -z "${INIT_FREE:-}" || -z "${FINAL_FREE:-}" ]]; then
     echo "FAIL: couldn't parse 'bytes free' lines from DIR output" >&2
     fail=1
-elif (( FINAL_FREE != INIT_FREE - 1024 )); then
-    echo "FAIL: 'bytes free' wrong (expected $((INIT_FREE - 1024)), got ${FINAL_FREE}) — extend may not be consuming a fs block" >&2
+elif (( FINAL_FREE != INIT_FREE - 2048 )); then
+    echo "FAIL: 'bytes free' wrong (expected $((INIT_FREE - 2048)), got ${FINAL_FREE}) — extend + NEWCOPY.TXT should consume 2 blocks" >&2
     fail=1
 fi
 if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
