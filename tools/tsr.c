@@ -26,6 +26,42 @@
 static uint8_t g_drive_letter = 0;     /* 'A'..'Z'; 0 = uninitialised */
 static uint8_t g_drive_index  = 0;     /* g_drive_letter - 'A' */
 
+/* DOS version quirks — populated at install time from INT 21h AH=30h.
+ *
+ * Each field gates one MS-DOS-4-specific workaround in this TSR. The same
+ * binary works on FreeDOS, MS-DOS 4, MS-DOS 5+, and Windows 9x DOS by
+ * setting different defaults here. Keeping the quirks behind one struct
+ * makes the version-dependent surface area visible in one place rather
+ * than scattered through INT 21h/2Fh handlers.
+ *
+ * Always-on behaviours (multi-version aliases, defensive zeroing of
+ * sf_UID/sf_PID, whole-CDS zeroing) are NOT gated — they're either no-ops
+ * on other DOS versions or harmless extras. Only the workarounds that
+ * would behave differently on different versions live here. */
+struct dos_quirks {
+    uint8_t  major;             /* DOS major version (e.g. 4, 5, 6, 7) */
+    uint8_t  minor;             /* DOS minor version */
+    uint8_t  is_freedos;        /* TRUE if OEM byte (BH) == 0xFD */
+    uint8_t  is_msdos4;         /* TRUE if major == 4 and not FreeDOS */
+    uint16_t cds_flags;         /* curdir_flags to write at install time.
+                                 * MS-DOS 4: 0xC000 (isnet|inuse) — needs both
+                                 *   bits or kernel reports drive-not-present.
+                                 * Others:   0x8000 (isnet) — sufficient. */
+    uint8_t  ioctl_hook;        /* Enable INT 21h AH=44h AL=00h fixup.
+                                 * MS-DOS 4 IOCTL.ASM `ioctl_read` clears the
+                                 * high byte of the device-info word for files,
+                                 * losing the network bit. Other DOS versions
+                                 * report it correctly. */
+    uint8_t  chdir_intercept;   /* Enable INT 21h AH=3Bh ChDir override.
+                                 * MS-DOS 4 $CHDIR → TransPath → FatRead_CDS
+                                 * deref's curdir_devptr (which we leave at
+                                 * 0:0); kernel returns CF=1 AX=3 for every
+                                 * ChDir on Y:, including "Y:\". Other DOS
+                                 * versions don't take this path. */
+};
+
+static struct dos_quirks g_quirks;
+
 #define DOS_ERR_FILE_NOT_FOUND  0x02u
 #define DOS_ERR_PATH_NOT_FOUND  0x03u
 #define DOS_ERR_ACCESS_DENIED   0x05u
@@ -37,10 +73,12 @@ static uint8_t g_drive_index  = 0;     /* g_drive_letter - 'A' */
  * curdir_inuse (slot is live). FreeDOS works with just 0x8000 but MS-DOS 4
  * silently treats isnet-without-inuse as "drive not present", so DIR Y:
  * etc. fall back to the local FAT path and the kernel never calls our
- * redirector. See references/msdos4/v4.0/src/CMD/IFSFUNC/IFSSESS.ASM
+ * redirector. The actual value used at install time comes from
+ * g_quirks.cds_flags (see detect_dos_quirks()), which picks the right one
+ * for the running DOS version. See
+ * references/msdos4/v4.0/src/CMD/IFSFUNC/IFSSESS.ASM
  * (`MOV [SI.curdir_flags], curdir_isnet + curdir_inuse`) and
  * references/msdos4/v4.0/src/INC/CURDIR.INC for the bit definitions. */
-#define CDS_FLAG_REDIRECTED 0xC000u
 #define CDS_ENTRY_SIZE      88
 #define CDS_OFF_PATH        0x00
 #define CDS_OFF_FLAGS       0x43   /* curdir_flags (word) */
@@ -950,7 +988,7 @@ done:
  * IOCTL response shape isn't what blocks it. See run-msdos4-copy-debug.sh
  * for the residual diagnosis (CheckOwner / sf_UID at HANDLE.ASM:766). */
 void __interrupt __far my_int21_handler(union INTPACK r) {
-    if (r.w.ax == 0x4400u && g_fs_ready && g_sft_chain_head && g_sda) {
+    if (g_quirks.ioctl_hook && r.w.ax == 0x4400u && g_fs_ready && g_sft_chain_head && g_sda) {
         uint16_t  cur_psp;
         uint16_t  jft_len;
         uint16_t  jft_off;
@@ -1026,7 +1064,7 @@ found:
      * exist or resolve to a file, we chain through and let the kernel's
      * (accidentally-correct) AX=3 stand. This minimises divergence from
      * stock MS-DOS semantics. */
-    if (r.h.ah == 0x3Bu && g_fs_ready) {
+    if (g_quirks.chdir_intercept && r.h.ah == 0x3Bu && g_fs_ready) {
         uint8_t __far *path = (uint8_t __far *)MK_FP(r.x.ds, r.w.dx);
         uint8_t        c0   = path[0];
         if (c0 >= 'a' && c0 <= 'z') c0 = (uint8_t)(c0 - 0x20);
@@ -2286,6 +2324,30 @@ static char __far *get_lol(void) {
     return (char __far *)MK_FP(s.es, r.w.bx);
 }
 
+/* Probe the running DOS via INT 21h AH=30h and populate g_quirks. Called
+ * once at install time, before any of the gated workarounds can fire. */
+static void detect_dos_quirks(void) {
+    union REGS r;
+    r.h.ah = 0x30u;
+    r.h.al = 0u;
+    intdos(&r, &r);
+    g_quirks.major      = r.h.al;
+    g_quirks.minor      = r.h.ah;
+    g_quirks.is_freedos = (r.h.bh == 0xFDu);
+    g_quirks.is_msdos4  = (r.h.al == 4u) && !g_quirks.is_freedos;
+
+    /* Defaults match FreeDOS / MS-DOS 5+. */
+    g_quirks.cds_flags       = 0x8000u; /* curdir_isnet */
+    g_quirks.ioctl_hook      = 0u;
+    g_quirks.chdir_intercept = 0u;
+
+    if (g_quirks.is_msdos4) {
+        g_quirks.cds_flags       = 0xC000u; /* curdir_isnet | curdir_inuse */
+        g_quirks.ioctl_hook      = 1u;
+        g_quirks.chdir_intercept = 1u;
+    }
+}
+
 static char __far *get_sda(void) {
     union REGS  r;
     struct SREGS s;
@@ -2362,7 +2424,7 @@ static int hook_cds(void) {
     cds[CDS_OFF_PATH + 3] = 0;
 
     *(uint16_t __far *)(cds + CDS_OFF_BACKSLASH) = 2u;
-    *(uint16_t __far *)(cds + CDS_OFF_FLAGS) = CDS_FLAG_REDIRECTED;
+    *(uint16_t __far *)(cds + CDS_OFF_FLAGS) = g_quirks.cds_flags;
 
     g_cds_entry = cds;
     return 0;
@@ -2658,6 +2720,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    detect_dos_quirks();
+    if (!g_quiet) {
+        printf("  DOS    : %u.%u%s%s\n", g_quirks.major, g_quirks.minor,
+               g_quirks.is_freedos ? " (FreeDOS)" : "",
+               g_quirks.is_msdos4 ? " (MS-DOS 4 quirks active)" : "");
+    }
+
     if (hook_cds() != 0) {
         return 1;
     }
@@ -2672,7 +2741,7 @@ int main(int argc, char **argv) {
 
     if (!g_quiet) {
         printf("  drive %c: marked as redirector (flag 0x%04x)\n",
-               g_drive_letter, CDS_FLAG_REDIRECTED);
+               g_drive_letter, g_quirks.cds_flags);
         printf("  SDA at %04x:%04x\n", FP_SEG(g_sda), FP_OFF(g_sda));
         printf("  SFT chain head at %04x:%04x\n",
                FP_SEG(g_sft_chain_head), FP_OFF(g_sft_chain_head));
