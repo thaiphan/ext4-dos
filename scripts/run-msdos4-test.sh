@@ -126,18 +126,32 @@ TYPE Y:\HELLO.TXT >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
 echo === End regression === >> A:\OUT.TXT
 REM SKIP(MSDOS4): DIR Y:\*.TXT wildcard returns no entries on MS-DOS 4.
-REM Diagnosis from EXT4DMP per-call captures:
-REM   PRI_PATH for the wildcard arrives as "Y:????????.???" -- MS-DOS 4 has
-REM   wildcard-expanded the literal ".TXT" extension into "???".  Our
-REM   pattern compile sees all '?'s and treats it as match-all; FindFirst
-REM   returns the first entry (lost+found) which DOS then rejects against
-REM   its own internal pattern check (it knows the user typed *.TXT).  The
-REM   actual FCB-format pattern (????????TXT) is presumably in the SDB at
-REM   SDA+TMP_DM+DM_NAME_PAT but a naive read there returns garbage on the
-REM   first call (DOS doesn't pre-fill it for redirector dispatch).  Need
-REM   either: a heuristic to detect "valid FCB pattern" in SDB, or a parse
-REM   of MS-DOS 4 source's IFS dispatch to find where it stashes the
-REM   literal extension.  FreeDOS preserves it in PRI_PATH and works.
+REM Diagnosis (from EXT4DMP per-call captures + MS-DOS 4 source dive):
+REM
+REM   - PRI_PATH for the wildcard arrives as "Y:????????.???" -- MS-DOS 4
+REM     normalizes BOTH wildcard chars AND literal extension chars to '?'.
+REM     The literal pattern ".TXT" is NOT preserved here.
+REM   - SDA+TMP_DM (offset 0x19E) does not contain the FCB pattern either
+REM     -- reading it returns kernel code bytes (looks like an unrelated
+REM     DOS kernel function in DOSGroup happened to lay there).
+REM   - The DTA pointer at SDA+0x0C also points into kernel code, not at
+REM     a search FCB.
+REM   - The literal pattern is presumably in NAME1 in DOSGroup (per
+REM     SEARCH.ASM:223 TransPathSet), but that's a kernel-internal address
+REM     not exposed to redirectors.
+REM   - FreeDOS takes a different approach: PRI_PATH stays as "Y:\*.*",
+REM     redirector returns ALL entries, COMMAND.COM filters by user
+REM     pattern.  Our pattern compile happens to do the same on FreeDOS
+REM     because pattern_set ends up 0 (match-all).  On MS-DOS 4 the same
+REM     match-all behaviour returns lost+found first; DIR rejects it
+REM     (directory) but apparently doesn't continue iterating.
+REM
+REM   Path forward (not pursued in this session): need to read MS-DOS 4
+REM   COMMAND.COM's DIR-handling code to understand whether it iterates
+REM   FindNext or expects the redirector to filter.  If it expects
+REM   filter: we need access to the literal pattern; might require
+REM   peeking into DOSGroup at NAME1's known offset (fragile).  If it
+REM   iterates: there's a separate bug in our FindNext loop on MS-DOS 4.
 echo === DIR Y:\*.TXT (wildcard) === >> A:\OUT.TXT
 DIR Y:\*.TXT >> A:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> A:\OUT.TXT
