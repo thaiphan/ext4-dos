@@ -125,10 +125,19 @@ TYPE Y:\HELLO.TXT >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
 echo === End regression === >> A:\OUT.TXT
-REM SKIP(MSDOS4): DIR Y:\*.TXT wildcard returns no entries on MS-DOS 4 -- our
-REM FindFirst pattern-matching path doesn't engage here.  Tracked separately;
-REM FreeDOS exercises the same path and works.  Leaving the call so a future
-REM fix can be verified against the same OUT.TXT layout.
+REM SKIP(MSDOS4): DIR Y:\*.TXT wildcard returns no entries on MS-DOS 4.
+REM Diagnosis from EXT4DMP per-call captures:
+REM   PRI_PATH for the wildcard arrives as "Y:????????.???" -- MS-DOS 4 has
+REM   wildcard-expanded the literal ".TXT" extension into "???".  Our
+REM   pattern compile sees all '?'s and treats it as match-all; FindFirst
+REM   returns the first entry (lost+found) which DOS then rejects against
+REM   its own internal pattern check (it knows the user typed *.TXT).  The
+REM   actual FCB-format pattern (????????TXT) is presumably in the SDB at
+REM   SDA+TMP_DM+DM_NAME_PAT but a naive read there returns garbage on the
+REM   first call (DOS doesn't pre-fill it for redirector dispatch).  Need
+REM   either: a heuristic to detect "valid FCB pattern" in SDB, or a parse
+REM   of MS-DOS 4 source's IFS dispatch to find where it stashes the
+REM   literal extension.  FreeDOS preserves it in PRI_PATH and works.
 echo === DIR Y:\*.TXT (wildcard) === >> A:\OUT.TXT
 DIR Y:\*.TXT >> A:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> A:\OUT.TXT

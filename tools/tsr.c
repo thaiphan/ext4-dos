@@ -980,8 +980,9 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
         al = r.h.al;
         g_call_counts[al & 0x3F]++;
 
-        /* Snapshot the first FindFirst call DOS sends us. */
-        if (al == 0x1Bu && !g_ff_capture.valid) {
+        /* Snapshot the first FindFirst call DOS sends us.  MS-DOS 4 uses
+         * AL=0x19 (IFS_SEQ_SEARCH_FIRST); FreeDOS uses AL=0x1B. */
+        if ((al == 0x1Bu || al == 0x19u) && !g_ff_capture.valid) {
             uint8_t __far *src;
             int i;
 
