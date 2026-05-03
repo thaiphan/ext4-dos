@@ -93,6 +93,8 @@ static uint8_t __far *g_sft_chain_head;
 static struct blockdev *g_bdev;
 static struct ext4_fs   g_fs;
 static int              g_fs_ready;
+static char             g_chdir_path_buf[128];
+static struct ext4_inode g_chdir_inode;
 static uint64_t         g_partition_lba;
 static int              g_quiet;  /* -q: suppress install banner (for CONFIG.SYS INSTALL=) */
 
@@ -1000,6 +1002,66 @@ found:
                 r.w.flags &= ~1u;
                 return;
             }
+        }
+    }
+
+    /* AH=3Bh ChDir intercept for our drive — bypass MS-DOS 4 bug.
+     *
+     * MS-DOS 4 $CHDIR → TransPath → FatRead_CDS unconditionally dereferences
+     * curdir_devptr, which we leave at 0:0 (zeroing it is required to
+     * neutralise the IFS corruption — see hook_cds() comment). The kernel
+     * therefore returns CF=1 AX=path_not_found for ANY ChDir on Y:, even
+     * "Y:\" (the root). COMMAND.COM's COPY-from-Y uses
+     * "ChDir(file)→fail / ChDir(parent)→succeed" to detect the source's
+     * parent directory, so both ChDirs failing makes COPY think the parent
+     * doesn't exist and bail silently.
+     *
+     * Workaround: intercept INT 21h AH=3Bh for Y:-prefixed paths, walk
+     * ext4 ourselves, and return success/error matching the directory's
+     * actual existence. This bypasses the kernel's broken path entirely.
+     * Non-Y: paths chain to the original handler unchanged. */
+    if (r.h.ah == 0x3Bu && g_fs_ready) {
+        uint8_t __far *path = (uint8_t __far *)MK_FP(r.x.ds, r.w.dx);
+        uint8_t        c0   = path[0];
+        if (c0 >= 'a' && c0 <= 'z') c0 = (uint8_t)(c0 - 0x20);
+        if (c0 == g_drive_letter && path[1] == ':') {
+            uint32_t        ino;
+            int             j;
+            const uint8_t __far *src = path + 2;
+            g_chdir_path_buf[0] = '/';
+            j = 1;
+            if (*src == '\\' || *src == '/') src++;
+            while (*src && j < (int)sizeof(g_chdir_path_buf) - 1) {
+                char ch = (char)*src;
+                if (ch == '\\') ch = '/';
+                else if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+                g_chdir_path_buf[j++] = ch;
+                src++;
+            }
+            g_chdir_path_buf[j] = 0;
+            /* Strip a trailing slash other than the root "/" itself. */
+            if (j > 1 && g_chdir_path_buf[j - 1] == '/') g_chdir_path_buf[j - 1] = 0;
+
+            ino = (j == 1) ? 2u /* root */
+                           : path_lookup_with_alias(&g_fs, g_chdir_path_buf);
+            if (ino == 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            if (ext4_inode_read(&g_fs, ino, &g_chdir_inode) != 0) {
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            if ((g_chdir_inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
+                /* Not a directory — ChDir Y:\HELLO.TXT path. */
+                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                r.w.flags |= 1u;
+                return;
+            }
+            r.w.flags &= ~1u;
+            return;
         }
     }
 chain:
