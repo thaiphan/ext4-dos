@@ -79,8 +79,14 @@ static uint8_t g_drive_index  = 0;     /* g_drive_letter - 'A' */
 #define SFT_FILE_NAME_OFF       0x20  /* 11 bytes 8.3 */
 
 static void (__interrupt __far *prev_int2f)(void);
+static void (__interrupt __far *prev_int21)(void);
 static char __far *g_cds_entry;
 static char __far *g_sda;
+
+/* SFT chain head (LoL+4, dword far ptr). Cached at install time so the
+ * INT 21h hook can walk handle->JFT->SFT without making any nested
+ * INT calls (LoL access requires INT 21h AH=52h). */
+static uint8_t __far *g_sft_chain_head;
 
 static struct blockdev *g_bdev;
 static struct ext4_fs   g_fs;
@@ -894,6 +900,110 @@ done:
     return result;
 }
 
+/* MS-DOS 4 SFT block layout (per DOS/UTIL.ASM SFFromSFN):
+ *   +0x00 dword  next-block far ptr (or FFFF:FFFF at end)
+ *   +0x04 word   entry count for this block (SFCount)
+ *   +0x06 SFT entries, each 0x3B bytes (SF_Entry size). */
+#define SFT_BLOCK_NEXT_OFF   0x00
+#define SFT_BLOCK_COUNT_OFF  0x04
+#define SFT_BLOCK_ENTRY_OFF  0x06
+#define SFT_ENTRY_SIZE       0x3B
+
+/* INT 21h hook — fixes MS-DOS 4's IOCTL Get Device Info (AH=44h AL=00h)
+ * for redirected files.
+ *
+ * MS-DOS 4 IOCTL.ASM `ioctl_read` (line 292) clears AH, then for files
+ * skips loading the high byte of the device-info word and copies AX
+ * straight to DX:
+ *
+ *     XOR  AH,AH
+ *     TEST AL,devid_device                ; bit 7: file or device?
+ *     JZ   ioctl_no_high                  ; for files, skip
+ *     LES  DI,ES:[DI.sf_devptr]
+ *     MOV  AH,BYTE PTR ES:[DI.SDEVATT+1]
+ *  ioctl_no_high:
+ *     MOV  DX,AX                          ; for files: DX bit 15 = 0
+ *
+ * So DX bit 15 (sf_isnet / network) is never set for files, even ones
+ * that live on a redirected drive. Applications that test DX bit 15 to
+ * decide between an IFS path and the local-FAT path see the wrong answer.
+ *
+ * Workaround: pre-empt AH=44h AL=00h. Walk handle->JFT->SFT MANUALLY
+ * (no nested INT 2Fh from inside INT 21h — see SS!=DS hazard notes
+ * elsewhere in this file): SDA+0x10 -> current PSP, PSP+0x32/+0x34 ->
+ * JFT length / far ptr, JFT[BX] -> SFT index, then walk the SFT chain
+ * (cached at install in g_sft_chain_head). If the SFT matches one of
+ * our open slots, return DX with bit 15 set + drive index in the low
+ * 6 bits — the value the kernel SHOULD have produced. Otherwise chain.
+ *
+ * FreeDOS already returns the correct DX, so this hook is a no-op
+ * there: our slot lookup only matches our own SFTs.
+ *
+ * NOTE: this fix is NECESSARY but not SUFFICIENT to make MS-DOS 4
+ * COMMAND.COM's internal COPY work over a Y:-redirected source.
+ * COPY only tests DL bit 7 (devid_device), not DX bit 15, so the
+ * IOCTL response shape isn't what blocks it. See run-msdos4-copy-debug.sh
+ * for the residual diagnosis (CheckOwner / sf_UID at HANDLE.ASM:766). */
+void __interrupt __far my_int21_handler(union INTPACK r) {
+    if (r.w.ax == 0x4400u && g_fs_ready && g_sft_chain_head && g_sda) {
+        uint16_t  cur_psp;
+        uint16_t  jft_len;
+        uint16_t  jft_off;
+        uint16_t  jft_seg;
+        uint8_t   sft_idx;
+        uint8_t  __far *block;
+        uint16_t  remaining;
+        uint16_t  sft_seg, sft_off;
+        int       i;
+
+        /* Current PSP from SDA+0x10. JFT length at PSP+0x32, JFT far
+         * pointer at PSP+0x34 (dword). */
+        cur_psp = *(uint16_t __far *)(g_sda + 0x10);
+        if (cur_psp == 0) goto chain;
+        jft_len = *(uint16_t __far *)MK_FP(cur_psp, 0x32);
+        if (r.w.bx >= jft_len) goto chain;
+        jft_off = *(uint16_t __far *)MK_FP(cur_psp, 0x34);
+        jft_seg = *(uint16_t __far *)MK_FP(cur_psp, 0x36);
+        sft_idx = *(uint8_t __far *)MK_FP(jft_seg, jft_off + r.w.bx);
+        if (sft_idx == 0xFFu) goto chain;
+
+        /* Walk SFT chain to translate sft_idx into a SFT entry pointer.
+         * Each block has SFCount entries; if idx falls in this block,
+         * compute offset; else subtract count and follow the next ptr. */
+        remaining = (uint16_t)sft_idx;
+        block = g_sft_chain_head;
+        while (block) {
+            uint16_t count = *(uint16_t __far *)(block + SFT_BLOCK_COUNT_OFF);
+            if (remaining < count) {
+                sft_seg = FP_SEG(block);
+                sft_off = (uint16_t)(FP_OFF(block) + SFT_BLOCK_ENTRY_OFF
+                                     + remaining * SFT_ENTRY_SIZE);
+                goto found;
+            }
+            remaining = (uint16_t)(remaining - count);
+            block = *(uint8_t __far * __far *)(block + SFT_BLOCK_NEXT_OFF);
+            if (FP_OFF(block) == 0xFFFFu) break;
+        }
+        goto chain;
+
+found:
+        for (i = 0; i < MAX_OPEN_SLOTS; i++) {
+            if (g_open[i].used &&
+                g_open[i].sft_seg == sft_seg &&
+                g_open[i].sft_off == sft_off) {
+                /* Device-info word: bit 15 = network, bits 0-5 = drive
+                 * index. Same value we wrote into sf_devinfo at open. */
+                r.w.dx = (uint16_t)(0x8000u | (g_drive_index & 0x3Fu));
+                r.w.ax = 0;
+                r.w.flags &= ~1u;
+                return;
+            }
+        }
+    }
+chain:
+    _chain_intr(prev_int21);
+}
+
 void __interrupt __far my_int2f_handler(union INTPACK r) {
     uint8_t al;
 
@@ -950,12 +1060,16 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
      * unhook prevents trampling another TSR's vector). */
     if (r.w.ax == 0x11FBu && r.w.bx == EXT4_DOS_MAGIC_PROBE) {
         void (__interrupt __far *current_2f)(void) = _dos_getvect(0x2F);
+        void (__interrupt __far *current_21)(void) = _dos_getvect(0x21);
         if (FP_SEG(current_2f) != FP_SEG(my_int2f_handler) ||
-            FP_OFF(current_2f) != FP_OFF(my_int2f_handler)) {
+            FP_OFF(current_2f) != FP_OFF(my_int2f_handler) ||
+            FP_SEG(current_21) != FP_SEG(my_int21_handler) ||
+            FP_OFF(current_21) != FP_OFF(my_int21_handler)) {
             r.h.al = 0;
             r.w.flags |= 1u;
             return;
         }
+        _dos_setvect(0x21, prev_int21);
         _dos_setvect(0x2F, prev_int2f);
         if (g_cds_entry) {
             *(uint16_t __far *)(g_cds_entry + CDS_OFF_FLAGS) = 0;
@@ -2478,14 +2592,24 @@ int main(int argc, char **argv) {
 
     g_sda = get_sda();
 
+    /* Cache SFT chain head from LoL+4 (dword far ptr to first SFT block). */
+    {
+        char __far *lol = get_lol();
+        g_sft_chain_head = *(uint8_t __far * __far *)(lol + 0x04);
+    }
+
     if (!g_quiet) {
         printf("  drive %c: marked as redirector (flag 0x%04x)\n",
                g_drive_letter, CDS_FLAG_REDIRECTED);
         printf("  SDA at %04x:%04x\n", FP_SEG(g_sda), FP_OFF(g_sda));
+        printf("  SFT chain head at %04x:%04x\n",
+               FP_SEG(g_sft_chain_head), FP_OFF(g_sft_chain_head));
     }
 
     prev_int2f = _dos_getvect(0x2F);
     _dos_setvect(0x2F, my_int2f_handler);
+    prev_int21 = _dos_getvect(0x21);
+    _dos_setvect(0x21, my_int21_handler);
 
     fflush(stdout);
 

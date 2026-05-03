@@ -156,28 +156,20 @@ echo === DIR Y:\*.TXT (wildcard) === >> A:\OUT.TXT
 DIR Y:\*.TXT >> A:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
-REM SKIP(MSDOS4): COPY Y:\... A:\... -- MS-DOS 4's internal COPY (COPY.ASM
-REM line 595) uses INT 21h AX=6C00h ExtOpen which dispatches to AL=0x2E in
-REM our handler.  ExtOpen succeeds, Get File Times (AX=5700h, served by
-REM kernel from SFT) succeeds, Get XA Size (AX=5702h -> AL=0x2D, we return
-REM CX=0) succeeds.  But the read loop after that NEVER dispatches AL=0x08
-REM REM_READ -- COPY closes the file and bails silently.
+REM SKIP(MSDOS4): COPY Y:\... A:\... -- COMMAND.COM's internal COPY bails
+REM between IOCTL and Read.  Heavy-debugger trace (see
+REM scripts/run-msdos4-copy-debug.sh) suggests HANDLE.ASM:CheckOwner
+REM (line 766) returns CF=1 because sf_UID in the SFT doesn't match the
+REM caller's User_ID.  REM_OPEN doesn't currently set sf_UID at offset
+REM 0x2F; the pre-existing kernel value is stale relative to COMMAND.COM.
+REM An ext4prb /c probe (which mimics COPY's flow from a STANDALONE EXE)
+REM completes successfully, confirming the REM_* path is correct.
 REM
-REM Comparison with FreeDOS COPY (works): uses AL=0x16 (regular Open) +
-REM AL=0x0F (GetAttrs) + AL=0x08 (Read) + AL=0x06 (Close).  All counts
-REM increment correctly.
-REM
-REM Diagnosed against MS-DOS 4 source (DISK.ASM:DOS_READ + IOCTL.ASM:
-REM ioctl_read).  SFT setup at our REM_OPEN return looks correct
-REM (sf_mode=0=read, sf_isnet=1, ref_count=1, sf_attr=0).  IOCTL Get
-REM Device Info should return DL & 0x80 = 0 -> "not a device", which
-REM should funnel COPY into the read loop.  But the read never happens.
-REM
-REM Path forward (not pursued in this session): heavy-debugger trace from
-REM the AX=6C00h ExtOpen return through to the supposed AH=3Fh Read in
-REM COPY.ASM:COPYLP -- something between is silently aborting the copy.
-REM Could be IOCTL returning an unexpected value, COPY's internal buffer
-REM allocation failing, or some other ExtOpen-specific check.
+REM Tools/tsr.c does hook INT 21h AH=44h AL=00h to fix MS-DOS 4's
+REM IOCTL.ASM:ioctl_read kernel bug (XOR AH,AH then MOV DX,AX leaves
+REM DX bit 15 / sf_isnet always 0 for files).  The hook walks handle->
+REM JFT->SFT and returns DX with bit 15 + drive index.  Verified via
+REM ext4prb but doesn't unblock COPY -- COPY only tests DL bit 7 (device).
 echo === Write test: Y:\TARGET.TXT before === >> A:\OUT.TXT
 TYPE Y:\TARGET.TXT >> A:\OUT.TXT
 echo --- run ext4wr (in-place B + extend C) --- >> A:\OUT.TXT

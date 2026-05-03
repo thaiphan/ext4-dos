@@ -73,18 +73,11 @@ printf 'LASTDRIVE=Z\r\nINSTALL=A:\\EXT4.EXE -q 0x81 Y:\r\n' > "$MSDOS4_DIR/confi
 
 cat > "$MSDOS4_DIR/autoexec.bat.tmp" <<'EOF'
 @echo off
-echo === BASELINE: ext4prb /c (works correctly) ===
-A:\EXT4PRB.EXE /c
-echo === DROPPING INTO DEBUGGER NOW ===
+echo === DROPPING INTO DEBUGGER (set breakpoints, then F5 to run COPY) ===
 A:\EXT4CHK.EXE /B
-echo --- after debugger break ---
-echo === REPRO: actual COPY (broken) ===
+echo === COPY runs after debugger continues ===
 COPY Y:\HELLO.TXT A:\HELLO2.TXT
-echo --- after copy ---
-A:\EXT4DMP.EXE
-echo --- counts ---
-A:\EXT4CNT.EXE
-echo === DONE ===
+echo === COPY done ===
 A:\FDAPM.COM POWEROFF
 EOF
 awk 'BEGIN{ORS="\r\n"} {print}' "$MSDOS4_DIR/autoexec.bat.tmp" > "$MSDOS4_DIR/autoexec.bat"
