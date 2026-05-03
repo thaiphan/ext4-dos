@@ -156,20 +156,21 @@ echo === DIR Y:\*.TXT (wildcard) === >> A:\OUT.TXT
 DIR Y:\*.TXT >> A:\OUT.TXT
 echo === TYPE Y:\HELLO.TXT === >> A:\OUT.TXT
 TYPE Y:\HELLO.TXT >> A:\OUT.TXT
-REM SKIP(MSDOS4): COPY Y:\... A:\... -- COMMAND.COM's internal COPY bails
-REM between IOCTL and Read.  Heavy-debugger trace (see
-REM scripts/run-msdos4-copy-debug.sh) suggests HANDLE.ASM:CheckOwner
-REM (line 766) returns CF=1 because sf_UID in the SFT doesn't match the
-REM caller's User_ID.  REM_OPEN doesn't currently set sf_UID at offset
-REM 0x2F; the pre-existing kernel value is stale relative to COMMAND.COM.
-REM An ext4prb /c probe (which mimics COPY's flow from a STANDALONE EXE)
-REM completes successfully, confirming the REM_* path is correct.
+REM SKIP(MSDOS4): COPY Y:\... A:\... -- COMMAND.COM's internal COPY
+REM produces no output (no "0 file(s) copied", no source name) and no
+REM HELLO2.TXT is created.  Standalone ext4prb /c (which mimics COPY's
+REM exact INT 21h sequence: ExtOpen + GetTimes + GetXASize + IOCTL +
+REM Read) succeeds, so the redirector path itself is fine.  Ruled out:
 REM
-REM Tools/tsr.c does hook INT 21h AH=44h AL=00h to fix MS-DOS 4's
-REM IOCTL.ASM:ioctl_read kernel bug (XOR AH,AH then MOV DX,AX leaves
-REM DX bit 15 / sf_isnet always 0 for files).  The hook walks handle->
-REM JFT->SFT and returns DX with bit 15 + drive index.  Verified via
-REM ext4prb but doesn't unblock COPY -- COPY only tests DL bit 7 (device).
+REM   * IOCTL DX bit 15 (sf_isnet) -- COPY only tests DL bit 7.
+REM   * sf_UID/sf_PID at SFT offsets 0x2F/0x31 -- now zeroed at REM_OPEN
+REM     to match kernel SFNFree convention; doesn't change COPY behavior.
+REM
+REM Open succeeds (Open count +1 during COPY), IOCTL hook fires once on
+REM the source handle, but no Read or Close from COPY follow.  Something
+REM specific to COMMAND.COM's COPY-internal context (vs a standalone EXE
+REM doing identical INT 21h calls) blocks it.  Needs heavy-debugger trace
+REM to identify -- see scripts/run-msdos4-copy-debug.sh.
 echo === Write test: Y:\TARGET.TXT before === >> A:\OUT.TXT
 TYPE Y:\TARGET.TXT >> A:\OUT.TXT
 echo --- run ext4wr (in-place B + extend C) --- >> A:\OUT.TXT

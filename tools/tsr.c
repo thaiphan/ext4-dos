@@ -67,7 +67,7 @@ static uint8_t g_drive_index  = 0;     /* g_drive_letter - 'A' */
 #define DIR_START_OFF       26
 #define DIR_SIZE_OFF        28     /* 4 bytes */
 
-/* SFT offsets (DOS 4+) per RBIL */
+/* SFT offsets (DOS 4+) per RBIL and references/msdos4/v4.0/src/INC/SF.INC */
 #define SFT_REF_COUNT_OFF       0x00  /* word: number of handles referencing */
 #define SFT_OPEN_MODE_OFF       0x02  /* word: open mode (low byte = access) */
 #define SFT_FILE_ATTR_OFF       0x04  /* byte */
@@ -77,6 +77,8 @@ static uint8_t g_drive_index  = 0;     /* g_drive_letter - 'A' */
 #define SFT_FILE_SIZE_OFF       0x11  /* dword */
 #define SFT_FILE_POSITION_OFF   0x15  /* dword */
 #define SFT_FILE_NAME_OFF       0x20  /* 11 bytes 8.3 */
+#define SFT_UID_OFF             0x2F  /* word: owner User_ID for CheckOwner */
+#define SFT_PID_OFF             0x31  /* word: owner Proc_ID for CheckOwner */
 
 static void (__interrupt __far *prev_int2f)(void);
 static void (__interrupt __far *prev_int21)(void);
@@ -1564,6 +1566,12 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             }
             *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF)     = 0u;
             *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = 0u;
+            /* sf_UID/sf_PID must match kernel User_ID/Proc_ID for
+             * CheckOwner (HANDLE.ASM:766) to accept the handle on
+             * AX=5700h GetTimes / AH=3Fh Read. Both default to 0 on
+             * non-shared MS-DOS 4 (CONST2.ASM:131-132). */
+            *(uint16_t __far *)(sft + SFT_UID_OFF) = 0u;
+            *(uint16_t __far *)(sft + SFT_PID_OFF) = 0u;
 
             /* SFT-pointer diagnosis: snapshot what DOS handed us + what we
              * wrote back, so a later REM_WRITE that misses the slot can
@@ -1685,6 +1693,8 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                     }
                     *(uint32_t __far *)(sft_eo + SFT_FILE_SIZE_OFF)     = 0u;
                     *(uint32_t __far *)(sft_eo + SFT_FILE_POSITION_OFF) = 0u;
+                    *(uint16_t __far *)(sft_eo + SFT_UID_OFF) = 0u;
+                    *(uint16_t __far *)(sft_eo + SFT_PID_OFF) = 0u;
                     r.w.cx = 2u; /* action taken: file created */
                     r.w.flags &= ~1u;
                     return;
@@ -1753,6 +1763,9 @@ extopen_notfound:
             *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF) =
                 (uint32_t)slot->inode.size;
             *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = 0;
+            /* sf_UID/sf_PID — see comment at the REM_CREATE site above. */
+            *(uint16_t __far *)(sft + SFT_UID_OFF) = 0u;
+            *(uint16_t __far *)(sft + SFT_PID_OFF) = 0u;
 
             /* For AX=6C00h Extended Open dispatch (AL=0x2E), DOS expects
              * CX = "action taken" on success (1 = opened existing,
