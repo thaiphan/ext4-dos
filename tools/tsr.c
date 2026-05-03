@@ -27,6 +27,7 @@ static uint8_t g_drive_letter = 0;     /* 'A'..'Z'; 0 = uninitialised */
 static uint8_t g_drive_index  = 0;     /* g_drive_letter - 'A' */
 
 #define DOS_ERR_FILE_NOT_FOUND  0x02u
+#define DOS_ERR_PATH_NOT_FOUND  0x03u
 #define DOS_ERR_ACCESS_DENIED   0x05u
 #define DOS_ERR_NO_MORE_FILES   0x12u
 #define DOS_ERR_WRITE_PROTECT   0x13u
@@ -1005,21 +1006,26 @@ found:
         }
     }
 
-    /* AH=3Bh ChDir intercept for our drive — bypass MS-DOS 4 bug.
+    /* AH=3Bh ChDir intercept for our drive — surgical fix for one MS-DOS 4 bug.
      *
      * MS-DOS 4 $CHDIR → TransPath → FatRead_CDS unconditionally dereferences
-     * curdir_devptr, which we leave at 0:0 (zeroing it is required to
-     * neutralise the IFS corruption — see hook_cds() comment). The kernel
-     * therefore returns CF=1 AX=path_not_found for ANY ChDir on Y:, even
-     * "Y:\" (the root). COMMAND.COM's COPY-from-Y uses
-     * "ChDir(file)→fail / ChDir(parent)→succeed" to detect the source's
-     * parent directory, so both ChDirs failing makes COPY think the parent
-     * doesn't exist and bail silently.
+     * curdir_devptr, which is 0:0 because hook_cds() zeroes the whole 88-byte
+     * CDS slot to neutralise the IFS corruption from a stale curdir_ifs_hdr.
+     * The kernel reads physical address 0, gets garbage, and TransPath returns
+     * CF=1 AX=path_not_found for *every* ChDir on Y: — including "Y:\\".
      *
-     * Workaround: intercept INT 21h AH=3Bh for Y:-prefixed paths, walk
-     * ext4 ourselves, and return success/error matching the directory's
-     * actual existence. This bypasses the kernel's broken path entirely.
-     * Non-Y: paths chain to the original handler unchanged. */
+     * COMMAND.COM's COPY-from-Y detects the source's parent directory by
+     * "ChDir(file)→fail / ChDir(parent)→succeed".  It RELIES on ChDir(file)
+     * returning path-not-found — that's how it learns the file isn't a dir.
+     * The kernel actually does return AX=3 for ChDir(file) correctly here
+     * (just for the wrong reason). The bug is only that ChDir("Y:\\") *also*
+     * returns AX=3 when it should be CF=0.
+     *
+     * Therefore we ONLY intercept the cases that the kernel gets wrong:
+     * paths that DO resolve to a directory in ext4. For paths that don't
+     * exist or resolve to a file, we chain through and let the kernel's
+     * (accidentally-correct) AX=3 stand. This minimises divergence from
+     * stock MS-DOS semantics. */
     if (r.h.ah == 0x3Bu && g_fs_ready) {
         uint8_t __far *path = (uint8_t __far *)MK_FP(r.x.ds, r.w.dx);
         uint8_t        c0   = path[0];
@@ -1039,29 +1045,20 @@ found:
                 src++;
             }
             g_chdir_path_buf[j] = 0;
-            /* Strip a trailing slash other than the root "/" itself. */
             if (j > 1 && g_chdir_path_buf[j - 1] == '/') g_chdir_path_buf[j - 1] = 0;
 
             ino = (j == 1) ? 2u /* root */
                            : path_lookup_with_alias(&g_fs, g_chdir_path_buf);
-            if (ino == 0) {
-                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
-                r.w.flags |= 1u;
+            if (ino != 0 &&
+                ext4_inode_read(&g_fs, ino, &g_chdir_inode) == 0 &&
+                (g_chdir_inode.mode & EXT4_S_IFMT) == EXT4_S_IFDIR) {
+                /* This path IS a directory in ext4 → kernel's AX=3 would
+                 * be wrong → override with success. */
+                r.w.flags &= ~1u;
                 return;
             }
-            if (ext4_inode_read(&g_fs, ino, &g_chdir_inode) != 0) {
-                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
-                r.w.flags |= 1u;
-                return;
-            }
-            if ((g_chdir_inode.mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
-                /* Not a directory — ChDir Y:\HELLO.TXT path. */
-                r.w.ax = DOS_ERR_FILE_NOT_FOUND;
-                r.w.flags |= 1u;
-                return;
-            }
-            r.w.flags &= ~1u;
-            return;
+            /* Path doesn't exist or isn't a directory. Chain to kernel —
+             * its accidental AX=3 is the right answer here. */
         }
     }
 chain:
