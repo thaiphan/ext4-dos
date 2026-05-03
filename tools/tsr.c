@@ -2053,17 +2053,28 @@ extopen_notfound:
                                                werr, sizeof werr);
                 }
             } else if (pos == file_size && (pos & (bs - 1u)) == 0u) {
-                /* Append at EOF — may be partial (count < bs).
-                 * Zero-pad g_write_buf beyond count bytes; extend_block
-                 * writes the full block but inode.size advances by count. */
-                {
-                    uint16_t z;
-                    for (z = count; z < bs; z++) g_write_buf[z] = 0u;
-                }
+                /* Append at EOF — count may be >bs (MS-DOS 4 COPY emits a
+                 * single 2048-byte extend) or <bs (last partial block).
+                 * Loop one block at a time: each call to extend_block
+                 * allocates one new block and advances inode.size by the
+                 * bytes-supplied. The g_write_buf scratch is bs-sized. */
+                uint32_t blk_off = 0u;
                 g_ff_capture.last_write_was_extend = 1u;
-                rc = ext4_file_extend_block(&g_fs, &slot->inode, slot->inode_num,
-                                            g_write_buf, (uint32_t)count, now_unix,
-                                            werr, sizeof werr);
+                rc = 0;
+                while (blk_off < (uint32_t)count && rc == 0) {
+                    uint32_t remaining = (uint32_t)count - blk_off;
+                    uint32_t this_ext  = (remaining > bs) ? bs : remaining;
+                    uint16_t k;
+                    for (k = 0; k < (uint16_t)this_ext; k++)
+                        g_write_buf[k] = user_buf[(uint16_t)blk_off + k];
+                    /* Zero-pad the tail of the final partial block. */
+                    for (k = (uint16_t)this_ext; k < (uint16_t)bs; k++)
+                        g_write_buf[k] = 0u;
+                    rc = ext4_file_extend_block(&g_fs, &slot->inode, slot->inode_num,
+                                                g_write_buf, this_ext, now_unix,
+                                                werr, sizeof werr);
+                    blk_off += this_ext;
+                }
             } else {
                 /* Sparse-hole or non-contiguous extend. */
                 g_ff_capture.last_write_rc = -42;
