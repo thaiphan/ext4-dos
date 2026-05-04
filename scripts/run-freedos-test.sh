@@ -27,7 +27,7 @@ if [[ ! -f "$EXT4_SRC_IMG" ]]; then
 fi
 
 
-for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe ext4wr.exe ext4xfr.exe ext4tr.exe; do
+for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe ext4wr.exe ext4xfr.exe ext4tr.exe ext4mv.exe; do
     if [[ ! -x "$DOS_DIR/$f" ]]; then
         echo "ERROR: $DOS_DIR/$f missing. Run: make dos-build" >&2
         exit 1
@@ -99,6 +99,12 @@ echo === Truncate-down: ext4tr Y:\RENAMED.TXT to 100 bytes === >> C:\OUT.TXT
 C:\EXT4TR.EXE Y:\RENAMED.TXT 100 >> C:\OUT.TXT
 echo === DIR Y:\RENAMED.TXT (expect size 100 after truncate) === >> C:\OUT.TXT
 DIR Y:\RENAMED.TXT >> C:\OUT.TXT
+echo === Cross-dir REN: Y:\RENAMED.TXT -> Y:\SUBDIR\MOVED.TXT === >> C:\OUT.TXT
+C:\EXT4MV.EXE Y:\RENAMED.TXT Y:\SUBDIR\MOVED.TXT >> C:\OUT.TXT
+echo === TYPE Y:\SUBDIR\MOVED.TXT (verify content survived move) === >> C:\OUT.TXT
+TYPE Y:\SUBDIR\MOVED.TXT >> C:\OUT.TXT
+echo === DIR Y:\RENAMED.TXT (must NOT exist in root) === >> C:\OUT.TXT
+DIR Y:\RENAMED.TXT >> C:\OUT.TXT
 echo === Make directory: MD Y:\NEWDIR === >> C:\OUT.TXT
 MD Y:\NEWDIR >> C:\OUT.TXT
 echo === DIR Y:\NEWDIR (must exist) === >> C:\OUT.TXT
@@ -147,6 +153,7 @@ mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4dmp.exe" ::EXT4DMP.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4wr.exe"  ::EXT4WR.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4xfr.exe" ::EXT4XFR.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4tr.exe"  ::EXT4TR.EXE
+mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4mv.exe"  ::EXT4MV.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$FREEDOS_DIR/fdauto-test.bat" ::FDAUTO.BAT
 
 # Boot in DOSBox-X, then kill after timeout (poweroff doesn't exit DOSBox-X).
@@ -256,6 +263,19 @@ if ! grep -qE "Truncated 'Y:.RENAMED.TXT' to 100 bytes" <<<"$OUT"; then
 fi
 if ! grep -F -A6 'DIR Y:\RENAMED.TXT (expect size 100' <<<"$OUT" | grep -qE "RENAMED[[:space:]]+TXT[[:space:]]+100"; then
     echo "FAIL: Y:\\RENAMED.TXT not size 100 after truncate-down" >&2
+    fail=1
+fi
+# Cross-dir REN: ext4mv reports success; MOVED.TXT now in SUBDIR; RENAMED.TXT gone from root.
+if ! grep -qE "Renamed 'Y:.RENAMED.TXT' -> 'Y:.SUBDIR.MOVED.TXT'" <<<"$OUT"; then
+    echo "FAIL: ext4mv didn't report cross-dir rename success" >&2
+    fail=1
+fi
+if ! grep -F -A2 'TYPE Y:\SUBDIR\MOVED.TXT (verify content' <<<"$OUT" | grep -qE "BBBBBBBBBB"; then
+    echo "FAIL: Y:\\SUBDIR\\MOVED.TXT TYPE didn't return content (truncate-down kept first 100 'B' bytes)" >&2
+    fail=1
+fi
+if grep -F -A6 'DIR Y:\RENAMED.TXT (must NOT exist' <<<"$OUT" | grep -qE "RENAMED[[:space:]]+TXT"; then
+    echo "FAIL: Y:\\RENAMED.TXT still in root after cross-dir REN" >&2
     fail=1
 fi
 # Direct INT 2Fh AX=11A3h must return data consistent with the install-time

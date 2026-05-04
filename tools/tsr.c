@@ -1456,17 +1456,10 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                     return;
                 }
             }
-            /* Extract dest basename and verify it's same parent. */
+            /* Extract dest basename. */
             base_dst = 0;
             for (p = 0; dst_path[p]; p++)
                 if (dst_path[p] == '/') base_dst = p + 1;
-            /* Only same-parent renames supported for now. */
-            if (base_dst != base_src ||
-                memcmp(src_path, dst_path, (unsigned)base_src) != 0) {
-                r.w.ax = DOS_ERR_WRITE_PROTECT; /* cross-dir: not supported */
-                r.w.flags |= 1u;
-                return;
-            }
             /* Refuse if dest already exists. */
             if (path_lookup_with_alias(&g_fs, dst_path) != 0) {
                 r.w.ax = 5u; /* ACCESS_DENIED */
@@ -1484,11 +1477,39 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                 new_name[j] = dst_path[base_dst + j];
             new_name[j] = '\0';
             werr[0] = '\0';
-            if (ext4_rename(&g_fs, parent_ino, file_ino,
-                            new_name, nm_len, werr, sizeof werr) != 0) {
-                r.w.ax = DOS_ERR_WRITE_PROTECT;
-                r.w.flags |= 1u;
-                return;
+            if (base_dst == base_src &&
+                memcmp(src_path, dst_path, (unsigned)base_src) == 0) {
+                /* Same parent — in-place name update. */
+                if (ext4_rename(&g_fs, parent_ino, file_ino,
+                                new_name, nm_len, werr, sizeof werr) != 0) {
+                    r.w.ax = DOS_ERR_WRITE_PROTECT;
+                    r.w.flags |= 1u;
+                    return;
+                }
+            } else {
+                /* Cross-directory: resolve new parent and call xdir variant. */
+                static char new_parent_path[128];
+                uint32_t    new_parent_ino;
+                if (base_dst <= 1) {
+                    new_parent_ino = 2u; /* dest is in root */
+                } else {
+                    for (j = 0; j + 1 < base_dst && j < 127; j++)
+                        new_parent_path[j] = dst_path[j];
+                    new_parent_path[j] = '\0';
+                    new_parent_ino = ext4_path_lookup(&g_fs, new_parent_path);
+                    if (new_parent_ino == 0) {
+                        r.w.ax = 3u; /* PATH_NOT_FOUND */
+                        r.w.flags |= 1u;
+                        return;
+                    }
+                }
+                if (ext4_rename_xdir(&g_fs, parent_ino, file_ino,
+                                     new_parent_ino, new_name, nm_len,
+                                     0x6A000000u, werr, sizeof werr) != 0) {
+                    r.w.ax = DOS_ERR_WRITE_PROTECT;
+                    r.w.flags |= 1u;
+                    return;
+                }
             }
             r.w.flags &= ~1u;
             return;

@@ -94,16 +94,12 @@ int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
  * inodes) so a crash never leaves the file orphaned or double-linked.
  * Refuses directories (would also need ".." update + link counts),
  * htree parents, and multi-block dirs. Caller must ensure the
- * destination name doesn't already exist. Returns 0 on success.
- *
- * Not compiled in DOS small-model builds — see extent.c. */
-#ifndef __DOS__
+ * destination name doesn't already exist. Returns 0 on success. */
 int ext4_rename_xdir(struct ext4_fs *fs,
                      uint32_t old_parent_ino, uint32_t file_ino,
                      uint32_t new_parent_ino, const char *new_name,
                      uint8_t  new_name_len, uint32_t now_unix,
                      char *err, uint32_t err_len);
-#endif
 
 /* Remove a regular file from parent_ino.  Frees each data block (one
  * 3-block journal transaction per block), then frees the inode + removes

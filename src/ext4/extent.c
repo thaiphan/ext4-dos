@@ -35,6 +35,21 @@ static uint8_t scratch_parent_dir   [EXT4_WRITE_BUF_SIZE]; /* parent dir block (
 static uint8_t scratch_parent_inode [EXT4_WRITE_BUF_SIZE]; /* parent inode block (mkdir) */
 static struct ext4_jbd_trans scratch_trans;
 
+/* Forward decls for static helpers used before their definition. */
+static void inode_set_mtime_and_csum(const struct ext4_fs *fs, uint32_t ino,
+                                     uint8_t *inode_bytes, uint32_t now_unix);
+static void sb_recompute_csum(const struct ext4_fs *fs, uint8_t *sb);
+static int  dir_find_entry_by_inode(const uint8_t *blk, uint32_t bs,
+                                    uint32_t target_ino);
+static int  dir_find_slot_for_entry(uint8_t *blk, uint32_t bs,
+                                    uint32_t need_rec);
+static void bgd_finalize_block_bitmap_csums(const struct ext4_fs *fs,
+                                            uint32_t group, uint8_t *be,
+                                            const uint8_t *bitmap);
+static void bgd_finalize_inode_bitmap_csums(const struct ext4_fs *fs,
+                                            uint32_t group, uint8_t *be,
+                                            const uint8_t *bitmap);
+
 int ext4_extent_lookup(struct ext4_fs *fs, const uint8_t *initial_node,
                        uint32_t logical, uint64_t *out_phys) {
     static uint8_t node_buf[EXT4_EXT_NODE_BUF];
@@ -179,18 +194,9 @@ int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     }
 
     /* Bump mtime in the inode (offset 0x10 within the inode, LE). */
-    {
-        uint8_t *p = scratch_inode_block + offset_in_block + 0x10;
-        p[0] = (uint8_t) now_unix;
-        p[1] = (uint8_t)(now_unix >>  8);
-        p[2] = (uint8_t)(now_unix >> 16);
-        p[3] = (uint8_t)(now_unix >> 24);
-    }
-
-    /* Recompute the inode-level checksum (no-op if metadata_csum is
-     * off). Must come after every other byte change to the inode —
-     * mtime above, plus any future writes that touch other fields. */
-    ext4_inode_recompute_csum(fs, inode_num, scratch_inode_block + offset_in_block);
+    /* mtime + i_checksum (must be last in-inode write). */
+    inode_set_mtime_and_csum(fs, inode_num,
+                             scratch_inode_block + offset_in_block, now_unix);
 
     /* Copy caller's new data into DGROUP so the multi-step commit doesn't
      * hold a FAR pointer alive across BIOS calls. */
@@ -301,26 +307,152 @@ static uint32_t dir_block_csum(const struct ext4_fs *fs, uint32_t parent_ino,
     return crc;
 }
 
+/* DGROUP-resident output cells for the dir-walk helpers.  Returning via
+ * out-pointers to caller-stack locals would break in TSR interrupt
+ * context (SS != DS, the near pointer hits the wrong segment).  These
+ * statics live in DGROUP, so writes from the helper land in the same
+ * segment the caller reads from. */
+static uint32_t s_dir_slot_off;
+static uint32_t s_dir_entry_off;
+static uint32_t s_dir_prev_off;
+
+/* Find a slot in `blk` (a directory block, `bs` bytes) with at least
+ * `need_rec` bytes of free space after the existing entry's real size.
+ * On success: returns 1, writes s_dir_slot_off (where the new entry
+ * goes, = `predecessor_off + predecessor_real_sz`), and TRUNCATES the
+ * predecessor's rec_len to its real size in `blk` so the caller can
+ * just write the new entry at s_dir_slot_off and set its rec_len to
+ * fill the rest of the slot.  Returns 0 if no slot fits. */
+static int dir_find_slot_for_entry(uint8_t *blk, uint32_t bs,
+                                   uint32_t need_rec) {
+    uint32_t off = 0;
+    while (off + 8u <= bs) {
+        uint16_t rec = le16(blk + off + 4);
+        uint8_t  nl  = blk[off + 6];
+        uint32_t ino = le32(blk + off);
+        uint32_t real_sz;
+        if (rec < 8u || rec > bs - off) return 0;
+        if (blk[off+7] == 0xDEu && rec == 12u && ino == 0u) {
+            off += rec; continue;
+        }
+        real_sz = (ino != 0u) ? ((8u + nl + 3u) & ~(uint32_t)3u) : 0u;
+        if (rec >= real_sz + need_rec) {
+            s_dir_slot_off = off + real_sz;
+            if (ino != 0u) {
+                blk[off + 4] = (uint8_t) real_sz;
+                blk[off + 5] = (uint8_t)(real_sz >> 8);
+            }
+            return 1;
+        }
+        off += rec;
+    }
+    return 0;
+}
+
+/* Walk a directory block looking for the entry with the given inode.
+ * Returns 1 on found and writes s_dir_entry_off (start of entry) +
+ * s_dir_prev_off (start of preceding entry, or 0xFFFFFFFFu if
+ * `target_ino` is the first non-sentinel entry). Returns 0 if the
+ * entry is missing. `bs` is the dir block size. */
+static int dir_find_entry_by_inode(const uint8_t *blk, uint32_t bs,
+                                   uint32_t target_ino) {
+    uint32_t off = 0, prev = 0xFFFFFFFFu;
+    while (off + 8u <= bs) {
+        uint16_t rec = le16(blk + off + 4);
+        uint32_t ino = le32(blk + off);
+        if (rec < 8u || rec > bs - off) return 0;
+        if (blk[off+7] == 0xDEu && rec == 12u && ino == 0u) {
+            off += rec; continue;
+        }
+        if (ino == target_ino) {
+            s_dir_entry_off = off; s_dir_prev_off = prev; return 1;
+        }
+        prev = off; off += rec;
+    }
+    return 0;
+}
+
+/* Stamp the block-bitmap checksum into a BGD entry's block-bitmap-csum
+ * fields (low at 0x18, high at 0x38 if bgd_size >= 64), then recompute
+ * the BGD entry's own checksum.  Call AFTER all other BGD-entry field
+ * writes; the entry csum is over all earlier fields. */
+static void bgd_finalize_block_bitmap_csums(const struct ext4_fs *fs,
+                                            uint32_t group, uint8_t *be,
+                                            const uint8_t *bitmap) {
+    uint32_t bcs = bitmap_compute_csum(fs, bitmap);
+    uint16_t bc;
+    be[0x18] = (uint8_t)bcs; be[0x19] = (uint8_t)(bcs >> 8);
+    if (fs->bgd_size >= 64u) {
+        be[0x38] = (uint8_t)(bcs >> 16); be[0x39] = (uint8_t)(bcs >> 24);
+    }
+    bc = bgd_compute_csum(fs, group, be);
+    be[0x1E] = (uint8_t)bc; be[0x1F] = (uint8_t)(bc >> 8);
+}
+
+/* Same but for inode-bitmap-csum fields (low at 0x1A, high at 0x3A). */
+static void bgd_finalize_inode_bitmap_csums(const struct ext4_fs *fs,
+                                            uint32_t group, uint8_t *be,
+                                            const uint8_t *bitmap) {
+    uint32_t ics = inode_bitmap_csum(fs, bitmap);
+    uint16_t bc;
+    be[0x1A] = (uint8_t)ics; be[0x1B] = (uint8_t)(ics >> 8);
+    if (fs->bgd_size >= 64u) {
+        be[0x3A] = (uint8_t)(ics >> 16); be[0x3B] = (uint8_t)(ics >> 24);
+    }
+    bc = bgd_compute_csum(fs, group, be);
+    be[0x1E] = (uint8_t)bc; be[0x1F] = (uint8_t)(bc >> 8);
+}
+
+/* Recompute the SB checksum after modifying any SB fields.  No-op if
+ * metadata_csum isn't enabled.  `sb` points at the SB at its in-block
+ * offset (typically `scratch_sb + sb_offset_in_block`). */
+static void sb_recompute_csum(const struct ext4_fs *fs, uint8_t *sb) {
+    uint32_t cs;
+    if (!(fs->sb.feature_ro_compat & 0x400u)) return;
+    sb[0x3FC] = sb[0x3FD] = 0; sb[0x3FE] = sb[0x3FF] = 0;
+    cs = crc32c(CRC32C_INIT, sb, 0x3FC);
+    sb[0x3FC] = (uint8_t) cs; sb[0x3FD] = (uint8_t)(cs >>  8);
+    sb[0x3FE] = (uint8_t)(cs >> 16); sb[0x3FF] = (uint8_t)(cs >> 24);
+}
+
+/* Stamp `now_unix` into i_mtime and recompute the inode-level csum.
+ * Caller passes the pointer to the inode's bytes WITHIN the FS-block
+ * buffer (typically `block + offset_in_block`).  Use this only when
+ * mtime is the LAST inode-field change; for callers that also bump
+ * link count (mkdir/rmdir) or other fields, write those first then
+ * call this last. */
+static void inode_set_mtime_and_csum(const struct ext4_fs *fs, uint32_t ino,
+                                     uint8_t *inode_bytes, uint32_t now_unix) {
+    inode_bytes[0x10] = (uint8_t) now_unix;
+    inode_bytes[0x11] = (uint8_t)(now_unix >>  8);
+    inode_bytes[0x12] = (uint8_t)(now_unix >> 16);
+    inode_bytes[0x13] = (uint8_t)(now_unix >> 24);
+    ext4_inode_recompute_csum(fs, ino, inode_bytes);
+}
+
+/* DGROUP-resident outputs from read_inode_block — see s_dir_* above for
+ * the same SS!=DS rationale. Caller reads these after a successful
+ * call. */
+static uint64_t s_inode_fs_block;
+static uint32_t s_inode_offset;
+static uint32_t s_inode_gen;
+
 /* Compute the location of inode `ino`'s on-disk slot, read the FS block
- * holding it into `buf`, and (optionally) return the generation field.
- * Used when we need to write the inode back through the journal — caller
- * subsequently modifies bytes at `buf + offset_in_block` and includes
- * `fs_block` in the transaction. */
-static int read_inode_block(struct ext4_fs *fs, uint32_t ino, uint8_t *buf,
-                            uint64_t *out_fs_block, uint32_t *out_offset,
-                            uint32_t *out_gen) {
+ * holding it into `buf`, and (always) populate s_inode_fs_block,
+ * s_inode_offset, and s_inode_gen.  Caller subsequently modifies bytes
+ * at `buf + s_inode_offset` and includes `s_inode_fs_block` in the
+ * transaction. */
+static int read_inode_block(struct ext4_fs *fs, uint32_t ino, uint8_t *buf) {
     uint32_t g  = (ino - 1u) / fs->sb.inodes_per_group;
     uint32_t i  = (ino - 1u) % fs->sb.inodes_per_group;
     const uint8_t *b0 = fs->bgd_buf + g * fs->bgd_size;
     uint64_t it = ((uint64_t)((fs->bgd_size >= 64u) ? le32(b0 + 0x28) : 0u) << 32)
                 | (uint64_t)le32(b0 + 0x08);
     uint64_t ib = (uint64_t)i * fs->sb.inode_size;
-    uint64_t fs_block = it + ib / fs->sb.block_size;
-    uint32_t offset   = (uint32_t)(ib % fs->sb.block_size);
-    *out_fs_block = fs_block;
-    *out_offset   = offset;
-    if (ext4_fs_read_block(fs, fs_block, buf) != 0) return -1;
-    if (out_gen) *out_gen = le32(buf + offset + 0x64);
+    s_inode_fs_block = it + ib / fs->sb.block_size;
+    s_inode_offset   = (uint32_t)(ib % fs->sb.block_size);
+    if (ext4_fs_read_block(fs, s_inode_fs_block, buf) != 0) return -1;
+    s_inode_gen = le32(buf + s_inode_offset + 0x64);
     return 0;
 }
 
@@ -442,22 +574,7 @@ static int find_free_inode(struct ext4_fs *fs, char *err, uint32_t err_len) {
             }
         }
 
-        /* Inode bitmap csum (same formula as block bitmap, no bgid). */
-        {
-            uint32_t ic = inode_bitmap_csum(fs, scratch_bitmap);
-            bgd_entry[0x1A] = (uint8_t)(ic & 0xFFu);
-            bgd_entry[0x1B] = (uint8_t)(ic >>  8);
-            if (fs->bgd_size >= 64u) {
-                bgd_entry[0x3A] = (uint8_t)(ic >> 16);
-                bgd_entry[0x3B] = (uint8_t)(ic >> 24);
-            }
-        }
-        /* BGD checksum. */
-        {
-            uint16_t bc = bgd_compute_csum(fs, g, bgd_entry);
-            bgd_entry[0x1E] = (uint8_t)bc;
-            bgd_entry[0x1F] = (uint8_t)(bc >> 8);
-        }
+        bgd_finalize_inode_bitmap_csums(fs, g, bgd_entry, scratch_bitmap);
         return 0;
     }
 
@@ -483,7 +600,6 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
     uint64_t   dir_fs_block;           /* parent dir data block we'll modify */
     static uint64_t dir_phys;          /* DGROUP — extent_lookup output */
     uint8_t   *dir_blk;                /* = scratch_data */
-    uint32_t   off;
     uint32_t   new_rec_needed;         /* min bytes for new entry */
     int        found_slot = 0;
     uint32_t   slot_off = 0;           /* where to write new entry in dir block */
@@ -545,34 +661,9 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
             dir_fs_block = dir_phys;
             rc = ext4_fs_read_block(fs, dir_fs_block, dir_blk);
             if (rc) continue;
-
-            off = 0;
-            while (off + 8u <= fs->sb.block_size) {
-                uint16_t rec_len = le16(dir_blk + off + 4);
-                uint8_t  nl      = dir_blk[off + 6];
-                uint32_t ino     = le32(dir_blk + off);
-                uint32_t real_sz;
-
-                if (rec_len < 8u || rec_len > fs->sb.block_size - off) break;
-
-                /* Tail csum sentinel — skip. */
-                if (dir_blk[off + 7] == 0xDEu && rec_len == 12u && ino == 0u) {
-                    off += rec_len; continue;
-                }
-
-                real_sz = (ino != 0u) ? ((8u + nl + 3u) & ~(uint32_t)3u) : 0u;
-                if (rec_len >= real_sz + new_rec_needed) {
-                    slot_off    = off + real_sz;
-                    found_slot  = 1;
-                    /* Shrink the existing entry to its real size. */
-                    if (ino != 0u) {
-                        dir_blk[off + 4] = (uint8_t) real_sz;
-                        dir_blk[off + 5] = (uint8_t)(real_sz >> 8);
-                    }
-                    break;
-                }
-                off += rec_len;
-            }
+            found_slot = dir_find_slot_for_entry(dir_blk, fs->sb.block_size,
+                                                 new_rec_needed);
+            if (found_slot) slot_off = s_dir_slot_off;
         }
     }
     if (!found_slot) {
@@ -618,16 +709,7 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
         sb_in_block[0x12] = (uint8_t)(fi >> 16);
         sb_in_block[0x13] = (uint8_t)(fi >> 24);
     }
-    if (fs->sb.feature_ro_compat & 0x400u) {
-        uint32_t csum;
-        sb_in_block[0x3FC] = sb_in_block[0x3FD] = 0;
-        sb_in_block[0x3FE] = sb_in_block[0x3FF] = 0;
-        csum = crc32c(CRC32C_INIT, sb_in_block, 0x3FC);
-        sb_in_block[0x3FC] = (uint8_t) csum;
-        sb_in_block[0x3FD] = (uint8_t)(csum >>  8);
-        sb_in_block[0x3FE] = (uint8_t)(csum >> 16);
-        sb_in_block[0x3FF] = (uint8_t)(csum >> 24);
-    }
+    sb_recompute_csum(fs, sb_in_block);
 
     /* --- Initialize new inode block --- */
     inode_group         = (alloc_inode_num - 1u) / fs->sb.inodes_per_group;
@@ -831,21 +913,7 @@ static int find_free_block(struct ext4_fs *fs, char *err, uint32_t err_len) {
         /* Clear BLOCK_UNINIT if we initialized the bitmap ourselves. */
         if (bg_flags & 0x1u) bgd_entry[0x12] &= ~(uint8_t)0x1u;
 
-        /* Recompute bitmap + BGD checksums. */
-        {
-            uint32_t bm_csum = bitmap_compute_csum(fs, scratch_bitmap);
-            bgd_entry[0x18] = (uint8_t)(bm_csum & 0xFFu);
-            bgd_entry[0x19] = (uint8_t)(bm_csum >>  8);
-            if (fs->bgd_size >= 64u) {
-                bgd_entry[0x38] = (uint8_t)(bm_csum >> 16);
-                bgd_entry[0x39] = (uint8_t)(bm_csum >> 24);
-            }
-        }
-        {
-            uint16_t bg_csum = bgd_compute_csum(fs, g, bgd_entry);
-            bgd_entry[0x1E] = (uint8_t) bg_csum;
-            bgd_entry[0x1F] = (uint8_t)(bg_csum >> 8);
-        }
+        bgd_finalize_block_bitmap_csums(fs, g, bgd_entry, scratch_bitmap);
         return 0;
     }
 
@@ -1004,20 +1072,7 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
                         bgd_entry[0x2D] = (uint8_t)(fh >> 8);
                     }
                 }
-                {
-                    uint32_t bm_csum = bitmap_compute_csum(fs, scratch_bitmap);
-                    bgd_entry[0x18] = (uint8_t)(bm_csum & 0xFFu);
-                    bgd_entry[0x19] = (uint8_t)(bm_csum >>  8);
-                    if (fs->bgd_size >= 64u) {
-                        bgd_entry[0x38] = (uint8_t)(bm_csum >> 16);
-                        bgd_entry[0x39] = (uint8_t)(bm_csum >> 24);
-                    }
-                }
-                {
-                    uint16_t bc = bgd_compute_csum(fs, target_group, bgd_entry);
-                    bgd_entry[0x1E] = (uint8_t)bc;
-                    bgd_entry[0x1F] = (uint8_t)(bc >> 8);
-                }
+                bgd_finalize_block_bitmap_csums(fs, target_group, bgd_entry, scratch_bitmap);
             } else {
                 /* Leaf table has room — use the general scanner which will
                  * try every group and pick the first free bit. */
@@ -1063,17 +1118,7 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
         }
     }
 
-    /* Recompute fs sb checksum if metadata_csum on. */
-    if (fs->sb.feature_ro_compat & 0x400u) {
-        uint32_t csum;
-        sb_in_block[0x3FC] = sb_in_block[0x3FD] = 0;
-        sb_in_block[0x3FE] = sb_in_block[0x3FF] = 0;
-        csum = crc32c(CRC32C_INIT, sb_in_block, 0x3FC);
-        sb_in_block[0x3FC] = (uint8_t) csum;
-        sb_in_block[0x3FD] = (uint8_t)(csum >>  8);
-        sb_in_block[0x3FE] = (uint8_t)(csum >> 16);
-        sb_in_block[0x3FF] = (uint8_t)(csum >> 24);
-    }
+    sb_recompute_csum(fs, sb_in_block);
 
     /* --- Read the inode block + update extent length, size, blocks_count, mtime --- */
     group               = (inode_num - 1u) / fs->sb.inodes_per_group;
@@ -1157,12 +1202,8 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
     inode_in_block[0x1F] = (uint8_t)(blocks_count_lo >> 24);
     (void)blocks_count_hi;
 
-    /* mtime + recompute i_checksum (must be last in-inode change). */
-    inode_in_block[0x10] = (uint8_t) now_unix;
-    inode_in_block[0x11] = (uint8_t)(now_unix >>  8);
-    inode_in_block[0x12] = (uint8_t)(now_unix >> 16);
-    inode_in_block[0x13] = (uint8_t)(now_unix >> 24);
-    ext4_inode_recompute_csum(fs, inode_num, inode_in_block);
+    /* mtime + i_checksum — must be last (after all other field writes). */
+    inode_set_mtime_and_csum(fs, inode_num, inode_in_block, now_unix);
 
     /* --- Stage data block + commit 5-block transaction --- */
     if (append_bytes > fs->sb.block_size) append_bytes = fs->sb.block_size;
@@ -1289,35 +1330,15 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
         slot_off   = 0;
         dir_fs_block = 0;
         for (b = 0; b < nblks && !found_slot; b++) {
-            uint32_t off;
             rc = ext4_extent_lookup(fs, parent_inode.i_block, b, &dir_phys);
             if (rc) continue;
             dir_fs_block = dir_phys;
             if (ext4_fs_read_block(fs, dir_fs_block, scratch_parent_dir) != 0)
                 continue;
-            off = 0;
-            while (off + 8u <= fs->sb.block_size) {
-                uint16_t rec_len = le16(scratch_parent_dir + off + 4);
-                uint8_t  nl      = scratch_parent_dir[off + 6];
-                uint32_t ino     = le32(scratch_parent_dir + off);
-                uint32_t real_sz;
-                if (rec_len < 8u || rec_len > fs->sb.block_size - off) break;
-                if (scratch_parent_dir[off + 7] == 0xDEu
-                    && rec_len == 12u && ino == 0u) {
-                    off += rec_len; continue;
-                }
-                real_sz = (ino != 0u) ? ((8u + nl + 3u) & ~(uint32_t)3u) : 0u;
-                if (rec_len >= real_sz + new_rec_needed) {
-                    slot_off   = off + real_sz;
-                    found_slot = 1;
-                    if (ino != 0u) {
-                        scratch_parent_dir[off + 4] = (uint8_t) real_sz;
-                        scratch_parent_dir[off + 5] = (uint8_t)(real_sz >> 8);
-                    }
-                    break;
-                }
-                off += rec_len;
-            }
+            found_slot = dir_find_slot_for_entry(scratch_parent_dir,
+                                                 fs->sb.block_size,
+                                                 new_rec_needed);
+            if (found_slot) slot_off = s_dir_slot_off;
         }
     }
     if (!found_slot) {
@@ -1366,13 +1387,7 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
         fi--;
         sb[0x10] = (uint8_t) fi; sb[0x11] = (uint8_t)(fi >> 8);
         sb[0x12] = (uint8_t)(fi >> 16); sb[0x13] = (uint8_t)(fi >> 24);
-        if (fs->sb.feature_ro_compat & 0x400u) {
-            uint32_t cs;
-            sb[0x3FC] = sb[0x3FD] = 0; sb[0x3FE] = sb[0x3FF] = 0;
-            cs = crc32c(CRC32C_INIT, sb, 0x3FC);
-            sb[0x3FC] = (uint8_t)cs; sb[0x3FD] = (uint8_t)(cs >> 8);
-            sb[0x3FE] = (uint8_t)(cs >> 16); sb[0x3FF] = (uint8_t)(cs >> 24);
-        }
+        sb_recompute_csum(fs, sb);
     }
 
     /* Locate new dir's inode block (using bgd_buf — inode table never moves). */
@@ -1455,13 +1470,7 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
             sb[0x158] = (uint8_t)h32; sb[0x159] = (uint8_t)(h32 >> 8);
             sb[0x15A] = (uint8_t)(h32 >> 16); sb[0x15B] = (uint8_t)(h32 >> 24);
         }
-        if (fs->sb.feature_ro_compat & 0x400u) {
-            uint32_t cs;
-            sb[0x3FC] = sb[0x3FD] = 0; sb[0x3FE] = sb[0x3FF] = 0;
-            cs = crc32c(CRC32C_INIT, sb, 0x3FC);
-            sb[0x3FC] = (uint8_t)cs; sb[0x3FD] = (uint8_t)(cs >> 8);
-            sb[0x3FE] = (uint8_t)(cs >> 16); sb[0x3FF] = (uint8_t)(cs >> 24);
-        }
+        sb_recompute_csum(fs, sb);
     }
 
     /* Build new dir data block (. and ..) in scratch_data. */
@@ -1557,9 +1566,7 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
         uint16_t  lc = le16(pi + 0x1A);
         lc++;
         pi[0x1A] = (uint8_t)lc; pi[0x1B] = (uint8_t)(lc >> 8);
-        pi[0x10] = (uint8_t)now_unix; pi[0x11] = (uint8_t)(now_unix >>  8);
-        pi[0x12] = (uint8_t)(now_unix >> 16); pi[0x13] = (uint8_t)(now_unix >> 24);
-        ext4_inode_recompute_csum(fs, parent_ino, pi);
+        inode_set_mtime_and_csum(fs, parent_ino, pi, now_unix);
     }
 
     scratch_trans.block_count = 7u;
@@ -1685,23 +1692,11 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
         int found = 0;
         parent_slot_off = 0; parent_prev_off = 0xFFFFFFFFu; parent_dir_block = 0;
         for (b = 0; b < nblks && !found; b++) {
-            uint32_t off, prev;
             if (ext4_extent_lookup(fs, par_inode.i_block, b, &dir_phys) != 0) continue;
             parent_dir_block = dir_phys;
             if (ext4_fs_read_block(fs, parent_dir_block, scratch_parent_dir) != 0) continue;
-            prev = 0xFFFFFFFFu; off = 0;
-            while (off + 8u <= fs->sb.block_size) {
-                uint16_t rec = le16(scratch_parent_dir + off + 4);
-                uint32_t ino = le32(scratch_parent_dir + off);
-                if (rec < 8u || rec > fs->sb.block_size - off) break;
-                if (scratch_parent_dir[off + 7] == 0xDEu && rec == 12u && ino == 0u) {
-                    off += rec; continue;
-                }
-                if (ino == dir_ino) {
-                    parent_slot_off = off; parent_prev_off = prev; found = 1; break;
-                }
-                prev = off; off += rec;
-            }
+            found = dir_find_entry_by_inode(scratch_parent_dir, fs->sb.block_size, dir_ino);
+            if (found) { parent_slot_off = s_dir_entry_off; parent_prev_off = s_dir_prev_off; }
         }
         if (!found) { say_simple(err, err_len, "entry not found in parent"); return -1; }
     }
@@ -1750,11 +1745,7 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
         fl++; if (fl == 0u) fh++;
         be[0x0C]=(uint8_t)fl; be[0x0D]=(uint8_t)(fl>>8);
         if (fs->bgd_size >= 64u) { be[0x2C]=(uint8_t)fh; be[0x2D]=(uint8_t)(fh>>8); }
-        { uint32_t bcs=bitmap_compute_csum(fs,scratch_bitmap);
-          be[0x18]=(uint8_t)bcs; be[0x19]=(uint8_t)(bcs>>8);
-          if (fs->bgd_size>=64u){be[0x38]=(uint8_t)(bcs>>16);be[0x39]=(uint8_t)(bcs>>24);}
-        }
-        { uint16_t bc=bgd_compute_csum(fs,data_group,be); be[0x1E]=(uint8_t)bc; be[0x1F]=(uint8_t)(bc>>8); }
+        bgd_finalize_block_bitmap_csums(fs, data_group, be, scratch_bitmap);
     }
     if (ext4_fs_read_block(fs, sb_fs_block, scratch_sb) != 0) {
         say_simple(err, err_len, "SB read failed (tx1)"); return -1;
@@ -1771,12 +1762,7 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
             sb[0x158]=(uint8_t)h32; sb[0x159]=(uint8_t)(h32>>8);
             sb[0x15A]=(uint8_t)(h32>>16); sb[0x15B]=(uint8_t)(h32>>24);
         }
-        if (fs->sb.feature_ro_compat & 0x400u) {
-            uint32_t cs; sb[0x3FC]=sb[0x3FD]=0; sb[0x3FE]=sb[0x3FF]=0;
-            cs=crc32c(CRC32C_INIT,sb,0x3FC);
-            sb[0x3FC]=(uint8_t)cs; sb[0x3FD]=(uint8_t)(cs>>8);
-            sb[0x3FE]=(uint8_t)(cs>>16); sb[0x3FF]=(uint8_t)(cs>>24);
-        }
+        sb_recompute_csum(fs, sb);
     }
     scratch_trans.block_count = 3u;
     scratch_trans.fs_block[0] = data_bmap_phys; scratch_trans.buf[0] = scratch_bitmap;
@@ -1815,12 +1801,7 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
         else if (uh > 0u) { uh--; ud = 0xFFFFu; }
         be[0x10]=(uint8_t)ud; be[0x11]=(uint8_t)(ud>>8);
         if (fs->bgd_size>=64u){be[0x30]=(uint8_t)uh; be[0x31]=(uint8_t)(uh>>8);}
-        /* inode bitmap csum */
-        { uint32_t ic=inode_bitmap_csum(fs,scratch_bitmap);
-          be[0x1A]=(uint8_t)(ic&0xFFu); be[0x1B]=(uint8_t)(ic>>8);
-          if (fs->bgd_size>=64u){be[0x3A]=(uint8_t)(ic>>16);be[0x3B]=(uint8_t)(ic>>24);}
-        }
-        { uint16_t bc=bgd_compute_csum(fs,inode_group,be); be[0x1E]=(uint8_t)bc; be[0x1F]=(uint8_t)(bc>>8); }
+        bgd_finalize_inode_bitmap_csums(fs, inode_group, be, scratch_bitmap);
     }
     if (ext4_fs_read_block(fs, sb_fs_block, scratch_sb) != 0) {
         say_simple(err, err_len, "SB read failed (tx2)"); return -1;
@@ -1830,12 +1811,7 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
         uint32_t fi = le32(sb+0x10); fi++;
         sb[0x10]=(uint8_t)fi; sb[0x11]=(uint8_t)(fi>>8);
         sb[0x12]=(uint8_t)(fi>>16); sb[0x13]=(uint8_t)(fi>>24);
-        if (fs->sb.feature_ro_compat & 0x400u) {
-            uint32_t cs; sb[0x3FC]=sb[0x3FD]=0; sb[0x3FE]=sb[0x3FF]=0;
-            cs=crc32c(CRC32C_INIT,sb,0x3FC);
-            sb[0x3FC]=(uint8_t)cs; sb[0x3FD]=(uint8_t)(cs>>8);
-            sb[0x3FE]=(uint8_t)(cs>>16); sb[0x3FF]=(uint8_t)(cs>>24);
-        }
+        sb_recompute_csum(fs, sb);
     }
 
     /* Locate and zero the dir inode (bitmap is authoritative — zeroing
@@ -1871,10 +1847,7 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
         uint16_t lc = le16(pi + 0x1A);
         if (lc > 0u) lc--;
         pi[0x1A]=(uint8_t)lc; pi[0x1B]=(uint8_t)(lc>>8);
-        { uint32_t t = dir_inode.mtime + 1u;
-          pi[0x10]=(uint8_t)t; pi[0x11]=(uint8_t)(t>>8);
-          pi[0x12]=(uint8_t)(t>>16); pi[0x13]=(uint8_t)(t>>24); }
-        ext4_inode_recompute_csum(fs, parent_ino, pi);
+        inode_set_mtime_and_csum(fs, parent_ino, pi, dir_inode.mtime + 1u);
     }
 
     scratch_trans.block_count = 6u;
@@ -1929,17 +1902,7 @@ static int free_one_data_block(struct ext4_fs *fs, uint64_t blk_phys,
             be[0x2C] = (uint8_t)fh; be[0x2D] = (uint8_t)(fh >> 8);
         }
     }
-    {
-        uint32_t bcs = bitmap_compute_csum(fs, scratch_bitmap);
-        be[0x18] = (uint8_t)bcs; be[0x19] = (uint8_t)(bcs >> 8);
-        if (fs->bgd_size >= 64u) {
-            be[0x38] = (uint8_t)(bcs >> 16); be[0x39] = (uint8_t)(bcs >> 24);
-        }
-    }
-    {
-        uint16_t bc = bgd_compute_csum(fs, grp, be);
-        be[0x1E] = (uint8_t)bc; be[0x1F] = (uint8_t)(bc >> 8);
-    }
+    bgd_finalize_block_bitmap_csums(fs, grp, be, scratch_bitmap);
     if (ext4_fs_read_block(fs, sb_fs_block, scratch_sb) != 0) {
         say_simple(err, err_len, "SB read failed (blk free)"); return -1;
     }
@@ -1956,13 +1919,7 @@ static int free_one_data_block(struct ext4_fs *fs, uint64_t blk_phys,
             sb[0x158] = (uint8_t)h32; sb[0x159] = (uint8_t)(h32 >> 8);
             sb[0x15A] = (uint8_t)(h32 >> 16); sb[0x15B] = (uint8_t)(h32 >> 24);
         }
-        if (fs->sb.feature_ro_compat & 0x400u) {
-            uint32_t cs;
-            sb[0x3FC] = sb[0x3FD] = 0; sb[0x3FE] = sb[0x3FF] = 0;
-            cs = crc32c(CRC32C_INIT, sb, 0x3FC);
-            sb[0x3FC] = (uint8_t)cs; sb[0x3FD] = (uint8_t)(cs >> 8);
-            sb[0x3FE] = (uint8_t)(cs >> 16); sb[0x3FF] = (uint8_t)(cs >> 24);
-        }
+        sb_recompute_csum(fs, sb);
     }
     scratch_trans.block_count = 3u;
     scratch_trans.fs_block[0] = bmap_phys;    scratch_trans.buf[0] = scratch_bitmap;
@@ -2065,29 +2022,17 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
         parent_gen = le32(scratch_inode_block + (uint32_t)(ib%fs->sb.block_size) + 0x64);
     }
 
-    /* Scan parent dir for entry with file_ino. */
+    /* Scan parent dir blocks for entry with file_ino. */
     {
         uint32_t nblks = (uint32_t)((par_inode.size+fs->sb.block_size-1u)/fs->sb.block_size);
         uint32_t b; int found = 0;
         parent_slot_off = 0; parent_prev_off = 0xFFFFFFFFu; parent_dir_block = 0;
         for (b = 0; b < nblks && !found; b++) {
-            uint32_t off, prev;
             if (ext4_extent_lookup(fs, par_inode.i_block, b, &dir_phys) != 0) continue;
             parent_dir_block = dir_phys;
             if (ext4_fs_read_block(fs, parent_dir_block, scratch_parent_dir) != 0) continue;
-            prev = 0xFFFFFFFFu; off = 0;
-            while (off + 8u <= fs->sb.block_size) {
-                uint16_t rec = le16(scratch_parent_dir + off + 4);
-                uint32_t ino = le32(scratch_parent_dir + off);
-                if (rec < 8u || rec > fs->sb.block_size - off) break;
-                if (scratch_parent_dir[off+7] == 0xDEu && rec == 12u && ino == 0u) {
-                    off += rec; continue;
-                }
-                if (ino == file_ino) {
-                    parent_slot_off = off; parent_prev_off = prev; found = 1; break;
-                }
-                prev = off; off += rec;
-            }
+            found = dir_find_entry_by_inode(scratch_parent_dir, fs->sb.block_size, file_ino);
+            if (found) { parent_slot_off = s_dir_entry_off; parent_prev_off = s_dir_prev_off; }
         }
         if (!found) { say_simple(err, err_len, "entry not found in parent"); return -1; }
     }
@@ -2126,11 +2071,7 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
         fl++; if (fl==0u) fh++;
         be[0x0E]=(uint8_t)fl; be[0x0F]=(uint8_t)(fl>>8);
         if (fs->bgd_size>=64u){be[0x2E]=(uint8_t)fh; be[0x2F]=(uint8_t)(fh>>8);}
-        { uint32_t ic=inode_bitmap_csum(fs,scratch_bitmap);
-          be[0x1A]=(uint8_t)(ic&0xFFu); be[0x1B]=(uint8_t)(ic>>8);
-          if (fs->bgd_size>=64u){be[0x3A]=(uint8_t)(ic>>16);be[0x3B]=(uint8_t)(ic>>24);}
-        }
-        { uint16_t bc=bgd_compute_csum(fs,inode_group,be); be[0x1E]=(uint8_t)bc; be[0x1F]=(uint8_t)(bc>>8); }
+        bgd_finalize_inode_bitmap_csums(fs, inode_group, be, scratch_bitmap);
     }
     if (ext4_fs_read_block(fs, sb_fs_block, scratch_sb) != 0) {
         say_simple(err, err_len, "SB read failed (final tx)"); return -1;
@@ -2140,12 +2081,7 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
         uint32_t fi=le32(sb+0x10); fi++;
         sb[0x10]=(uint8_t)fi; sb[0x11]=(uint8_t)(fi>>8);
         sb[0x12]=(uint8_t)(fi>>16); sb[0x13]=(uint8_t)(fi>>24);
-        if (fs->sb.feature_ro_compat & 0x400u) {
-            uint32_t cs; sb[0x3FC]=sb[0x3FD]=0; sb[0x3FE]=sb[0x3FF]=0;
-            cs=crc32c(CRC32C_INIT,sb,0x3FC);
-            sb[0x3FC]=(uint8_t)cs; sb[0x3FD]=(uint8_t)(cs>>8);
-            sb[0x3FE]=(uint8_t)(cs>>16); sb[0x3FF]=(uint8_t)(cs>>24);
-        }
+        sb_recompute_csum(fs, sb);
     }
     {
         uint32_t g=inode_group, idx=inode_bit;
@@ -2175,10 +2111,7 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
     }
     {
         uint8_t *pi=scratch_parent_inode+parent_inode_offset;
-        uint32_t t=file_inode.mtime+1u;
-        pi[0x10]=(uint8_t)t; pi[0x11]=(uint8_t)(t>>8);
-        pi[0x12]=(uint8_t)(t>>16); pi[0x13]=(uint8_t)(t>>24);
-        ext4_inode_recompute_csum(fs, parent_ino, pi);
+        inode_set_mtime_and_csum(fs, parent_ino, pi, file_inode.mtime + 1u);
     }
 
     scratch_trans.block_count = 6u;
@@ -2348,12 +2281,8 @@ int ext4_file_truncate(struct ext4_fs *fs, uint32_t inode_num,
     inode_in_block[0x1E] = (uint8_t)(blocks_count_lo >> 16);
     inode_in_block[0x1F] = (uint8_t)(blocks_count_lo >> 24);
 
-    /* mtime + recompute i_checksum (matches extend_block). */
-    inode_in_block[0x10] = (uint8_t) now_unix;
-    inode_in_block[0x11] = (uint8_t)(now_unix >>  8);
-    inode_in_block[0x12] = (uint8_t)(now_unix >> 16);
-    inode_in_block[0x13] = (uint8_t)(now_unix >> 24);
-    ext4_inode_recompute_csum(fs, inode_num, inode_in_block);
+    /* mtime + i_checksum — must be last in-inode write. */
+    inode_set_mtime_and_csum(fs, inode_num, inode_in_block, now_unix);
 
     scratch_trans.block_count = 1u;
     scratch_trans.fs_block[0] = inode_fs_block;
@@ -2468,13 +2397,9 @@ int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
     if (ext4_fs_read_block(fs, parent_inode_fs_block, scratch_inode_block) != 0) {
         say_simple(err, err_len, "parent inode block read failed"); return -1;
     }
-    {
-        uint8_t *pi=scratch_inode_block+parent_inode_offset;
-        uint32_t t=par_inode.mtime+1u;
-        pi[0x10]=(uint8_t)t; pi[0x11]=(uint8_t)(t>>8);
-        pi[0x12]=(uint8_t)(t>>16); pi[0x13]=(uint8_t)(t>>24);
-        ext4_inode_recompute_csum(fs, parent_ino, pi);
-    }
+    inode_set_mtime_and_csum(fs, parent_ino,
+                             scratch_inode_block + parent_inode_offset,
+                             par_inode.mtime + 1u);
 
     scratch_trans.block_count = 2u;
     scratch_trans.fs_block[0] = parent_dir_block;      scratch_trans.buf[0] = scratch_parent_dir;
@@ -2486,13 +2411,6 @@ int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
 }
 
 /* --- Cross-directory rename --------------------------------------------- */
-
-/* Excluded from DOS small-model builds: the TSR's _TEXT segment is at
- * its 64 KiB cap and adding ~2 KiB of new code overflows the link.  The
- * host build (which has no such cap) compiles and tests this normally;
- * DOS-side cross-dir support is a follow-up that needs either function
- * extraction or a memory-model bump. */
-#ifndef __DOS__
 
 /* Move file_ino's dir entry from old_parent to new_parent (with new name).
  * Single 4-block journal transaction (old_dir_block + new_dir_block + both
@@ -2553,14 +2471,18 @@ int ext4_rename_xdir(struct ext4_fs *fs,
 
     new_rec_needed = (8u + (uint32_t)new_name_len + 3u) & ~(uint32_t)3u;
 
-    if (read_inode_block(fs, old_parent_ino, scratch_inode_block,
-                         &old_par_inode_block, &old_par_inode_offset, &old_par_gen) != 0) {
+    if (read_inode_block(fs, old_parent_ino, scratch_inode_block) != 0) {
         say_simple(err, err_len, "old parent inode block read"); return -1;
     }
-    if (read_inode_block(fs, new_parent_ino, scratch_parent_inode,
-                         &new_par_inode_block, &new_par_inode_offset, &new_par_gen) != 0) {
+    old_par_inode_block  = s_inode_fs_block;
+    old_par_inode_offset = s_inode_offset;
+    old_par_gen          = s_inode_gen;
+    if (read_inode_block(fs, new_parent_ino, scratch_parent_inode) != 0) {
         say_simple(err, err_len, "new parent inode block read"); return -1;
     }
+    new_par_inode_block  = s_inode_fs_block;
+    new_par_inode_offset = s_inode_offset;
+    new_par_gen          = s_inode_gen;
 
     /* Find old entry in old parent's first dir block (single-block dirs only). */
     if (ext4_extent_lookup(fs, old_par_inode.i_block, 0, &old_dir_phys) != 0) {
@@ -2569,24 +2491,11 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     if (ext4_fs_read_block(fs, old_dir_phys, scratch_parent_dir) != 0) {
         say_simple(err, err_len, "old parent dir block read"); return -1;
     }
-    {
-        uint32_t off = 0, prev = 0xFFFFFFFFu;
-        while (off + 8u <= fs->sb.block_size) {
-            uint16_t rec = le16(scratch_parent_dir + off + 4);
-            uint32_t ino = le32(scratch_parent_dir + off);
-            if (rec < 8u || rec > fs->sb.block_size - off) break;
-            if (scratch_parent_dir[off+7] == 0xDEu && rec == 12u && ino == 0u) {
-                off += rec; continue;
-            }
-            if (ino == file_ino) {
-                old_slot_off = off; old_prev_off = prev; found_old = 1; break;
-            }
-            prev = off; off += rec;
-        }
-    }
+    found_old = dir_find_entry_by_inode(scratch_parent_dir, fs->sb.block_size, file_ino);
     if (!found_old) {
         say_simple(err, err_len, "file not in old parent"); return -1;
     }
+    old_slot_off = s_dir_entry_off; old_prev_off = s_dir_prev_off;
 
     /* Find a slot for the new entry in new parent's first dir block. */
     if (ext4_extent_lookup(fs, new_par_inode.i_block, 0, &new_dir_phys) != 0) {
@@ -2595,33 +2504,11 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     if (ext4_fs_read_block(fs, new_dir_phys, scratch_data) != 0) {
         say_simple(err, err_len, "new parent dir block read"); return -1;
     }
-    {
-        uint32_t off = 0;
-        while (off + 8u <= fs->sb.block_size) {
-            uint16_t rec = le16(scratch_data + off + 4);
-            uint8_t  nl  = scratch_data[off + 6];
-            uint32_t ino = le32(scratch_data + off);
-            uint32_t real_sz;
-            if (rec < 8u || rec > fs->sb.block_size - off) break;
-            if (scratch_data[off+7] == 0xDEu && rec == 12u && ino == 0u) {
-                off += rec; continue;
-            }
-            real_sz = (ino != 0u) ? ((8u + nl + 3u) & ~(uint32_t)3u) : 0u;
-            if (rec >= real_sz + new_rec_needed) {
-                slot_off  = off + real_sz;
-                found_new = 1;
-                if (ino != 0u) {
-                    scratch_data[off + 4] = (uint8_t) real_sz;
-                    scratch_data[off + 5] = (uint8_t)(real_sz >> 8);
-                }
-                break;
-            }
-            off += rec;
-        }
-    }
+    found_new = dir_find_slot_for_entry(scratch_data, fs->sb.block_size, new_rec_needed);
     if (!found_new) {
         say_simple(err, err_len, "no room in new parent dir"); return -1;
     }
+    slot_off = s_dir_slot_off;
 
     /* Insert new entry in new parent. file_type field carried over. */
     ft = (fs->sb.feature_incompat & 0x2u) ? 1u : 0u;  /* EXT4_FT_REGULAR */
@@ -2660,22 +2547,10 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     dir_block_set_tail_csum(fs, scratch_parent_dir, old_parent_ino, old_par_gen);
 
     /* Update both parent inode mtimes + recompute their checksums. */
-    {
-        uint8_t *opi = scratch_inode_block + old_par_inode_offset;
-        opi[0x10] = (uint8_t) now_unix;
-        opi[0x11] = (uint8_t)(now_unix >>  8);
-        opi[0x12] = (uint8_t)(now_unix >> 16);
-        opi[0x13] = (uint8_t)(now_unix >> 24);
-        ext4_inode_recompute_csum(fs, old_parent_ino, opi);
-    }
-    {
-        uint8_t *npi = scratch_parent_inode + new_par_inode_offset;
-        npi[0x10] = (uint8_t) now_unix;
-        npi[0x11] = (uint8_t)(now_unix >>  8);
-        npi[0x12] = (uint8_t)(now_unix >> 16);
-        npi[0x13] = (uint8_t)(now_unix >> 24);
-        ext4_inode_recompute_csum(fs, new_parent_ino, npi);
-    }
+    inode_set_mtime_and_csum(fs, old_parent_ino,
+                             scratch_inode_block + old_par_inode_offset, now_unix);
+    inode_set_mtime_and_csum(fs, new_parent_ino,
+                             scratch_parent_inode + new_par_inode_offset, now_unix);
 
     scratch_trans.block_count = 4u;
     scratch_trans.fs_block[0] = old_dir_phys;          scratch_trans.buf[0] = scratch_parent_dir;
@@ -2686,8 +2561,6 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     if (rc) return -1;
     return 0;
 }
-
-#endif /* !__DOS__ */
 
 int ext4_file_read_head(struct ext4_fs *fs, const struct ext4_inode *inode,
                         uint32_t length, void *out_buf) {
