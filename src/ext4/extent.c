@@ -313,6 +313,13 @@ static uint32_t dir_block_csum(const struct ext4_fs *fs, uint32_t parent_ino,
  * statics live in DGROUP, so writes from the helper land in the same
  * segment the caller reads from. */
 static uint32_t s_dir_slot_off;
+/* rec_len the caller should give the new entry — equals the predecessor's
+ * pre-truncation rec_len minus the predecessor's real_sz. Filling the
+ * predecessor's dead space exactly preserves any entries after it.
+ * Computing as `block_size - slot_off` is the wrong formula when the slot
+ * is interior (predecessor isn't the last entry); using that would
+ * overwrite all entries that follow. */
+static uint32_t s_dir_slot_rec;
 static uint32_t s_dir_entry_off;
 static uint32_t s_dir_prev_off;
 
@@ -338,6 +345,7 @@ static int dir_find_slot_for_entry(uint8_t *blk, uint32_t bs,
         real_sz = (ino != 0u) ? ((8u + nl + 3u) & ~(uint32_t)3u) : 0u;
         if (rec >= real_sz + need_rec) {
             s_dir_slot_off = off + real_sz;
+            s_dir_slot_rec = (uint32_t)rec - real_sz;
             if (ino != 0u) {
                 blk[off + 4] = (uint8_t) real_sz;
                 blk[off + 5] = (uint8_t)(real_sz >> 8);
@@ -676,11 +684,7 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
 
     /* --- Write new dir entry into dir_blk at slot_off --- */
     {
-        uint32_t remaining = fs->sb.block_size - slot_off;
-        /* Account for tail csum sentinel (12 bytes) if metadata_csum on. */
-        if (fs->sb.feature_ro_compat & 0x400u) {
-            if (remaining >= 12u) remaining -= 12u;
-        }
+        uint32_t remaining = s_dir_slot_rec;
         dir_blk[slot_off + 0] = (uint8_t) alloc_inode_num;
         dir_blk[slot_off + 1] = (uint8_t)(alloc_inode_num >>  8);
         dir_blk[slot_off + 2] = (uint8_t)(alloc_inode_num >> 16);
@@ -1500,13 +1504,11 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
     }
 
     /* Insert new dir entry into parent's dir block (scratch_parent_dir).
-     * Scan already found slot_off and shrunk the predecessor. */
+     * Scan already found slot_off and shrunk the predecessor; the
+     * new entry's rec_len is exactly the predecessor's freed dead-space. */
     {
-        uint32_t remaining = fs->sb.block_size - slot_off;
+        uint32_t remaining = s_dir_slot_rec;
         uint8_t  ft_dir    = (fs->sb.feature_incompat & 0x2u) ? 2u : 0u;
-        if (fs->sb.feature_ro_compat & 0x400u) {
-            if (remaining >= 12u) remaining -= 12u;
-        }
         scratch_parent_dir[slot_off + 0] = (uint8_t)new_ino;
         scratch_parent_dir[slot_off + 1] = (uint8_t)(new_ino >>  8);
         scratch_parent_dir[slot_off + 2] = (uint8_t)(new_ino >> 16);
@@ -2412,16 +2414,63 @@ int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
 
 /* --- Cross-directory rename --------------------------------------------- */
 
-/* Move file_ino's dir entry from old_parent to new_parent (with new name).
- * Single 4-block journal transaction (old_dir_block + new_dir_block + both
- * parent inode blocks) so a crash either leaves the file in old_parent or
- * in new_parent — never both, never neither.  Refuses htree dirs, multi-
- * block dirs (the existing same-parent rename has the same restriction),
- * and renaming directories (would also need to update the moved dir's
- * ".." entry and adjust both parents' link counts — out of scope).
+#ifndef __WATCOMC__
+/* Walk new_parent's "..-up" chain looking for moved_ino.
+ * Returns 1 if moved_ino is an ancestor (would create a cycle on move),
+ * 0 if walk reaches root cleanly, negative on read/format failure. The
+ * walk uses scratch_bgd as a one-block scratch (rename's other paths
+ * don't touch BGD blocks). Bounded at 64 levels — corrupt fs safety.
+ * ".." entry is always at offset 12 (after "." with rec=12); the inode
+ * field is the first 4 bytes of the entry.
  *
- * Caller is responsible for guaranteeing old_parent != new_parent and
- * that the destination name doesn't already exist. */
+ * Host-only: cycle detection adds ~700 bytes to _TEXT, which pushes the
+ * DOS TSR over its 64-KiB cap. DOS-side cross-dir DIR rename is rare
+ * (DOS COMMAND.COM doesn't issue it for directories — only AH=56h
+ * direct callers do), and a cycle attempt by such a caller would
+ * corrupt the fs. The DOS path therefore refuses dir renames; only
+ * the host code path (and host-only test fixtures) takes this branch. */
+static int xdir_is_ancestor(struct ext4_fs *fs, uint32_t moved_ino,
+                            uint32_t descendant_ino) {
+    static struct ext4_inode walk_inode;
+    static uint64_t          walk_phys;
+    uint32_t cur = descendant_ino;
+    int      depth;
+
+    for (depth = 0; depth < 64; depth++) {
+        if (cur == moved_ino) return 1;
+        if (cur == 2u || cur == 0u) return 0;
+        if (ext4_inode_read(fs, cur, &walk_inode) != 0) return -1;
+        if ((walk_inode.mode & 0xF000u) != EXT4_S_IFDIR) return -1;
+        if (ext4_extent_lookup(fs, walk_inode.i_block, 0, &walk_phys) != 0) return -1;
+        if (ext4_fs_read_block(fs, walk_phys, scratch_bgd) != 0) return -1;
+        cur = le32(scratch_bgd + 12);
+    }
+    return -1;
+}
+#endif
+
+/* Move file_ino's dir entry from old_parent to new_parent (with new name).
+ *
+ * For regular files: 4-block transaction (old_dir_block + new_dir_block +
+ * both parent inode blocks). When old_parent and new_parent's inodes
+ * share an fs_block (consecutive inodes — root's #2 vs a user dir won't
+ * collide, but two adjacent user dirs can), the trans collapses to 3
+ * blocks with both inodes' edits applied to a single shared buffer.
+ *
+ * For directories: 5-block transaction adding the moved dir's first
+ * data block (with its ".." entry rewritten to point at new_parent),
+ * AND old/new parents' i_links_count adjusted (-1/+1) to track the
+ * lost/gained ".." backlink. Refuses moving the dir into one of its
+ * own descendants (would create a cycle).
+ *
+ * Atomic: a crash either leaves the file in old_parent or in new_parent —
+ * never both, never neither, never with stale ".." or stale link counts.
+ *
+ * Refuses: htree parents, multi-block parent dirs (same-block dir limit
+ * from same-parent rename), and renaming root.
+ *
+ * Caller guarantees old_parent != new_parent and that the destination
+ * name doesn't already exist. */
 int ext4_rename_xdir(struct ext4_fs *fs,
                      uint32_t old_parent_ino, uint32_t file_ino,
                      uint32_t new_parent_ino, const char *new_name,
@@ -2432,7 +2481,9 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     static struct ext4_inode file_inode;
     static uint64_t old_dir_phys;
     static uint64_t new_dir_phys;
+    static uint64_t moved_dir_phys;
     uint32_t       old_par_gen, new_par_gen;
+    uint32_t       moved_dir_gen = 0u;
     uint32_t       new_rec_needed;
     uint32_t       slot_off = 0;
     int            found_old = 0, found_new = 0;
@@ -2440,6 +2491,9 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     uint64_t       old_par_inode_block, new_par_inode_block;
     uint32_t       old_par_inode_offset, new_par_inode_offset;
     uint8_t        ft;
+    int            is_dir;
+    int            inode_blocks_share;
+    uint8_t       *new_par_inode_buf;
     int            rc;
 
     if (err && err_len) err[0] = '\0';
@@ -2449,10 +2503,10 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     if (new_name_len == 0u) {
         say_simple(err, err_len, "empty name"); return -1;
     }
+    if (file_ino == 0u || file_ino == 2u) {
+        say_simple(err, err_len, "cannot rename root"); return -1;
+    }
 
-    /* Read both parent inodes + the file inode (to determine file type
-     * and refuse directories — moving a dir would also need to update
-     * its "..").*/
     if (ext4_inode_read(fs, old_parent_ino, &old_par_inode) != 0) {
         say_simple(err, err_len, "old parent inode read failed"); return -1;
     }
@@ -2462,29 +2516,66 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     if (ext4_inode_read(fs, file_ino, &file_inode) != 0) {
         say_simple(err, err_len, "file inode read failed"); return -1;
     }
-    if ((file_inode.mode & 0xF000u) == EXT4_S_IFDIR) {
-        say_simple(err, err_len, "moving directories not supported"); return -1;
-    }
     if ((old_par_inode.flags & 0x1000u) || (new_par_inode.flags & 0x1000u)) {
         say_simple(err, err_len, "htree parent not supported"); return -1;
+    }
+    is_dir = ((file_inode.mode & 0xF000u) == EXT4_S_IFDIR);
+
+    if (is_dir) {
+#ifdef __WATCOMC__
+        /* DOS build: refuse dir renames. The cycle-detection walker
+         * pushes _TEXT over the 64-KiB TSR cap; on host (where we test
+         * cross-dir dir rename thoroughly) we run the full walker. */
+        say_simple(err, err_len, "dir rename DOS-only refused"); return -1;
+#else
+        if (file_ino == new_parent_ino) {
+            say_simple(err, err_len, "dir into self"); return -1;
+        }
+        rc = xdir_is_ancestor(fs, file_ino, new_parent_ino);
+        if (rc < 0) {
+            say_simple(err, err_len, "ancestor walk"); return -1;
+        }
+        if (rc == 1) {
+            say_simple(err, err_len, "dir cycle"); return -1;
+        }
+#endif
     }
 
     new_rec_needed = (8u + (uint32_t)new_name_len + 3u) & ~(uint32_t)3u;
 
+    /* Old parent inode block. */
     if (read_inode_block(fs, old_parent_ino, scratch_inode_block) != 0) {
         say_simple(err, err_len, "old parent inode block read"); return -1;
     }
     old_par_inode_block  = s_inode_fs_block;
     old_par_inode_offset = s_inode_offset;
     old_par_gen          = s_inode_gen;
+
+    /* New parent inode block. Always read into scratch_parent_inode.
+     * On host, additionally detect whether the two parents share a fs_block;
+     * if so, point new_par_inode_buf at scratch_inode_block instead, so
+     * dir-rename's nlink ±1 updates land on the same buffer (otherwise
+     * one update would be lost when checkpoint flushes the trans's two
+     * journaled copies of the same fs_block). On DOS we don't ship the
+     * dir-rename branch (sized out of the 64-KiB TSR), so the share case
+     * just costs a redundant inode-block journal slot. */
     if (read_inode_block(fs, new_parent_ino, scratch_parent_inode) != 0) {
         say_simple(err, err_len, "new parent inode block read"); return -1;
     }
     new_par_inode_block  = s_inode_fs_block;
     new_par_inode_offset = s_inode_offset;
+    new_par_inode_buf    = scratch_parent_inode;
     new_par_gen          = s_inode_gen;
+    inode_blocks_share   = 0;
+#ifndef __WATCOMC__
+    if (new_par_inode_block == old_par_inode_block) {
+        inode_blocks_share = 1;
+        new_par_inode_buf  = scratch_inode_block;
+        new_par_gen        = le32(scratch_inode_block + new_par_inode_offset + 0x64);
+    }
+#endif
 
-    /* Find old entry in old parent's first dir block (single-block dirs only). */
+    /* Find old entry in old parent's first dir block. */
     if (ext4_extent_lookup(fs, old_par_inode.i_block, 0, &old_dir_phys) != 0) {
         say_simple(err, err_len, "old parent dir block lookup"); return -1;
     }
@@ -2510,13 +2601,39 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     }
     slot_off = s_dir_slot_off;
 
-    /* Insert new entry in new parent. file_type field carried over. */
-    ft = (fs->sb.feature_incompat & 0x2u) ? 1u : 0u;  /* EXT4_FT_REGULAR */
-    {
-        uint32_t remaining = fs->sb.block_size - slot_off;
-        if (fs->sb.feature_ro_compat & 0x400u) {
-            if (remaining >= 12u) remaining -= 12u;
+#ifndef __WATCOMC__
+    /* If moving a directory, fetch its i_generation (for dir-block tail
+     * csum) and rewrite its first data block's ".." entry to new_parent.
+     * Two reads share scratch_bitmap: first the inode block (gen capture),
+     * then the data block (the actual edit). DOS build refused is_dir
+     * earlier, so this can only run is_dir=true on host. */
+    if (is_dir) {
+        if (ext4_extent_lookup(fs, file_inode.i_block, 0, &moved_dir_phys) != 0) {
+            say_simple(err, err_len, "moved dir lookup"); return -1;
         }
+        if (read_inode_block(fs, file_ino, scratch_bitmap) != 0) {
+            say_simple(err, err_len, "moved dir inode"); return -1;
+        }
+        moved_dir_gen = s_inode_gen;
+        if (ext4_fs_read_block(fs, moved_dir_phys, scratch_bitmap) != 0) {
+            say_simple(err, err_len, "moved dir data"); return -1;
+        }
+        scratch_bitmap[12 + 0] = (uint8_t) new_parent_ino;
+        scratch_bitmap[12 + 1] = (uint8_t)(new_parent_ino >>  8);
+        scratch_bitmap[12 + 2] = (uint8_t)(new_parent_ino >> 16);
+        scratch_bitmap[12 + 3] = (uint8_t)(new_parent_ino >> 24);
+        dir_block_set_tail_csum(fs, scratch_bitmap, file_ino, moved_dir_gen);
+    }
+#endif
+
+    /* Insert new entry in new parent. file_type carried over from file. */
+    if (fs->sb.feature_incompat & 0x2u) {
+        ft = is_dir ? 2u : 1u;  /* EXT4_FT_DIR : EXT4_FT_REGULAR */
+    } else {
+        ft = 0u;
+    }
+    {
+        uint32_t remaining = s_dir_slot_rec;
         scratch_data[slot_off + 0] = (uint8_t) file_ino;
         scratch_data[slot_off + 1] = (uint8_t)(file_ino >>  8);
         scratch_data[slot_off + 2] = (uint8_t)(file_ino >> 16);
@@ -2546,17 +2663,52 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     }
     dir_block_set_tail_csum(fs, scratch_parent_dir, old_parent_ino, old_par_gen);
 
-    /* Update both parent inode mtimes + recompute their checksums. */
+    /* Update parent inode bytes: nlink ±1 for dir-rename, mtime, csum.
+     * Do nlink BEFORE csum so the csum covers the final state. nlink
+     * adjustments only run on host — DOS-side dir rename is refused. */
+#ifndef __WATCOMC__
+    if (is_dir) {
+        uint8_t  *pi = scratch_inode_block + old_par_inode_offset;
+        uint16_t  lc = le16(pi + 0x1A);
+        if (lc > 0u) lc--;
+        pi[0x1A] = (uint8_t)lc; pi[0x1B] = (uint8_t)(lc >> 8);
+    }
+#endif
     inode_set_mtime_and_csum(fs, old_parent_ino,
                              scratch_inode_block + old_par_inode_offset, now_unix);
+#ifndef __WATCOMC__
+    if (is_dir) {
+        uint8_t  *pi = new_par_inode_buf + new_par_inode_offset;
+        uint16_t  lc = le16(pi + 0x1A);
+        lc++;
+        pi[0x1A] = (uint8_t)lc; pi[0x1B] = (uint8_t)(lc >> 8);
+    }
+#endif
     inode_set_mtime_and_csum(fs, new_parent_ino,
-                             scratch_parent_inode + new_par_inode_offset, now_unix);
+                             new_par_inode_buf + new_par_inode_offset, now_unix);
 
-    scratch_trans.block_count = 4u;
-    scratch_trans.fs_block[0] = old_dir_phys;          scratch_trans.buf[0] = scratch_parent_dir;
-    scratch_trans.fs_block[1] = new_dir_phys;          scratch_trans.buf[1] = scratch_data;
-    scratch_trans.fs_block[2] = old_par_inode_block;   scratch_trans.buf[2] = scratch_inode_block;
-    scratch_trans.fs_block[3] = new_par_inode_block;   scratch_trans.buf[3] = scratch_parent_inode;
+    /* Build trans. Slot count varies:
+     *   regular file, separate inode blocks: 4 slots
+     *   regular file, shared inode block:    3 slots
+     *   directory,    separate inode blocks: 5 slots (+moved-dir block) [host only]
+     *   directory,    shared inode block:    4 slots [host only] */
+    {
+        uint32_t k = 0;
+        scratch_trans.fs_block[k] = old_dir_phys;        scratch_trans.buf[k++] = scratch_parent_dir;
+        scratch_trans.fs_block[k] = new_dir_phys;        scratch_trans.buf[k++] = scratch_data;
+        scratch_trans.fs_block[k] = old_par_inode_block; scratch_trans.buf[k++] = scratch_inode_block;
+        if (!inode_blocks_share) {
+            scratch_trans.fs_block[k] = new_par_inode_block;
+            scratch_trans.buf[k++]    = scratch_parent_inode;
+        }
+#ifndef __WATCOMC__
+        if (is_dir) {
+            scratch_trans.fs_block[k] = moved_dir_phys;
+            scratch_trans.buf[k++]    = scratch_bitmap;
+        }
+#endif
+        scratch_trans.block_count = k;
+    }
     rc = ext4_journal_commit(fs, &scratch_trans, err, err_len);
     if (rc) return -1;
     return 0;

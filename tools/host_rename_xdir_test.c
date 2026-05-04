@@ -1,12 +1,21 @@
 /* Host-side test for ext4_rename_xdir (cross-directory rename).
  *
- * Setup: /xfoo.txt (1 block of 'X') exists in root; /xsub/ exists (created here).
+ * Setup: /xfoo.txt (1 block of 'X'), /xsub/ exist in root. The dir-rename
+ * cases also create /xdir1/, /xdir1/leaf.txt, and /xdir2/.
+ *
  * Test:
- *   1. Move /xfoo.txt -> /xsub/xfoo.txt  (same name, new parent)
- *   2. Move /xsub/xfoo.txt -> /xrenamed.txt  (new name, root again)
- *   3. Verify the inode number is preserved across both moves
- *   4. Same-parent must be refused (we exposed ext4_rename for that)
- *   5. Refuse cross-dir rename of a directory (out of scope)
+ *   File rename:
+ *     1. Move /xfoo.txt -> /xsub/xfoo.txt  (same name, new parent)
+ *     2. Move /xsub/xfoo.txt -> /xrenamed.txt  (new name, root again)
+ *     3. Verify the inode number is preserved across both moves
+ *     4. Same-parent must be refused
+ *     5. Empty name must be refused
+ *   Directory rename:
+ *     6. Move /xdir1 -> /xsub/xdir1 (with leaf.txt inside)
+ *     7. Verify "..'s inode in xdir1's first block now points at xsub
+ *     8. Verify nlinks: root -1, xsub +1 (relative to pre-move snapshot)
+ *     9. Move /xsub/xdir1 -> /xdir2/sub (with new name)
+ *    10. Refuse cycle: move /xdir2 -> /xdir2/sub (xdir2 is now an ancestor)
  *
  * Note: not compiled into DOS builds — host-only verification. */
 #include <stdio.h>
@@ -103,10 +112,138 @@ int main(int argc, char **argv) {
                           "", 0u, now+40u, err, sizeof err);
     ASSERT(rc != 0, "empty-name xdir rename should fail");
 
-    /* --- 5. Renaming a directory must be refused --- */
-    rc = ext4_rename_xdir(&fs, 2u, sub_ino, sub_ino,
-                          "xsubmoved", 9u, now+50u, err, sizeof err);
-    ASSERT(rc != 0, "directory xdir rename should fail (.. update not supported)");
+    /* --- 5. Renaming root must be refused --- */
+    rc = ext4_rename_xdir(&fs, 2u, 2u, sub_ino,
+                          "rootmoved", 9u, now+50u, err, sizeof err);
+    ASSERT(rc != 0, "rename of root must be refused");
+
+    /* --- 6. Cross-dir DIRECTORY rename: /xdir1 -> /xsub/xdir1 --- */
+    {
+        uint32_t xdir1_ino, xdir2_ino, leaf_ino;
+        uint32_t pre_root_nlinks, pre_xsub_nlinks, post_root_nlinks, post_xsub_nlinks;
+        static struct ext4_inode dir_inode;
+        static uint8_t dir_block[1024];
+        uint32_t dotdot_ino;
+
+        xdir1_ino = ext4_dir_create(&fs, 2u, "xdir1", 5u, now+60u, err, sizeof err);
+        ASSERT(xdir1_ino != 0, "mkdir /xdir1: '%s'", err);
+        xdir2_ino = ext4_dir_create(&fs, 2u, "xdir2", 5u, now+61u, err, sizeof err);
+        ASSERT(xdir2_ino != 0, "mkdir /xdir2: '%s'", err);
+        leaf_ino  = ext4_file_create(&fs, xdir1_ino, "leaf.txt", 8u,
+                                     (uint16_t)(0x8000u | 0644u), now+62u,
+                                     err, sizeof err);
+        ASSERT(leaf_ino != 0, "create /xdir1/leaf.txt: '%s'", err);
+
+        /* Snapshot link counts of root and xsub before the move. */
+        {
+            static uint8_t inblk[1024];
+            uint32_t off;
+            uint64_t fb;
+            uint32_t g, idx;
+            const uint8_t *bgd;
+            uint64_t it;
+
+            for (int phase = 0; phase < 2; phase++) {
+                uint32_t ino = (phase == 0) ? 2u : sub_ino;
+                g   = (ino - 1u) / fs.sb.inodes_per_group;
+                idx = (ino - 1u) % fs.sb.inodes_per_group;
+                bgd = fs.bgd_buf + g * fs.bgd_size;
+                it  = ((uint64_t)((fs.bgd_size>=64u)?(((uint32_t)bgd[0x28])
+                       |((uint32_t)bgd[0x29]<<8)|((uint32_t)bgd[0x2A]<<16)
+                       |((uint32_t)bgd[0x2B]<<24)) : 0u) << 32)
+                    | (((uint32_t)bgd[0x08])|((uint32_t)bgd[0x09]<<8)
+                       |((uint32_t)bgd[0x0A]<<16)|((uint32_t)bgd[0x0B]<<24));
+                fb  = it + (uint64_t)idx * fs.sb.inode_size / fs.sb.block_size;
+                off = (uint32_t)((uint64_t)idx * fs.sb.inode_size % fs.sb.block_size);
+                rc  = ext4_fs_read_block(&fs, fb, inblk);
+                ASSERT(rc == 0, "snapshot inode read");
+                {
+                    uint32_t nl = (uint32_t)inblk[off+0x1A] | ((uint32_t)inblk[off+0x1B]<<8);
+                    if (phase == 0) pre_root_nlinks = nl;
+                    else            pre_xsub_nlinks = nl;
+                }
+            }
+        }
+
+        rc = ext4_rename_xdir(&fs, 2u, xdir1_ino, sub_ino,
+                              "xdir1", 5u, now+70u, err, sizeof err);
+        ASSERT(rc == 0, "xdir DIR rename: '%s'", err);
+        ASSERT(ext4_path_lookup(&fs, "/xdir1") == 0, "/xdir1 still in root");
+        ASSERT(ext4_path_lookup(&fs, "/xsub/xdir1") == xdir1_ino,
+               "/xsub/xdir1 missing or wrong inode");
+        ASSERT(ext4_path_lookup(&fs, "/xsub/xdir1/leaf.txt") == leaf_ino,
+               "/xsub/xdir1/leaf.txt missing — child entry not preserved");
+
+        /* --- 7. Verify ..'s inode points at xsub --- */
+        rc = ext4_inode_read(&fs, xdir1_ino, &dir_inode);
+        ASSERT(rc == 0, "moved dir inode read");
+        {
+            uint64_t phys;
+            rc = ext4_extent_lookup(&fs, dir_inode.i_block, 0, &phys);
+            ASSERT(rc == 0, "moved dir extent lookup");
+            rc = ext4_fs_read_block(&fs, phys, dir_block);
+            ASSERT(rc == 0, "moved dir block read");
+        }
+        dotdot_ino = (uint32_t)dir_block[12]
+                   | ((uint32_t)dir_block[13] << 8)
+                   | ((uint32_t)dir_block[14] << 16)
+                   | ((uint32_t)dir_block[15] << 24);
+        ASSERT(dotdot_ino == sub_ino, "..'s inode is %u, expected sub_ino=%u",
+               (unsigned)dotdot_ino, (unsigned)sub_ino);
+
+        /* --- 8. Verify nlinks: root -1, xsub +1 --- */
+        {
+            static uint8_t inblk[1024];
+            uint32_t off;
+            uint64_t fb;
+            uint32_t g, idx;
+            const uint8_t *bgd;
+            uint64_t it;
+
+            for (int phase = 0; phase < 2; phase++) {
+                uint32_t ino = (phase == 0) ? 2u : sub_ino;
+                g   = (ino - 1u) / fs.sb.inodes_per_group;
+                idx = (ino - 1u) % fs.sb.inodes_per_group;
+                bgd = fs.bgd_buf + g * fs.bgd_size;
+                it  = ((uint64_t)((fs.bgd_size>=64u)?(((uint32_t)bgd[0x28])
+                       |((uint32_t)bgd[0x29]<<8)|((uint32_t)bgd[0x2A]<<16)
+                       |((uint32_t)bgd[0x2B]<<24)) : 0u) << 32)
+                    | (((uint32_t)bgd[0x08])|((uint32_t)bgd[0x09]<<8)
+                       |((uint32_t)bgd[0x0A]<<16)|((uint32_t)bgd[0x0B]<<24));
+                fb  = it + (uint64_t)idx * fs.sb.inode_size / fs.sb.block_size;
+                off = (uint32_t)((uint64_t)idx * fs.sb.inode_size % fs.sb.block_size);
+                rc  = ext4_fs_read_block(&fs, fb, inblk);
+                ASSERT(rc == 0, "post-move inode read");
+                {
+                    uint32_t nl = (uint32_t)inblk[off+0x1A] | ((uint32_t)inblk[off+0x1B]<<8);
+                    if (phase == 0) post_root_nlinks = nl;
+                    else            post_xsub_nlinks = nl;
+                }
+            }
+            ASSERT(post_root_nlinks + 1u == pre_root_nlinks,
+                   "root nlinks pre=%u post=%u (expected post=pre-1)",
+                   (unsigned)pre_root_nlinks, (unsigned)post_root_nlinks);
+            ASSERT(post_xsub_nlinks == pre_xsub_nlinks + 1u,
+                   "xsub nlinks pre=%u post=%u (expected post=pre+1)",
+                   (unsigned)pre_xsub_nlinks, (unsigned)post_xsub_nlinks);
+        }
+
+        /* --- 9. Second hop: /xsub/xdir1 -> /xdir2/sub (rename mid-move) --- */
+        rc = ext4_rename_xdir(&fs, sub_ino, xdir1_ino, xdir2_ino,
+                              "sub", 3u, now+80u, err, sizeof err);
+        ASSERT(rc == 0, "xdir DIR rename hop2: '%s'", err);
+        ASSERT(ext4_path_lookup(&fs, "/xsub/xdir1") == 0,
+               "/xsub/xdir1 still found after second move");
+        ASSERT(ext4_path_lookup(&fs, "/xdir2/sub") == xdir1_ino,
+               "/xdir2/sub missing — second move broke");
+        ASSERT(ext4_path_lookup(&fs, "/xdir2/sub/leaf.txt") == leaf_ino,
+               "/xdir2/sub/leaf.txt — leaf lost across two hops");
+
+        /* --- 10. Cycle: refuse moving xdir2 into xdir2/sub (its own descendant) --- */
+        rc = ext4_rename_xdir(&fs, 2u, xdir2_ino, xdir1_ino,
+                              "xdir2cycle", 10u, now+90u, err, sizeof err);
+        ASSERT(rc != 0, "cycle move (xdir2 -> /xdir2/sub) must be refused");
+    }
 
     ASSERT(fs.jbd.start == 0, "journal must be clean");
 

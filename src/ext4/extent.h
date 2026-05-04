@@ -89,11 +89,22 @@ int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
                 const char *new_name, uint8_t new_name_len,
                 char *err, uint32_t err_len);
 
-/* Move a regular file from old_parent_ino to new_parent_ino with a new
- * name. Single 4-block transaction (both dir blocks + both parent
- * inodes) so a crash never leaves the file orphaned or double-linked.
- * Refuses directories (would also need ".." update + link counts),
- * htree parents, and multi-block dirs. Caller must ensure the
+/* Move a regular file or directory from old_parent_ino to new_parent_ino
+ * with a new name. Atomic: a crash leaves the entry in exactly one of
+ * the two parents, never both, never neither.
+ *
+ * Regular files: 4 trans blocks (both dir blocks + both parent inodes),
+ *   collapsing to 3 when the two parents' inodes happen to share an
+ *   fs_block.
+ *
+ * Directories: 5 trans blocks (above + the moved dir's first data
+ *   block whose ".." entry is rewritten to new_parent_ino), and the
+ *   parents' i_links_count is adjusted -1/+1 to track the lost/gained
+ *   ".." backlink. Refused if moving the dir into one of its own
+ *   descendants (cycle) or moving root.
+ *
+ * Refuses htree parents, multi-block parent dirs (single-block-dir
+ * limit shared with same-parent rename). Caller must ensure the
  * destination name doesn't already exist. Returns 0 on success. */
 int ext4_rename_xdir(struct ext4_fs *fs,
                      uint32_t old_parent_ino, uint32_t file_ino,
