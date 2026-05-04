@@ -191,8 +191,12 @@ REM Under MS-DOS 4, DIR Y:\NEWDIR lists the *contents* of NEWDIR,
 REM not NEWDIR itself in Y:\.  Use DIR Y: so the entry is visible.
 echo === DIR Y: (NEWDIR must appear) === >> A:\OUT.TXT
 DIR Y: >> A:\OUT.TXT
-echo === Remove directory: RD Y:\NEWDIR === >> A:\OUT.TXT
-RD Y:\NEWDIR >> A:\OUT.TXT
+echo === Cross-dir DIR rename: Y:\NEWDIR -^> Y:\SUBDIR\MVDDIR === >> A:\OUT.TXT
+A:\EXT4MV.EXE Y:\NEWDIR Y:\SUBDIR\MVDDIR >> A:\OUT.TXT
+echo === DIR Y: (NEWDIR must be gone after move) === >> A:\OUT.TXT
+DIR Y: >> A:\OUT.TXT
+echo === Remove directory: RD Y:\SUBDIR\MVDDIR === >> A:\OUT.TXT
+RD Y:\SUBDIR\MVDDIR >> A:\OUT.TXT
 echo === DIR Y: (NEWDIR must be gone, TARGET extended to 2048) === >> A:\OUT.TXT
 DIR Y: >> A:\OUT.TXT
 echo === Truncate-on-replace setup: COPY Y:\TARGET.TXT Y:\REPLACE.TXT (2048B) === >> A:\OUT.TXT
@@ -344,9 +348,19 @@ if ! grep -F -A20 'DIR Y: (NEWDIR must appear)' <<<"$OUT" | grep -qE "NEWDIR[[:s
     echo "FAIL: Y:\\NEWDIR not visible in DIR Y: after MD" >&2
     fail=1
 fi
-# RD Y:\NEWDIR — must be absent from the subsequent DIR Y: listing.
-if grep -F -A20 'DIR Y: (NEWDIR must be gone' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
-    echo "FAIL: Y:\\NEWDIR still visible after RD" >&2
+# Cross-dir DIRECTORY rename: ext4mv reports success, MVDDIR appears under
+# Y:\SUBDIR, NEWDIR is gone from root, RD at the new path leaves both clean.
+if ! grep -qE "Renamed 'Y:.NEWDIR' -> 'Y:.SUBDIR.MVDDIR'" <<<"$OUT"; then
+    echo "FAIL: ext4mv didn't report cross-dir DIRECTORY rename success" >&2
+    fail=1
+fi
+if grep -F -A20 'DIR Y: (NEWDIR must be gone after move)' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
+    echo "FAIL: Y:\\NEWDIR still visible after cross-dir rename moved it away" >&2
+    fail=1
+fi
+# Final RD — NEWDIR and MVDDIR must both be absent from root listing.
+if grep -F -A20 'DIR Y: (NEWDIR must be gone, TARGET' <<<"$OUT" | grep -qE "(NEWDIR|MVDDIR)[[:space:]]+<DIR>"; then
+    echo "FAIL: NEWDIR or MVDDIR still visible in root after RD" >&2
     fail=1
 fi
 # Multi-file COPY /B (HELLO + VERY~876 -> A:\BOTH.TXT). Differs from
@@ -436,7 +450,7 @@ if grep -qE 'A{100}' <<<"$WRITE_AFTER"; then
     fail=1
 fi
 # DIR Y: after writes must show TARGET sized 2048 (the extend bumped it).
-if ! grep -F -A12 'DIR Y: (NEWDIR must be gone' <<<"$OUT" | grep -qE "TARGET[[:space:]]+TXT[[:space:]]+2[,]?048"; then
+if ! grep -F -A12 'DIR Y: (NEWDIR must be gone, TARGET' <<<"$OUT" | grep -qE "TARGET[[:space:]]+TXT[[:space:]]+2[,]?048"; then
     echo "FAIL: TARGET.TXT not 2048 bytes in DIR Y: after extend" >&2
     fail=1
 fi

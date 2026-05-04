@@ -109,9 +109,13 @@ echo === Make directory: MD Y:\NEWDIR === >> C:\OUT.TXT
 MD Y:\NEWDIR >> C:\OUT.TXT
 echo === DIR Y:\NEWDIR (must exist) === >> C:\OUT.TXT
 DIR Y:\NEWDIR >> C:\OUT.TXT
-echo === Remove directory: RD Y:\NEWDIR === >> C:\OUT.TXT
-RD Y:\NEWDIR >> C:\OUT.TXT
-echo === DIR Y: (NEWDIR must be gone) === >> C:\OUT.TXT
+echo === Cross-dir DIR rename: Y:\NEWDIR -^> Y:\SUBDIR\MVDDIR === >> C:\OUT.TXT
+C:\EXT4MV.EXE Y:\NEWDIR Y:\SUBDIR\MVDDIR >> C:\OUT.TXT
+echo === DIR Y:\NEWDIR (must NOT exist after move) === >> C:\OUT.TXT
+DIR Y:\NEWDIR >> C:\OUT.TXT
+echo === Remove directory: RD Y:\SUBDIR\MVDDIR === >> C:\OUT.TXT
+RD Y:\SUBDIR\MVDDIR >> C:\OUT.TXT
+echo === DIR Y: (MVDDIR must be gone) === >> C:\OUT.TXT
 DIR Y: >> C:\OUT.TXT
 echo === Truncate-on-replace setup: COPY Y:\TARGET.TXT Y:\REPLACE.TXT (2048B) === >> C:\OUT.TXT
 COPY Y:\TARGET.TXT Y:\REPLACE.TXT >> C:\OUT.TXT
@@ -243,13 +247,26 @@ if ! grep -F -A8 'DIR Y:\RENAMED.TXT' <<<"$OUT" | grep -qE "RENAMED[[:space:]]+T
     fail=1
 fi
 # MD Y:\NEWDIR must produce a visible directory.
-if ! grep -F -A8 'DIR Y:\NEWDIR' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
+if ! grep -F -A8 'DIR Y:\NEWDIR (must exist)' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
     echo "FAIL: Y:\\NEWDIR not visible as DIR after MD" >&2
     fail=1
 fi
-# RD Y:\NEWDIR — must be absent from the subsequent DIR Y: listing.
-if grep -F -A12 'DIR Y: (NEWDIR must be gone)' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
-    echo "FAIL: Y:\\NEWDIR still visible after RD" >&2
+# Cross-dir DIRECTORY rename: ext4mv reports success, moved dir appears at new
+# path, original path is gone, RD at new path leaves both root entries clean.
+if ! grep -qE "Renamed 'Y:.NEWDIR' -> 'Y:.SUBDIR.MVDDIR'" <<<"$OUT"; then
+    echo "FAIL: ext4mv didn't report cross-dir DIRECTORY rename success" >&2
+    fail=1
+fi
+if grep -F -A8 'DIR Y:\NEWDIR (must NOT exist after move)' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
+    echo "FAIL: Y:\\NEWDIR still in root after cross-dir rename" >&2
+    fail=1
+fi
+if grep -F -A8 'DIR Y:\NEWDIR (must NOT exist after move)' <<<"$OUT" | grep -qE "NEWDIR[[:space:]]+<DIR>"; then
+    echo "FAIL: Y:\\NEWDIR still visible after cross-dir rename moved it away" >&2
+    fail=1
+fi
+if grep -F -A12 'DIR Y: (MVDDIR must be gone)' <<<"$OUT" | grep -qE "(NEWDIR|MVDDIR)[[:space:]]+<DIR>"; then
+    echo "FAIL: NEWDIR or MVDDIR still visible in root after RD" >&2
     fail=1
 fi
 # Dynamic free-space check: final free (after all writes) must equal initial
