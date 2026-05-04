@@ -27,7 +27,7 @@ if [[ ! -f "$EXT4_SRC_IMG" ]]; then
 fi
 
 
-for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe ext4wr.exe; do
+for f in ext4.exe ext4chk.exe ext4dir.exe ext4cnt.exe ext4dmp.exe ext4wr.exe ext4xfr.exe; do
     if [[ ! -x "$DOS_DIR/$f" ]]; then
         echo "ERROR: $DOS_DIR/$f missing. Run: make dos-build" >&2
         exit 1
@@ -113,6 +113,8 @@ echo === TYPE Y:\VERY~EB7.TXT (8.3 alias roundtrip) === >> C:\OUT.TXT
 TYPE Y:\VERY~EB7.TXT >> C:\OUT.TXT
 echo === Verify g_fs.sb integrity (canary) === >> C:\OUT.TXT
 C:\EXT4CHK.EXE /V >> C:\OUT.TXT
+echo === Get Extended Free Space (INT 21h AX=7303h -> AL=A3h) === >> C:\OUT.TXT
+C:\EXT4XFR.EXE Y:\ >> C:\OUT.TXT
 echo === Subfunction call counts === >> C:\OUT.TXT
 C:\EXT4CNT.EXE >> C:\OUT.TXT
 echo === FindFirst capture dump === >> C:\OUT.TXT
@@ -139,6 +141,7 @@ mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4dir.exe" ::EXT4DIR.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4cnt.exe" ::EXT4CNT.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4dmp.exe" ::EXT4DMP.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4wr.exe"  ::EXT4WR.EXE
+mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$DOS_DIR/ext4xfr.exe" ::EXT4XFR.EXE
 mcopy -i "$TEST_IMG@@$PARTITION_OFFSET" -o "$FREEDOS_DIR/fdauto-test.bat" ::FDAUTO.BAT
 
 # Boot in DOSBox-X, then kill after timeout (poweroff doesn't exit DOSBox-X).
@@ -237,6 +240,24 @@ if [[ -z "$INIT_FREE" || "$FINAL_FREE" -ne "$EXPECTED_FINAL" ]]; then
 fi
 if ! grep -qE "verify:.*-> OK" <<<"$OUT"; then
     echo "FAIL: g_fs.sb integrity canary tripped — see 'verify:' lines above" >&2
+    fail=1
+fi
+# Direct INT 2Fh AX=11A3h must return data consistent with the install-time
+# snapshot (this is the redirector handler, bypasses the kernel — works
+# regardless of FreeDOS build).  AX=7303h via the kernel may take either the
+# AL=A3h path (FreeDOS Build 2045+) or fall back to AL=0Ch (older builds);
+# either way the byte totals must match.
+EXTFREE_DIRECT_FREE=$(awk '/INT 2Fh AX=11A3h direct/,/INT 21h AX=7303h/' <<<"$OUT" | grep -oE 'bytes free *: *[0-9]+' | grep -oE '[0-9]+$' || true)
+if [[ -z "${EXTFREE_DIRECT_FREE:-}" ]]; then
+    echo "FAIL: ext4xfr didn't print AX=11A3h 'bytes free' line" >&2
+    fail=1
+elif (( EXTFREE_DIRECT_FREE != INIT_FREE )); then
+    echo "FAIL: AX=11A3h direct bytes free (${EXTFREE_DIRECT_FREE}) doesn't match install-time snapshot (${INIT_FREE})" >&2
+    fail=1
+fi
+EXTFREE_KERNEL_FREE=$(awk '/INT 21h AX=7303h on/,EOF' <<<"$OUT" | grep -oE 'bytes free *: *[0-9]+' | head -1 | grep -oE '[0-9]+$' || true)
+if [[ -n "${EXTFREE_KERNEL_FREE:-}" ]] && (( EXTFREE_KERNEL_FREE != INIT_FREE )); then
+    echo "FAIL: AX=7303h via kernel bytes free (${EXTFREE_KERNEL_FREE}) doesn't match install-time snapshot (${INIT_FREE})" >&2
     fail=1
 fi
 # DEL: NEWCOPY.TXT must be absent after DEL, HELLO.TXT must still be present.

@@ -118,7 +118,7 @@ $(HOST_DIR)/host_crc32c_test: tools/host_crc32c_test.c src/util/crc32c.c | $(HOS
 $(HOST_DIR):
 	mkdir -p $@
 
-dos-build: $(DOS_DIR)/ext4cli.exe $(DOS_DIR)/ext4.exe $(DOS_DIR)/ext4chk.exe $(DOS_DIR)/ext4dir.exe $(DOS_DIR)/ext4cnt.exe $(DOS_DIR)/ext4dmp.exe $(DOS_DIR)/ext4wr.exe $(DOS_DIR)/ext4prb.exe
+dos-build: $(DOS_DIR)/ext4cli.exe $(DOS_DIR)/ext4.exe $(DOS_DIR)/ext4chk.exe $(DOS_DIR)/ext4dir.exe $(DOS_DIR)/ext4cnt.exe $(DOS_DIR)/ext4dmp.exe $(DOS_DIR)/ext4wr.exe $(DOS_DIR)/ext4prb.exe $(DOS_DIR)/ext4xfr.exe
 
 $(DOS_DIR)/ext4cli.exe: $(DOS_CLI_OBJ)
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
@@ -142,6 +142,9 @@ $(DOS_DIR)/ext4wr.exe: $(DOS_DIR)/tsr_write.obj
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
 $(DOS_DIR)/ext4prb.exe: $(DOS_DIR)/tsr_probe.obj
+	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
+
+$(DOS_DIR)/ext4xfr.exe: $(DOS_DIR)/tsr_xfree.obj
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
 $(DOS_DIR)/%.obj: %.c | $(DOS_DIR)

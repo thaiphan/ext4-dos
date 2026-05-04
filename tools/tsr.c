@@ -2209,6 +2209,51 @@ extopen_notfound:
             return;
         }
 
+        case 0xA3: { /* REM_GETLARGESPACE — INT 2Fh AX=11A3h.
+                      *
+                      * The 32-bit-precision counterpart to AL=0Ch. Issued by
+                      * FreeDOS's INT 21h AX=7303h dispatch (dosfns.c
+                      * DosGetExtFree); modern callers using the new "Get
+                      * Extended Free Space" API land here. MS-DOS 4 doesn't
+                      * have AX=7303h in its kernel and never gets here — we
+                      * implement this for FreeDOS + Win9x callers.
+                      *
+                      * Register convention from FreeDOS int2f.asm
+                      * remote_getfree (handles AL=0Ch and AL=A3h with the
+                      * same return path):
+                      *   AX = total clusters HIGH 16
+                      *   BX = total clusters LOW  16
+                      *   CX = avail clusters HIGH 16
+                      *   DX = avail clusters LOW  16
+                      *   SI = bytes per sector
+                      *   sectors-per-cluster is implied 1
+                      * Caller does its own scaling if values don't fit a
+                      * downstream API.  CF=0 on success. */
+            uint32_t blocks_total;
+            uint32_t blocks_free;
+            uint32_t bs;
+
+            if (!g_fs_ready) {
+                /* Signal "not supported" so the caller falls back to the
+                 * legacy AL=0Ch path. */
+                r.w.flags |= 1u;
+                r.w.ax = 1u;
+                return;
+            }
+
+            bs           = g_safe_block_size;
+            blocks_total = g_safe_blocks_count_lo;
+            blocks_free  = g_safe_free_blocks_count_lo;
+
+            r.w.ax = (uint16_t)(blocks_total >> 16);
+            r.w.bx = (uint16_t)(blocks_total & 0xFFFFul);
+            r.w.cx = (uint16_t)(blocks_free  >> 16);
+            r.w.dx = (uint16_t)(blocks_free  & 0xFFFFul);
+            r.w.si = (uint16_t)bs;
+            r.w.flags &= ~1u;
+            return;
+        }
+
         case 0x23: /* Qualify Remote File Name (INT 2Fh AX=1123h)
                     *   DS:SI = ASCIIZ path to qualify
                     *   ES:DI = 67-byte output buffer for canonical name
