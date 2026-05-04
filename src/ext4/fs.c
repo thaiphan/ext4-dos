@@ -50,22 +50,20 @@ int ext4_fs_open(struct ext4_fs *fs, struct blockdev *bd, uint64_t partition_lba
     rc = bdev_read(bd, bgd_sector, sectors_to_read, fs->bgd_buf);
     if (rc) return -5;
 
-    /* Journal init + replay is best-effort: a parse failure should not
-     * block mount. Without a replay map we fall back to on-disk state,
-     * which is the pre-replay world (data may be slightly stale for
-     * files written just before a crash). Callers that care can inspect
-     * fs->jbd.present and fs->jbd.replay_active.
+    /* Journal init: a parse failure does not block the mount — callers
+     * can inspect fs->jbd.present. Replay failure is a different story:
+     * after a partial streaming-flush or a cap-exceeded BUILD, reads
+     * could mix replayed and pre-replay data. Refuse the mount in those
+     * cases (RECOVER stays set on disk; a future mount retries
+     * idempotently — clean Linux first if it's persistent).
      *
-     * If the bdev is writable, hard-checkpoint the replay map: flush
-     * journaled blocks to disk, clear RECOVER. After this the FS is
-     * e2fsck-clean and reads no longer need the redirect. On a read-only
-     * bdev we stay in soft-replay mode. */
+     * If the bdev is writable, ext4_journal_checkpoint runs after replay
+     * to (a) flush any soft-replay map built on a writable read-only-mode
+     * fallback, and (b) clear orphan RECOVER stuck from a prior crash-
+     * mid-commit. No-op if already clean. */
     if (ext4_journal_init(fs, jerr, sizeof jerr) == 0 && fs->jbd.present) {
-        (void)ext4_journal_replay(fs, jerr, sizeof jerr);
+        if (ext4_journal_replay(fs, jerr, sizeof jerr) != 0) return -6;
         if (bdev_writable(fs->bd)) {
-            /* Always invoke checkpoint on writable mounts: it self-decides
-             * whether work is needed (replay map populated OR RECOVER stuck
-             * on FS SB from a prior crash-mid-commit). No-op if already clean. */
             (void)ext4_journal_checkpoint(fs, jerr, sizeof jerr);
         }
     }

@@ -74,7 +74,7 @@ vpath %.c tools src/blockdev src/ext4 src/partition src/util
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_orphan_recover_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_xgroup_test $(HOST_DIR)/host_create_test $(HOST_DIR)/host_mkdir_test $(HOST_DIR)/host_rmdir_test $(HOST_DIR)/host_del_test $(HOST_DIR)/host_rename_test $(HOST_DIR)/host_rename_xdir_test $(HOST_DIR)/host_truncate_test $(HOST_DIR)/host_crc32c_test
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_journal_streaming_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_orphan_recover_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_xgroup_test $(HOST_DIR)/host_create_test $(HOST_DIR)/host_mkdir_test $(HOST_DIR)/host_rmdir_test $(HOST_DIR)/host_del_test $(HOST_DIR)/host_rename_test $(HOST_DIR)/host_rename_xdir_test $(HOST_DIR)/host_truncate_test $(HOST_DIR)/host_crc32c_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
@@ -89,6 +89,9 @@ $(HOST_DIR)/host_journal_test: tools/host_journal_test.c $(LIB_SRCS_HOST) | $(HO
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_orphan_recover_test: tools/host_orphan_recover_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
+$(HOST_DIR)/host_journal_streaming_test: tools/host_journal_streaming_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_checkpoint_test: tools/host_checkpoint_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
@@ -168,7 +171,7 @@ $(DOS_DIR)/%.obj: %.c | $(DOS_DIR)
 $(DOS_DIR):
 	mkdir -p $@
 
-host-test: host-build tests/images/journal.img tests/images/journal-csum.img tests/images/write.img tests/images/write-csum.img tests/images/xgroup.img
+host-test: host-build tests/images/journal.img tests/images/journal-csum.img tests/images/journal-large.img tests/images/write.img tests/images/write-csum.img tests/images/xgroup.img
 	@echo "==> running host_features_test"
 	@$(HOST_DIR)/host_features_test
 	@echo "==> running host_crc32c_test"
@@ -189,6 +192,9 @@ host-test: host-build tests/images/journal.img tests/images/journal-csum.img tes
 	@echo "==> running host_orphan_recover_test (metadata_csum, mutates working copy)"
 	@cp tests/images/write-csum.img tests/images/orphan-recover-csum-test.img
 	@$(HOST_DIR)/host_orphan_recover_test tests/images/orphan-recover-csum-test.img
+	@echo "==> running host_journal_streaming_test (>cap unique blocks, mutates working copy)"
+	@cp tests/images/journal-large.img tests/images/journal-large-test.img
+	@$(HOST_DIR)/host_journal_streaming_test tests/images/journal-large-test.img tests/images/journal-large.expect
 	@echo "==> running host_write_test (no-csum, mutates working copy)"
 	@cp tests/images/write.img tests/images/write-test.img
 	@$(HOST_DIR)/host_write_test tests/images/write-test.img
@@ -231,6 +237,9 @@ tests/images/journal.img: scripts/mkfixture-journal.py
 	$(PYTHON) $<
 
 tests/images/journal-csum.img: scripts/mkfixture-journal-csum.py
+	$(PYTHON) $<
+
+tests/images/journal-large.img: scripts/mkfixture-journal-large.py
 	$(PYTHON) $<
 
 tests/images/write.img: scripts/mkfixture-write.py

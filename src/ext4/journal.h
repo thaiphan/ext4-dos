@@ -113,16 +113,28 @@ struct ext4_fs;
  * If parsing fails, returns negative AND fills err with a short reason. */
 int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len);
 
-/* Walk the on-disk log and build the {fs_block -> journal_blk} replay
- * map (and the revoke map). After this returns successfully with
- * jbd->replay_active == 1, the read hook can redirect reads of
- * journaled blocks to their newest committed copy in the log.
+/* Walk the on-disk log and apply replay. Behavior depends on bdev and
+ * build target:
  *
- * No-op if jbd->present == 0 or jbd->start == 0 (clean log).
+ *  - Writable bdev (host build): streaming flush. Each non-revoked tag's
+ *    data block is written straight to its fs_block during the walk;
+ *    cleanup (jsb.start=0, clear RECOVER) is delegated to the post-replay
+ *    ext4_journal_checkpoint call. No in-memory replay map is built, so
+ *    EXT4_JBD_REPLAY_MAP_MAX does NOT cap the journal size.
  *
- * Returns 0 on success. On parse error / capacity exceeded, returns
- * negative and leaves replay_active == 0 — callers can still mount
- * (we just see slightly stale data, same as the pre-replay world). */
+ *  - Read-only bdev, OR DOS TSR build (writable or not): soft replay.
+ *    Builds {fs_block -> journal_blk} map (and revoke map); the read
+ *    hook redirects reads of journaled blocks to their newest committed
+ *    copy in the log. The map is capped at EXT4_JBD_REPLAY_MAP_MAX
+ *    entries; overflow returns negative — ext4_fs_open propagates the
+ *    error and refuses the mount rather than serving pre-replay data.
+ *    (DOS TSR omits streaming because it doesn't fit in the 64 KiB
+ *    _TEXT segment; users seeing the cap-overflow refusal should boot
+ *    Linux to complete recovery.)
+ *
+ * No-op if jbd->present == 0 or jbd->start == 0 (clean log). Returns
+ * 0 on success. On streaming-flush write failure, returns negative
+ * with RECOVER still set on disk — next mount retries idempotently. */
 int ext4_journal_replay(struct ext4_fs *fs, char *err, uint32_t err_len);
 
 /* "Hard replay": apply the replay map to disk so the on-disk state

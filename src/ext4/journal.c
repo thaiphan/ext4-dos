@@ -13,10 +13,33 @@
 
 /* Walk actions — three passes, lwext4-style. SCAN finds the last
  * contiguous valid commit; REVOKE populates the revoke map; BUILD
- * populates the replay map (consulting the now-complete revoke map). */
+ * populates the replay map (consulting the now-complete revoke map);
+ * FLUSH (writable mounts only) skips the map and writes each non-
+ * revoked tag's data block directly to its fs_block on disk — no cap.
+ * SCAN→REVOKE→FLUSH is the writable-mount path; SCAN→REVOKE→BUILD is
+ * the read-only soft-replay path.
+ *
+ * The FLUSH path is omitted on the DOS TSR build (__WATCOMC__) to keep
+ * the _TEXT segment under 64 KiB. The DOS TSR falls back to BUILD on
+ * writable mounts; if BUILD overflows EXT4_JBD_REPLAY_MAP_MAX, the
+ * replay aborts and ext4_fs_open returns an error so the caller
+ * refuses the mount rather than serving stale on-disk data. The
+ * cross-OS scenario (Linux dirties a journal with > cap unique blocks,
+ * user reboots into DOS) is uncommon — workaround is to boot Linux
+ * once and let it complete the recovery before mounting from DOS. */
 #define JBD_ACTION_SCAN   0
 #define JBD_ACTION_REVOKE 1
 #define JBD_ACTION_BUILD  2
+#ifndef __WATCOMC__
+#define JBD_ACTION_FLUSH  3
+#endif
+
+/* Forward decl — iterate_descriptor_tags (FLUSH branch) calls
+ * checkpoint_one_block_buf, defined alongside the other writable-side
+ * helpers further down. */
+static int  checkpoint_one_block_buf(struct ext4_fs *fs, uint64_t fs_block,
+                                     uint32_t jblk, uint8_t is_escape,
+                                     uint8_t *scratch);
 
 /* DGROUP statics — DOS small-model has ~4 KB stack, and bdev_read
  * paths can run with SS != DS in interrupt context. See feedback memory:
@@ -245,14 +268,23 @@ static int iterate_descriptor_tags(struct ext4_fs *fs, uint32_t this_seq,
         (*this_block)++;
         wrap_jblk(fs, this_block);
 
-        if (action == JBD_ACTION_BUILD) {
-            if (!is_revoked(&fs->jbd, fs_block, this_seq)) {
-                if (replay_upsert(&fs->jbd, fs_block, *this_block,
-                                  (uint8_t)is_escape) < 0) {
-                    return -1; /* cap exceeded */
-                }
-            }
+        /* BUILD: add to soft-replay map. FLUSH (host only): write straight
+         * to fs_block (walk order is seq-ascending, so a block journaled
+         * multiple times naturally ends up with its latest version on
+         * disk). FLUSH uses jsb_buf as scratch so it doesn't clobber the
+         * descriptor in walk_buf. */
+        if (action == JBD_ACTION_BUILD
+            && !is_revoked(&fs->jbd, fs_block, this_seq)) {
+            if (replay_upsert(&fs->jbd, fs_block, *this_block,
+                              (uint8_t)is_escape) < 0) return -1;
         }
+#ifndef __WATCOMC__
+        else if (action == JBD_ACTION_FLUSH
+            && !is_revoked(&fs->jbd, fs_block, this_seq)) {
+            if (checkpoint_one_block_buf(fs, fs_block, *this_block,
+                                         (uint8_t)is_escape, jsb_buf) != 0) return -2;
+        }
+#endif
 
         p         += tag_bytes;
         remaining -= (int32_t)tag_bytes;
@@ -382,10 +414,13 @@ static int walk_log(struct ext4_fs *fs, int action, uint32_t *last_seq_io) {
 int ext4_journal_replay(struct ext4_fs *fs, char *err, uint32_t err_len) {
     uint32_t last_seq;
     int      rc;
+    int      writable;
 
     if (err && err_len) err[0] = '\0';
     if (!fs->jbd.present)  return 0;
     if (fs->jbd.start == 0) return 0; /* clean log */
+
+    writable = bdev_writable(fs->bd);
 
     /* Pass 1: SCAN — find last contiguous valid commit. */
     last_seq = 0;
@@ -405,17 +440,34 @@ int ext4_journal_replay(struct ext4_fs *fs, char *err, uint32_t err_len) {
         return rc;
     }
 
-    /* Pass 3: BUILD — populate replay map, skipping tags shadowed by
-     * the revoke map. */
+    /* Pass 3: FLUSH on writable bdev (streams writes, no map cap), or
+     * BUILD on read-only (soft replay via in-memory map, EXT4_JBD_-
+     * REPLAY_MAP_MAX cap applies). On streaming failure RECOVER stays
+     * set on disk so the next mount retries idempotently; cleanup
+     * (zero jsb.start, clear RECOVER) is delegated to fs.c's call to
+     * ext4_journal_checkpoint, whose orphan-RECOVER branch handles the
+     * no-map case. (DOS TSR build uses BUILD unconditionally — see
+     * note next to JBD_ACTION_FLUSH.) */
+#ifdef __WATCOMC__
+    (void)writable;
     rc = walk_log(fs, JBD_ACTION_BUILD, &last_seq);
+#else
+    rc = walk_log(fs, writable ? JBD_ACTION_FLUSH : JBD_ACTION_BUILD, &last_seq);
+#endif
     if (rc) {
         fs->jbd.replay_count = 0;
         fs->jbd.revoke_count = 0;
-        say_dec(err, err_len, "journal build pass failed rc=", rc);
+        say_dec(err, err_len, "journal pass3 failed rc=", rc);
         return rc;
     }
 
+#ifndef __WATCOMC__
+    if (!writable) {
+        fs->jbd.replay_active = (uint8_t)((fs->jbd.replay_count > 0) ? 1 : 0);
+    }
+#else
     fs->jbd.replay_active = (uint8_t)((fs->jbd.replay_count > 0) ? 1 : 0);
+#endif
     return 0;
 }
 
@@ -436,24 +488,28 @@ int ext4_journal_lookup(const struct ext4_fs *fs, uint64_t fs_block,
 /* --- Hard checkpoint (write replay map back to disk) -------------------- */
 
 /* Write one journal-recorded block back to its on-disk fs_block
- * location. Restores the JBD magic if the tag was escaped. Reuses
- * walk_buf — the log walker isn't running concurrently with this. */
-static int checkpoint_one_block(struct ext4_fs *fs, uint64_t fs_block,
-                                uint32_t jblk, uint8_t is_escape) {
+ * location. Restores the JBD magic if the tag was escaped. The caller
+ * picks the scratch buffer: map-based callers pass walk_buf (which is
+ * dormant by then); the streaming-flush walker passes jsb_buf so it
+ * doesn't clobber the descriptor it's iterating over in walk_buf. */
+static int checkpoint_one_block_buf(struct ext4_fs *fs, uint64_t fs_block,
+                                    uint32_t jblk, uint8_t is_escape,
+                                    uint8_t *scratch) {
     uint32_t byte, sector, sectors;
     int      rc;
 
-    rc = ext4_journal_read_log_block(fs, jblk, walk_buf);
+    rc = ext4_journal_read_log_block(fs, jblk, scratch);
     if (rc) return rc;
     if (is_escape) {
-        walk_buf[0] = 0xC0; walk_buf[1] = 0x3B;
-        walk_buf[2] = 0x39; walk_buf[3] = 0x98;
+        scratch[0] = 0xC0; scratch[1] = 0x3B;
+        scratch[2] = 0x39; scratch[3] = 0x98;
     }
     byte    = (uint32_t)(fs_block * (uint64_t)fs->sb.block_size);
     sector  = (uint32_t)(fs->partition_lba + byte / fs->bd->sector_size);
     sectors = fs->sb.block_size / fs->bd->sector_size;
-    return bdev_write(fs->bd, sector, sectors, walk_buf);
+    return bdev_write(fs->bd, sector, sectors, scratch);
 }
+
 
 /* Write one block to the journal log via the journal-inode extent
  * table. Symmetric to ext4_journal_read_log_block on the read side. */
@@ -770,34 +826,32 @@ int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
 int ext4_journal_checkpoint(struct ext4_fs *fs, char *err, uint32_t err_len) {
     uint32_t i;
     int      rc;
-    int      had_replay;
-    int      recover_set;
 
     if (err && err_len) err[0] = '\0';
     if (!fs->jbd.present) return 0;
 
-    had_replay  = fs->jbd.replay_active;
     /* Crash window in ext4_journal_commit: if we crashed after step 1
      * (set RECOVER) but before step 5 (jsb.start update), the next mount
      * sees RECOVER=1 with jsb.start=0. The walker no-ops on start==0, so
      * replay_active stays 0 — but RECOVER would be stuck on disk forever
      * unless we clear it here. e2fsprogs clears RECOVER on any successful
      * recovery, even an empty one; match that behavior. */
-    recover_set = (fs->sb.feature_incompat & 0x4u) != 0u;
-    if (!had_replay && !recover_set) return 0;
+    if (!fs->jbd.replay_active && (fs->sb.feature_incompat & 0x4u) == 0u) return 0;
 
     if (!bdev_writable(fs->bd)) {
         say(err, err_len, "bdev read-only; staying in soft-replay");
         return -3; /* matches BDEV_ERR_RO */
     }
 
-    /* 1. Flush each journaled block to its on-disk location. */
-    if (had_replay) {
+    /* 1. Flush each journaled block to its on-disk location. walk_buf is
+     * dormant by now (we're past the log walker), so reuse it as scratch. */
+    if (fs->jbd.replay_active) {
         for (i = 0; i < fs->jbd.replay_count; i++) {
-            rc = checkpoint_one_block(fs,
-                                      fs->jbd.replay[i].fs_block,
-                                      fs->jbd.replay[i].journal_blk,
-                                      fs->jbd.replay[i].is_escape);
+            rc = checkpoint_one_block_buf(fs,
+                                          fs->jbd.replay[i].fs_block,
+                                          fs->jbd.replay[i].journal_blk,
+                                          fs->jbd.replay[i].is_escape,
+                                          walk_buf);
             if (rc) {
                 say_dec(err, err_len, "checkpoint flush failed at index", (int32_t)i);
                 return rc;
@@ -845,9 +899,13 @@ int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len) {
     inum = fs->sb.journal_inum;
     if (inum == 0) return 0;
 
+    /* The err string is not currently read by any caller, but we keep
+     * say()/say_dec() calls for future debug visibility. snprintf is
+     * avoided here because each varargs call site is heavy in DOS small-
+     * model — these used to be snprintf and pushed the TSR over 64 KiB. */
     rc = ext4_inode_read(fs, inum, &jinode);
     if (rc) {
-        snprintf(err, err_len, "journal inode read failed (rc=%d)", rc);
+        say_dec(err, err_len, "journal inode read failed rc=", rc);
         return -1;
     }
 
@@ -858,18 +916,15 @@ int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len) {
     depth   = le16(jinode.i_block + 6);
 
     if (magic != EXT4_EXT_MAGIC) {
-        snprintf(err, err_len, "journal inode not extent-format (magic=0x%x)",
-                 (unsigned)magic);
+        say(err, err_len, "journal inode not extent-format");
         return -2;
     }
     if (depth != 0) {
-        snprintf(err, err_len, "journal extent tree depth %u unsupported",
-                 (unsigned)depth);
+        say(err, err_len, "journal extent tree depth unsupported");
         return -3;
     }
     if (entries == 0 || entries > EXT4_JBD_EXTENT_MAX) {
-        snprintf(err, err_len, "journal extent count %u out of range",
-                 (unsigned)entries);
+        say(err, err_len, "journal extent count out of range");
         return -4;
     }
 
@@ -890,8 +945,7 @@ int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len) {
     first_phys_block = fs->jbd.extents[0].physical;
 
     if (fs->sb.block_size > sizeof jsb_buf) {
-        snprintf(err, err_len, "fs block_size %lu > jsb buf",
-                 (unsigned long)fs->sb.block_size);
+        say(err, err_len, "fs block_size > jsb buf");
         return -6;
     }
     byte    = (uint32_t)(first_phys_block * (uint64_t)fs->sb.block_size);
@@ -899,7 +953,7 @@ int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len) {
     sectors = fs->sb.block_size / fs->bd->sector_size;
     rc = bdev_read(fs->bd, sector, sectors, jsb_buf);
     if (rc) {
-        snprintf(err, err_len, "journal sb read failed (rc=%d)", rc);
+        say_dec(err, err_len, "journal sb read failed rc=", rc);
         return -7;
     }
 
@@ -909,8 +963,7 @@ int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len) {
     }
     blocktype = be32(jsb_buf + 0x04);
     if (blocktype != EXT4_JBD_BT_SUPERBLOCK && blocktype != EXT4_JBD_BT_SUPER_V2) {
-        snprintf(err, err_len, "journal sb blocktype %lu unexpected",
-                 (unsigned long)blocktype);
+        say(err, err_len, "journal sb blocktype unexpected");
         return -9;
     }
 
@@ -929,24 +982,20 @@ int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len) {
     }
 
     if (fs->jbd.blocksize != fs->sb.block_size) {
-        snprintf(err, err_len, "journal blocksize %lu != fs %lu",
-                 (unsigned long)fs->jbd.blocksize,
-                 (unsigned long)fs->sb.block_size);
+        say(err, err_len, "journal blocksize != fs blocksize");
         return -10;
     }
 
     /* ASYNC_COMMIT changes commit-block placement in ways the walker
-     * misinterprets. Refuse it. CSUM_V2/V3 we tolerate by ignoring (commit
-     * block CRC verification is not yet implemented). REVOKE / 64BIT are
-     * normal. */
+     * misinterprets. Refuse it. CSUM_V2/V3 commit block CRC is verified
+     * via verify_commit_block. REVOKE / 64BIT are normal. */
     unsupported = fs->jbd.feature_incompat & ~((uint32_t)(
         EXT4_JBD_INCOMPAT_REVOKE  |
         EXT4_JBD_INCOMPAT_64BIT   |
         EXT4_JBD_INCOMPAT_CSUM_V2 |
         EXT4_JBD_INCOMPAT_CSUM_V3));
     if (unsupported) {
-        snprintf(err, err_len, "journal incompat 0x%lx unsupported",
-                 (unsigned long)unsupported);
+        say(err, err_len, "journal incompat unsupported");
         return -11;
     }
 
