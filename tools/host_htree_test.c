@@ -131,9 +131,8 @@ int main(int argc, char **argv) {
     pre_ino = ext4_path_lookup(&fs, "/htreedir/file050.txt");
     ASSERT(pre_ino != 0, "/htreedir/file050.txt should exist in fixture");
 
-    /* The actual test: create /htreedir/htreenew.txt. ext4_file_create's
-     * htree path computes the hash, walks dx_root, picks the leaf,
-     * inserts there. */
+    /* CREATE into htree: ext4_file_create's htree path computes the
+     * hash, walks dx_root, picks the leaf, inserts there. */
     new_ino = ext4_file_create(&fs, many_ino,
                                "htreenew.txt", 12u,
                                (uint16_t)(0x8000u | 0644u),
@@ -159,6 +158,25 @@ int main(int argc, char **argv) {
 
     ASSERT(fs.jbd.start == 0, "journal must be clean after htree create");
 
+    /* MKDIR into htree: same path, plus a 2-trans flow (alloc inode,
+     * bump used_dirs_count, then write the new dir's . and .. block,
+     * link it from parent, bump parent's nlink, drop free_inodes). */
+    {
+        uint32_t mkdir_ino = ext4_dir_create(&fs, many_ino,
+                                             "htreesub", 8u,
+                                             0x6A000000u, err, sizeof err);
+        ASSERT(mkdir_ino != 0,
+               "ext4_dir_create into htree dir returned 0, err='%s'", err);
+        if (mkdir_ino != 0) {
+            uint32_t reread = ext4_path_lookup(&fs, "/htreedir/htreesub");
+            ASSERT(reread == mkdir_ino,
+                   "/htreedir/htreesub lookup returned %u, expected %u",
+                   reread, mkdir_ino);
+        }
+    }
+
+    ASSERT(fs.jbd.start == 0, "journal must be clean after htree mkdir");
+
     file_bdev_close(bd);
 
     /* e2fsck -fn must report clean. mke2fs will verify the index
@@ -175,8 +193,8 @@ int main(int argc, char **argv) {
     }
 
     if (failures == 0) {
-        printf("host_htree_test: created /many/htreenew.txt as inode %u in htree dir; "
-               "existing index entries still resolve; e2fsck clean\n", new_ino);
+        printf("host_htree_test: created file + dir inside /htreedir; "
+               "existing entries still resolve; e2fsck clean\n");
         return 0;
     }
     fprintf(stderr, "host_htree_test: %d FAILURE(S)\n", failures);
