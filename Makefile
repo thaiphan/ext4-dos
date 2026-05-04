@@ -23,8 +23,12 @@ PYTHON ?= python3
 CFLAGS_HOST := -std=c99 -Wall -Wextra -Wpedantic -O2 -Isrc
 
 WCC_ENV := WATCOM=$(WATCOM) INCLUDE=$(WATCOM)/h
-WCC_DOS := $(WCC) -bt=dos -ms -zq -os -i=$(WATCOM)/h -i=src
-WCL_DOS := $(WCL) -bt=dos -ms -zq
+# Medium memory model: far code (multiple 64KiB code segments), near data
+# (single DGROUP). Switched from small (-ms) on 2026-05-04 because the
+# TSR _TEXT was at the cap and every hardening item pushed it over.
+# Far calls cost ~2 extra bytes each but unlock multiple code segments.
+WCC_DOS := $(WCC) -bt=dos -mm -zq -os -i=$(WATCOM)/h -i=src
+WCL_DOS := $(WCL) -bt=dos -mm -zq
 
 BUILD    := build
 HOST_DIR := $(BUILD)/host
