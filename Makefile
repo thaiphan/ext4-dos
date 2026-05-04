@@ -74,7 +74,7 @@ vpath %.c tools src/blockdev src/ext4 src/partition src/util
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_xgroup_test $(HOST_DIR)/host_create_test $(HOST_DIR)/host_mkdir_test $(HOST_DIR)/host_rmdir_test $(HOST_DIR)/host_del_test $(HOST_DIR)/host_rename_test $(HOST_DIR)/host_truncate_test $(HOST_DIR)/host_crc32c_test
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_xgroup_test $(HOST_DIR)/host_create_test $(HOST_DIR)/host_mkdir_test $(HOST_DIR)/host_rmdir_test $(HOST_DIR)/host_del_test $(HOST_DIR)/host_rename_test $(HOST_DIR)/host_rename_xdir_test $(HOST_DIR)/host_truncate_test $(HOST_DIR)/host_crc32c_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
@@ -110,6 +110,9 @@ $(HOST_DIR)/host_del_test: tools/host_del_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_rename_test: tools/host_rename_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
+$(HOST_DIR)/host_rename_xdir_test: tools/host_rename_xdir_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_truncate_test: tools/host_truncate_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
@@ -198,6 +201,9 @@ host-test: host-build tests/images/journal.img tests/images/journal-csum.img tes
 	@echo "==> running host_rename_test (rename)"
 	@cp tests/images/write.img tests/images/rename-test.img
 	@$(HOST_DIR)/host_rename_test tests/images/rename-test.img
+	@echo "==> running host_rename_xdir_test (cross-dir rename)"
+	@cp tests/images/write.img tests/images/rename-xdir-test.img
+	@$(HOST_DIR)/host_rename_xdir_test tests/images/rename-xdir-test.img
 	@echo "==> running host_truncate_test (truncate-down)"
 	@cp tests/images/write.img tests/images/truncate-test.img
 	@$(HOST_DIR)/host_truncate_test tests/images/truncate-test.img

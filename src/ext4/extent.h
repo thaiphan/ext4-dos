@@ -83,11 +83,27 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
 
 /* Rename a file or directory in-place within parent_ino.  Updates the
  * directory entry name to new_name (must fit within the entry's current
- * rec_len).  Same-parent only — cross-directory rename is not supported.
+ * rec_len).  Same-parent only — see ext4_rename_xdir for cross-dir.
  * Returns 0 on success, -1 on failure. */
 int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
                 const char *new_name, uint8_t new_name_len,
                 char *err, uint32_t err_len);
+
+/* Move a regular file from old_parent_ino to new_parent_ino with a new
+ * name. Single 4-block transaction (both dir blocks + both parent
+ * inodes) so a crash never leaves the file orphaned or double-linked.
+ * Refuses directories (would also need ".." update + link counts),
+ * htree parents, and multi-block dirs. Caller must ensure the
+ * destination name doesn't already exist. Returns 0 on success.
+ *
+ * Not compiled in DOS small-model builds — see extent.c. */
+#ifndef __DOS__
+int ext4_rename_xdir(struct ext4_fs *fs,
+                     uint32_t old_parent_ino, uint32_t file_ino,
+                     uint32_t new_parent_ino, const char *new_name,
+                     uint8_t  new_name_len, uint32_t now_unix,
+                     char *err, uint32_t err_len);
+#endif
 
 /* Remove a regular file from parent_ino.  Frees each data block (one
  * 3-block journal transaction per block), then frees the inode + removes

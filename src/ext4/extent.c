@@ -301,6 +301,52 @@ static uint32_t dir_block_csum(const struct ext4_fs *fs, uint32_t parent_ino,
     return crc;
 }
 
+/* Compute the location of inode `ino`'s on-disk slot, read the FS block
+ * holding it into `buf`, and (optionally) return the generation field.
+ * Used when we need to write the inode back through the journal — caller
+ * subsequently modifies bytes at `buf + offset_in_block` and includes
+ * `fs_block` in the transaction. */
+static int read_inode_block(struct ext4_fs *fs, uint32_t ino, uint8_t *buf,
+                            uint64_t *out_fs_block, uint32_t *out_offset,
+                            uint32_t *out_gen) {
+    uint32_t g  = (ino - 1u) / fs->sb.inodes_per_group;
+    uint32_t i  = (ino - 1u) % fs->sb.inodes_per_group;
+    const uint8_t *b0 = fs->bgd_buf + g * fs->bgd_size;
+    uint64_t it = ((uint64_t)((fs->bgd_size >= 64u) ? le32(b0 + 0x28) : 0u) << 32)
+                | (uint64_t)le32(b0 + 0x08);
+    uint64_t ib = (uint64_t)i * fs->sb.inode_size;
+    uint64_t fs_block = it + ib / fs->sb.block_size;
+    uint32_t offset   = (uint32_t)(ib % fs->sb.block_size);
+    *out_fs_block = fs_block;
+    *out_offset   = offset;
+    if (ext4_fs_read_block(fs, fs_block, buf) != 0) return -1;
+    if (out_gen) *out_gen = le32(buf + offset + 0x64);
+    return 0;
+}
+
+/* Stamp the 12-byte tail-csum sentinel on a dir block.  No-op if
+ * metadata_csum isn't on.  Used after every modification to a directory
+ * block — collapsing what was an 11-line repeated boilerplate at every
+ * call site.  Call ONCE after all modifications to dir_blk; the sentinel
+ * fields are zeroed and the csum is computed over the whole block
+ * (including the zeroed-out csum bytes). */
+static void dir_block_set_tail_csum(const struct ext4_fs *fs, uint8_t *dir_blk,
+                                    uint32_t parent_ino, uint32_t parent_gen) {
+    uint32_t tail;
+    uint32_t cs;
+    if (!(fs->sb.feature_ro_compat & 0x400u)) return;
+    tail = fs->sb.block_size - 12u;
+    dir_blk[tail+0]=dir_blk[tail+1]=0;
+    dir_blk[tail+2]=dir_blk[tail+3]=0;
+    dir_blk[tail+4]=12u; dir_blk[tail+5]=0u;
+    dir_blk[tail+6]=0u;  dir_blk[tail+7]=0xDEu;
+    dir_blk[tail+8]=dir_blk[tail+9]=0;
+    dir_blk[tail+10]=dir_blk[tail+11]=0;
+    cs = dir_block_csum(fs, parent_ino, parent_gen, dir_blk);
+    dir_blk[tail+8]=(uint8_t)cs;        dir_blk[tail+9]=(uint8_t)(cs>>8);
+    dir_blk[tail+10]=(uint8_t)(cs>>16); dir_blk[tail+11]=(uint8_t)(cs>>24);
+}
+
 /* Find and allocate a free inode across all groups. Sets alloc_inode_num
  * and alloc_inode_group; modifies scratch_bitmap (inode bitmap) and
  * scratch_bgd (BGD block).
@@ -554,23 +600,7 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
         dir_blk[slot_off + 7] = (fs->sb.feature_incompat & 0x2u) ? 1u : 0u; /* EXT4_FT_REGULAR=1 */
         memcpy(dir_blk + slot_off + 8u, name, name_len);
     }
-    /* Update / write dir block tail csum sentinel. */
-    if (fs->sb.feature_ro_compat & 0x400u) {
-        uint32_t tail_off = fs->sb.block_size - 12u;
-        uint32_t csum;
-        /* Ensure sentinel fields are correct before computing csum. */
-        dir_blk[tail_off + 0] = dir_blk[tail_off + 1] = 0;
-        dir_blk[tail_off + 2] = dir_blk[tail_off + 3] = 0;
-        dir_blk[tail_off + 4] = 12u;  dir_blk[tail_off + 5] = 0u;
-        dir_blk[tail_off + 6] = 0u;   dir_blk[tail_off + 7] = 0xDEu;
-        dir_blk[tail_off + 8] = dir_blk[tail_off + 9] = 0;
-        dir_blk[tail_off + 10] = dir_blk[tail_off + 11] = 0;
-        csum = dir_block_csum(fs, parent_ino, parent_gen, dir_blk);
-        dir_blk[tail_off + 8]  = (uint8_t) csum;
-        dir_blk[tail_off + 9]  = (uint8_t)(csum >>  8);
-        dir_blk[tail_off + 10] = (uint8_t)(csum >> 16);
-        dir_blk[tail_off + 11] = (uint8_t)(csum >> 24);
-    }
+    dir_block_set_tail_csum(fs, dir_blk, parent_ino, parent_gen);
 
     /* --- Read SB block + decrement free_inodes_count --- */
     bgd_fs_block        = (fs->sb.block_size > 1024u) ? 1u : 2u;
@@ -1457,18 +1487,7 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
         scratch_data[17] = (uint8_t)(dotdot_rec >> 8);
         scratch_data[18] = 2u;  scratch_data[19] = ft_dir;
         scratch_data[20] = '.'; scratch_data[21] = '.';
-        /* tail csum sentinel */
-        if (fs->sb.feature_ro_compat & 0x400u) {
-            uint32_t tail = fs->sb.block_size - 12u;
-            uint32_t cs;
-            scratch_data[tail + 4] = 12u;
-            scratch_data[tail + 7] = 0xDEu;
-            cs = dir_block_csum(fs, new_ino, 0u, scratch_data);
-            scratch_data[tail + 8]  = (uint8_t)cs;
-            scratch_data[tail + 9]  = (uint8_t)(cs >>  8);
-            scratch_data[tail + 10] = (uint8_t)(cs >> 16);
-            scratch_data[tail + 11] = (uint8_t)(cs >> 24);
-        }
+        dir_block_set_tail_csum(fs, scratch_data, new_ino, 0u);
     }
 
     /* Insert new dir entry into parent's dir block (scratch_parent_dir).
@@ -1489,21 +1508,7 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
         scratch_parent_dir[slot_off + 7] = ft_dir;
         memcpy(scratch_parent_dir + slot_off + 8u, name, name_len);
     }
-    if (fs->sb.feature_ro_compat & 0x400u) {
-        uint32_t tail = fs->sb.block_size - 12u;
-        uint32_t cs;
-        scratch_parent_dir[tail + 0] = scratch_parent_dir[tail + 1] = 0;
-        scratch_parent_dir[tail + 2] = scratch_parent_dir[tail + 3] = 0;
-        scratch_parent_dir[tail + 4] = 12u; scratch_parent_dir[tail + 5] = 0u;
-        scratch_parent_dir[tail + 6] = 0u;  scratch_parent_dir[tail + 7] = 0xDEu;
-        scratch_parent_dir[tail + 8]  = scratch_parent_dir[tail + 9]  = 0;
-        scratch_parent_dir[tail + 10] = scratch_parent_dir[tail + 11] = 0;
-        cs = dir_block_csum(fs, parent_ino, parent_gen, scratch_parent_dir);
-        scratch_parent_dir[tail + 8]  = (uint8_t)cs;
-        scratch_parent_dir[tail + 9]  = (uint8_t)(cs >>  8);
-        scratch_parent_dir[tail + 10] = (uint8_t)(cs >> 16);
-        scratch_parent_dir[tail + 11] = (uint8_t)(cs >> 24);
-    }
+    dir_block_set_tail_csum(fs, scratch_parent_dir, parent_ino, parent_gen);
 
     /* Re-read new dir's inode block (tx1 committed it), add extent + size. */
     if (ext4_fs_read_block(fs, new_inode_fs_block, scratch_inode_block) != 0) {
@@ -1714,18 +1719,7 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
             scratch_parent_dir[parent_slot_off + 2] = scratch_parent_dir[parent_slot_off + 3] = 0;
         }
     }
-    if (fs->sb.feature_ro_compat & 0x400u) {
-        uint32_t tail = fs->sb.block_size - 12u; uint32_t cs;
-        scratch_parent_dir[tail+0]=scratch_parent_dir[tail+1]=0;
-        scratch_parent_dir[tail+2]=scratch_parent_dir[tail+3]=0;
-        scratch_parent_dir[tail+4]=12u; scratch_parent_dir[tail+5]=0u;
-        scratch_parent_dir[tail+6]=0u; scratch_parent_dir[tail+7]=0xDEu;
-        scratch_parent_dir[tail+8]=scratch_parent_dir[tail+9]=0;
-        scratch_parent_dir[tail+10]=scratch_parent_dir[tail+11]=0;
-        cs = dir_block_csum(fs, parent_ino, parent_gen, scratch_parent_dir);
-        scratch_parent_dir[tail+8]=(uint8_t)cs; scratch_parent_dir[tail+9]=(uint8_t)(cs>>8);
-        scratch_parent_dir[tail+10]=(uint8_t)(cs>>16); scratch_parent_dir[tail+11]=(uint8_t)(cs>>24);
-    }
+    dir_block_set_tail_csum(fs, scratch_parent_dir, parent_ino, parent_gen);
 
     bgd_fs_block       = (fs->sb.block_size > 1024u) ? 1u : 2u;
     sb_fs_block        = (fs->sb.block_size > 1024u) ? 0u : 1u;
@@ -2111,18 +2105,7 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
             scratch_parent_dir[parent_slot_off+2]=scratch_parent_dir[parent_slot_off+3]=0;
         }
     }
-    if (fs->sb.feature_ro_compat & 0x400u) {
-        uint32_t tail=fs->sb.block_size-12u; uint32_t cs;
-        scratch_parent_dir[tail+0]=scratch_parent_dir[tail+1]=0;
-        scratch_parent_dir[tail+2]=scratch_parent_dir[tail+3]=0;
-        scratch_parent_dir[tail+4]=12u; scratch_parent_dir[tail+5]=0u;
-        scratch_parent_dir[tail+6]=0u; scratch_parent_dir[tail+7]=0xDEu;
-        scratch_parent_dir[tail+8]=scratch_parent_dir[tail+9]=0;
-        scratch_parent_dir[tail+10]=scratch_parent_dir[tail+11]=0;
-        cs=dir_block_csum(fs,parent_ino,parent_gen,scratch_parent_dir);
-        scratch_parent_dir[tail+8]=(uint8_t)cs; scratch_parent_dir[tail+9]=(uint8_t)(cs>>8);
-        scratch_parent_dir[tail+10]=(uint8_t)(cs>>16); scratch_parent_dir[tail+11]=(uint8_t)(cs>>24);
-    }
+    dir_block_set_tail_csum(fs, scratch_parent_dir, parent_ino, parent_gen);
 
     /* Free inode: bitmap + BGD (free_inodes++) + SB + zero inode slot. */
     inode_group = (file_ino - 1u) / fs->sb.inodes_per_group;
@@ -2470,18 +2453,7 @@ int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
             scratch_parent_dir[entry_off + k] = 0;
         memcpy(scratch_parent_dir + entry_off + 8u, new_name, new_name_len);
     }
-    if (fs->sb.feature_ro_compat & 0x400u) {
-        uint32_t tail=fs->sb.block_size-12u; uint32_t cs;
-        scratch_parent_dir[tail+0]=scratch_parent_dir[tail+1]=0;
-        scratch_parent_dir[tail+2]=scratch_parent_dir[tail+3]=0;
-        scratch_parent_dir[tail+4]=12u; scratch_parent_dir[tail+5]=0u;
-        scratch_parent_dir[tail+6]=0u; scratch_parent_dir[tail+7]=0xDEu;
-        scratch_parent_dir[tail+8]=scratch_parent_dir[tail+9]=0;
-        scratch_parent_dir[tail+10]=scratch_parent_dir[tail+11]=0;
-        cs=dir_block_csum(fs,parent_ino,parent_gen,scratch_parent_dir);
-        scratch_parent_dir[tail+8]=(uint8_t)cs; scratch_parent_dir[tail+9]=(uint8_t)(cs>>8);
-        scratch_parent_dir[tail+10]=(uint8_t)(cs>>16); scratch_parent_dir[tail+11]=(uint8_t)(cs>>24);
-    }
+    dir_block_set_tail_csum(fs, scratch_parent_dir, parent_ino, parent_gen);
 
     /* Update parent inode mtime. */
     {
@@ -2512,6 +2484,210 @@ int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
 
     return 0;
 }
+
+/* --- Cross-directory rename --------------------------------------------- */
+
+/* Excluded from DOS small-model builds: the TSR's _TEXT segment is at
+ * its 64 KiB cap and adding ~2 KiB of new code overflows the link.  The
+ * host build (which has no such cap) compiles and tests this normally;
+ * DOS-side cross-dir support is a follow-up that needs either function
+ * extraction or a memory-model bump. */
+#ifndef __DOS__
+
+/* Move file_ino's dir entry from old_parent to new_parent (with new name).
+ * Single 4-block journal transaction (old_dir_block + new_dir_block + both
+ * parent inode blocks) so a crash either leaves the file in old_parent or
+ * in new_parent — never both, never neither.  Refuses htree dirs, multi-
+ * block dirs (the existing same-parent rename has the same restriction),
+ * and renaming directories (would also need to update the moved dir's
+ * ".." entry and adjust both parents' link counts — out of scope).
+ *
+ * Caller is responsible for guaranteeing old_parent != new_parent and
+ * that the destination name doesn't already exist. */
+int ext4_rename_xdir(struct ext4_fs *fs,
+                     uint32_t old_parent_ino, uint32_t file_ino,
+                     uint32_t new_parent_ino, const char *new_name,
+                     uint8_t  new_name_len, uint32_t now_unix,
+                     char *err, uint32_t err_len) {
+    static struct ext4_inode old_par_inode;
+    static struct ext4_inode new_par_inode;
+    static struct ext4_inode file_inode;
+    static uint64_t old_dir_phys;
+    static uint64_t new_dir_phys;
+    uint32_t       old_par_gen, new_par_gen;
+    uint32_t       new_rec_needed;
+    uint32_t       slot_off = 0;
+    int            found_old = 0, found_new = 0;
+    uint32_t       old_slot_off = 0, old_prev_off = 0xFFFFFFFFu;
+    uint64_t       old_par_inode_block, new_par_inode_block;
+    uint32_t       old_par_inode_offset, new_par_inode_offset;
+    uint8_t        ft;
+    int            rc;
+
+    if (err && err_len) err[0] = '\0';
+    if (old_parent_ino == new_parent_ino) {
+        say_simple(err, err_len, "same parent — use ext4_rename"); return -1;
+    }
+    if (new_name_len == 0u) {
+        say_simple(err, err_len, "empty name"); return -1;
+    }
+
+    /* Read both parent inodes + the file inode (to determine file type
+     * and refuse directories — moving a dir would also need to update
+     * its "..").*/
+    if (ext4_inode_read(fs, old_parent_ino, &old_par_inode) != 0) {
+        say_simple(err, err_len, "old parent inode read failed"); return -1;
+    }
+    if (ext4_inode_read(fs, new_parent_ino, &new_par_inode) != 0) {
+        say_simple(err, err_len, "new parent inode read failed"); return -1;
+    }
+    if (ext4_inode_read(fs, file_ino, &file_inode) != 0) {
+        say_simple(err, err_len, "file inode read failed"); return -1;
+    }
+    if ((file_inode.mode & 0xF000u) == EXT4_S_IFDIR) {
+        say_simple(err, err_len, "moving directories not supported"); return -1;
+    }
+    if ((old_par_inode.flags & 0x1000u) || (new_par_inode.flags & 0x1000u)) {
+        say_simple(err, err_len, "htree parent not supported"); return -1;
+    }
+
+    new_rec_needed = (8u + (uint32_t)new_name_len + 3u) & ~(uint32_t)3u;
+
+    if (read_inode_block(fs, old_parent_ino, scratch_inode_block,
+                         &old_par_inode_block, &old_par_inode_offset, &old_par_gen) != 0) {
+        say_simple(err, err_len, "old parent inode block read"); return -1;
+    }
+    if (read_inode_block(fs, new_parent_ino, scratch_parent_inode,
+                         &new_par_inode_block, &new_par_inode_offset, &new_par_gen) != 0) {
+        say_simple(err, err_len, "new parent inode block read"); return -1;
+    }
+
+    /* Find old entry in old parent's first dir block (single-block dirs only). */
+    if (ext4_extent_lookup(fs, old_par_inode.i_block, 0, &old_dir_phys) != 0) {
+        say_simple(err, err_len, "old parent dir block lookup"); return -1;
+    }
+    if (ext4_fs_read_block(fs, old_dir_phys, scratch_parent_dir) != 0) {
+        say_simple(err, err_len, "old parent dir block read"); return -1;
+    }
+    {
+        uint32_t off = 0, prev = 0xFFFFFFFFu;
+        while (off + 8u <= fs->sb.block_size) {
+            uint16_t rec = le16(scratch_parent_dir + off + 4);
+            uint32_t ino = le32(scratch_parent_dir + off);
+            if (rec < 8u || rec > fs->sb.block_size - off) break;
+            if (scratch_parent_dir[off+7] == 0xDEu && rec == 12u && ino == 0u) {
+                off += rec; continue;
+            }
+            if (ino == file_ino) {
+                old_slot_off = off; old_prev_off = prev; found_old = 1; break;
+            }
+            prev = off; off += rec;
+        }
+    }
+    if (!found_old) {
+        say_simple(err, err_len, "file not in old parent"); return -1;
+    }
+
+    /* Find a slot for the new entry in new parent's first dir block. */
+    if (ext4_extent_lookup(fs, new_par_inode.i_block, 0, &new_dir_phys) != 0) {
+        say_simple(err, err_len, "new parent dir block lookup"); return -1;
+    }
+    if (ext4_fs_read_block(fs, new_dir_phys, scratch_data) != 0) {
+        say_simple(err, err_len, "new parent dir block read"); return -1;
+    }
+    {
+        uint32_t off = 0;
+        while (off + 8u <= fs->sb.block_size) {
+            uint16_t rec = le16(scratch_data + off + 4);
+            uint8_t  nl  = scratch_data[off + 6];
+            uint32_t ino = le32(scratch_data + off);
+            uint32_t real_sz;
+            if (rec < 8u || rec > fs->sb.block_size - off) break;
+            if (scratch_data[off+7] == 0xDEu && rec == 12u && ino == 0u) {
+                off += rec; continue;
+            }
+            real_sz = (ino != 0u) ? ((8u + nl + 3u) & ~(uint32_t)3u) : 0u;
+            if (rec >= real_sz + new_rec_needed) {
+                slot_off  = off + real_sz;
+                found_new = 1;
+                if (ino != 0u) {
+                    scratch_data[off + 4] = (uint8_t) real_sz;
+                    scratch_data[off + 5] = (uint8_t)(real_sz >> 8);
+                }
+                break;
+            }
+            off += rec;
+        }
+    }
+    if (!found_new) {
+        say_simple(err, err_len, "no room in new parent dir"); return -1;
+    }
+
+    /* Insert new entry in new parent. file_type field carried over. */
+    ft = (fs->sb.feature_incompat & 0x2u) ? 1u : 0u;  /* EXT4_FT_REGULAR */
+    {
+        uint32_t remaining = fs->sb.block_size - slot_off;
+        if (fs->sb.feature_ro_compat & 0x400u) {
+            if (remaining >= 12u) remaining -= 12u;
+        }
+        scratch_data[slot_off + 0] = (uint8_t) file_ino;
+        scratch_data[slot_off + 1] = (uint8_t)(file_ino >>  8);
+        scratch_data[slot_off + 2] = (uint8_t)(file_ino >> 16);
+        scratch_data[slot_off + 3] = (uint8_t)(file_ino >> 24);
+        scratch_data[slot_off + 4] = (uint8_t) remaining;
+        scratch_data[slot_off + 5] = (uint8_t)(remaining >> 8);
+        scratch_data[slot_off + 6] = new_name_len;
+        scratch_data[slot_off + 7] = ft;
+        memcpy(scratch_data + slot_off + 8u, new_name, new_name_len);
+    }
+    dir_block_set_tail_csum(fs, scratch_data, new_parent_ino, new_par_gen);
+
+    /* Remove old entry: extend predecessor's rec_len, or zero inode field. */
+    {
+        uint16_t cr = le16(scratch_parent_dir + old_slot_off + 4);
+        if (old_prev_off != 0xFFFFFFFFu) {
+            uint16_t pr = le16(scratch_parent_dir + old_prev_off + 4);
+            uint16_t nr = (uint16_t)(pr + cr);
+            scratch_parent_dir[old_prev_off + 4] = (uint8_t) nr;
+            scratch_parent_dir[old_prev_off + 5] = (uint8_t)(nr >> 8);
+        } else {
+            scratch_parent_dir[old_slot_off + 0] = 0;
+            scratch_parent_dir[old_slot_off + 1] = 0;
+            scratch_parent_dir[old_slot_off + 2] = 0;
+            scratch_parent_dir[old_slot_off + 3] = 0;
+        }
+    }
+    dir_block_set_tail_csum(fs, scratch_parent_dir, old_parent_ino, old_par_gen);
+
+    /* Update both parent inode mtimes + recompute their checksums. */
+    {
+        uint8_t *opi = scratch_inode_block + old_par_inode_offset;
+        opi[0x10] = (uint8_t) now_unix;
+        opi[0x11] = (uint8_t)(now_unix >>  8);
+        opi[0x12] = (uint8_t)(now_unix >> 16);
+        opi[0x13] = (uint8_t)(now_unix >> 24);
+        ext4_inode_recompute_csum(fs, old_parent_ino, opi);
+    }
+    {
+        uint8_t *npi = scratch_parent_inode + new_par_inode_offset;
+        npi[0x10] = (uint8_t) now_unix;
+        npi[0x11] = (uint8_t)(now_unix >>  8);
+        npi[0x12] = (uint8_t)(now_unix >> 16);
+        npi[0x13] = (uint8_t)(now_unix >> 24);
+        ext4_inode_recompute_csum(fs, new_parent_ino, npi);
+    }
+
+    scratch_trans.block_count = 4u;
+    scratch_trans.fs_block[0] = old_dir_phys;          scratch_trans.buf[0] = scratch_parent_dir;
+    scratch_trans.fs_block[1] = new_dir_phys;          scratch_trans.buf[1] = scratch_data;
+    scratch_trans.fs_block[2] = old_par_inode_block;   scratch_trans.buf[2] = scratch_inode_block;
+    scratch_trans.fs_block[3] = new_par_inode_block;   scratch_trans.buf[3] = scratch_parent_inode;
+    rc = ext4_journal_commit(fs, &scratch_trans, err, err_len);
+    if (rc) return -1;
+    return 0;
+}
+
+#endif /* !__DOS__ */
 
 int ext4_file_read_head(struct ext4_fs *fs, const struct ext4_inode *inode,
                         uint32_t length, void *out_buf) {
