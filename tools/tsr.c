@@ -2038,6 +2038,32 @@ extopen_notfound:
                         return;
                     }
                 }
+                if (pos < file_size) {
+                    /* Truncate-down: free trailing data blocks past pos and
+                     * shrink inode.size.  Re-read the inode from disk after
+                     * the commit so slot->inode reflects the truncated
+                     * extent tree (ext4_file_truncate writes back in place
+                     * but doesn't update our cached struct). */
+                    static char werr_t[64];
+                    int rc_t;
+                    werr_t[0] = '\0';
+                    rc_t = ext4_file_truncate(&g_fs, slot->inode_num,
+                                              (uint64_t)pos,
+                                              slot->inode.mtime + 1u,
+                                              werr_t, sizeof werr_t);
+                    g_ff_capture.last_write_rc = (int16_t)rc_t;
+                    if (rc_t == 0) {
+                        if (ext4_inode_read(&g_fs, slot->inode_num,
+                                            &slot->inode) == 0) {
+                            *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF) =
+                                (uint32_t)slot->inode.size;
+                            r.w.ax = 0u;
+                            r.w.flags &= ~1u;
+                            return;
+                        }
+                    }
+                    memcpy(g_ff_capture.last_write_err, werr_t, sizeof werr_t);
+                }
                 /* Truncate-down or extend failed: defer. */
                 r.w.ax = DOS_ERR_WRITE_PROTECT;
                 r.w.flags |= 1u;

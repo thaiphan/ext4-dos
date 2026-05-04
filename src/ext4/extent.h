@@ -97,6 +97,16 @@ int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
 int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
                      char *err, uint32_t err_len);
 
+/* Truncate a regular file to new_size (must be ≤ current size).  Frees
+ * data blocks past the new boundary one at a time (3-block tx each),
+ * then commits a final 1-block tx writing the inode with the truncated
+ * extent tree, updated size + blocks_count, bumped m/ctime, and a
+ * recomputed i_checksum.  Refuses directories and depth>0 trees.
+ * Returns 0 on success, -1 on failure. */
+int ext4_file_truncate(struct ext4_fs *fs, uint32_t inode_num,
+                       uint64_t new_size, uint32_t now_unix,
+                       char *err, uint32_t err_len);
+
 /* Remove an empty directory from parent_ino.  Verifies dir_ino is a
  * directory containing only dot/dotdot, frees the data block (tx1) and
  * inode (tx2), removes the entry from parent_ino, and decrements

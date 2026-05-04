@@ -1898,6 +1898,85 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
 
 /* --- File removal -------------------------------------------------------- */
 
+/* Free one allocated data block at blk_phys: clear its bit in the group's
+ * block bitmap, increment that group's BGD free_blocks_count, increment
+ * the SB free_blocks_count, recompute checksums, and commit a 3-block
+ * journal tx (bitmap + BGD + SB). Used by ext4_file_remove and
+ * ext4_file_truncate. Caller must hold no other scratch state across the
+ * call. */
+static int free_one_data_block(struct ext4_fs *fs, uint64_t blk_phys,
+                               char *err, uint32_t err_len) {
+    uint64_t base = blk_phys - (uint64_t)fs->sb.first_data_block;
+    uint32_t grp  = (uint32_t)(base / fs->sb.blocks_per_group);
+    uint32_t bit  = (uint32_t)(base % fs->sb.blocks_per_group);
+    uint64_t bmap_phys;
+    uint64_t bgd_fs_block       = (fs->sb.block_size > 1024u) ? 1u : 2u;
+    uint64_t sb_fs_block        = (fs->sb.block_size > 1024u) ? 0u : 1u;
+    uint32_t sb_offset_in_block = (fs->sb.block_size > 1024u) ? 1024u : 0u;
+    uint8_t *be;
+    uint8_t *sb;
+
+    if (ext4_fs_read_block(fs, bgd_fs_block, scratch_bgd) != 0) {
+        say_simple(err, err_len, "BGD read failed (blk free)"); return -1;
+    }
+    be = scratch_bgd + grp * fs->bgd_size;
+    bmap_phys = (((fs->bgd_size >= 64u) ? ((uint64_t)le32(be + 0x20) << 32) : 0u)
+                 | (uint64_t)le32(be + 0x00));
+    if (ext4_fs_read_block(fs, bmap_phys, scratch_bitmap) != 0) {
+        say_simple(err, err_len, "block bitmap read failed"); return -1;
+    }
+    scratch_bitmap[bit >> 3] &= ~(uint8_t)(1u << (bit & 7u));
+    {
+        uint16_t fl = le16(be + 0x0C);
+        uint32_t fh = (fs->bgd_size >= 64u) ? le16(be + 0x2C) : 0u;
+        fl++; if (fl == 0u) fh++;
+        be[0x0C] = (uint8_t)fl; be[0x0D] = (uint8_t)(fl >> 8);
+        if (fs->bgd_size >= 64u) {
+            be[0x2C] = (uint8_t)fh; be[0x2D] = (uint8_t)(fh >> 8);
+        }
+    }
+    {
+        uint32_t bcs = bitmap_compute_csum(fs, scratch_bitmap);
+        be[0x18] = (uint8_t)bcs; be[0x19] = (uint8_t)(bcs >> 8);
+        if (fs->bgd_size >= 64u) {
+            be[0x38] = (uint8_t)(bcs >> 16); be[0x39] = (uint8_t)(bcs >> 24);
+        }
+    }
+    {
+        uint16_t bc = bgd_compute_csum(fs, grp, be);
+        be[0x1E] = (uint8_t)bc; be[0x1F] = (uint8_t)(bc >> 8);
+    }
+    if (ext4_fs_read_block(fs, sb_fs_block, scratch_sb) != 0) {
+        say_simple(err, err_len, "SB read failed (blk free)"); return -1;
+    }
+    sb = scratch_sb + sb_offset_in_block;
+    {
+        uint32_t lo = le32(sb + 0x0C);
+        uint32_t hi = (fs->sb.feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT)
+                      ? le32(sb + 0x158) : 0u;
+        uint64_t fb = ((uint64_t)hi << 32) | lo; fb++;
+        sb[0x0C] = (uint8_t)fb; sb[0x0D] = (uint8_t)(fb >> 8);
+        sb[0x0E] = (uint8_t)(fb >> 16); sb[0x0F] = (uint8_t)(fb >> 24);
+        if (fs->sb.feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) {
+            uint32_t h32 = (uint32_t)(fb >> 32);
+            sb[0x158] = (uint8_t)h32; sb[0x159] = (uint8_t)(h32 >> 8);
+            sb[0x15A] = (uint8_t)(h32 >> 16); sb[0x15B] = (uint8_t)(h32 >> 24);
+        }
+        if (fs->sb.feature_ro_compat & 0x400u) {
+            uint32_t cs;
+            sb[0x3FC] = sb[0x3FD] = 0; sb[0x3FE] = sb[0x3FF] = 0;
+            cs = crc32c(CRC32C_INIT, sb, 0x3FC);
+            sb[0x3FC] = (uint8_t)cs; sb[0x3FD] = (uint8_t)(cs >> 8);
+            sb[0x3FE] = (uint8_t)(cs >> 16); sb[0x3FF] = (uint8_t)(cs >> 24);
+        }
+    }
+    scratch_trans.block_count = 3u;
+    scratch_trans.fs_block[0] = bmap_phys;    scratch_trans.buf[0] = scratch_bitmap;
+    scratch_trans.fs_block[1] = bgd_fs_block; scratch_trans.buf[1] = scratch_bgd;
+    scratch_trans.fs_block[2] = sb_fs_block;  scratch_trans.buf[2] = scratch_sb;
+    return ext4_journal_commit(fs, &scratch_trans, err, err_len);
+}
+
 int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
                      char *err, uint32_t err_len) {
     static struct ext4_inode file_inode;
@@ -1965,67 +2044,9 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
             uint64_t phys = ((uint64_t)le16(e + 6) << 32) | (uint64_t)le32(e + 8);
             uint32_t bi;
 
-            /* Free each block in this extent, one group-transaction at a
-             * time.  For most small files all blocks are in the same group
-             * so this is a single transaction. */
             for (bi = 0; bi < (uint32_t)len; bi++) {
-                uint64_t blk_phys  = phys + (uint64_t)bi;
-                uint64_t base      = blk_phys - (uint64_t)fs->sb.first_data_block;
-                uint32_t grp       = (uint32_t)(base / fs->sb.blocks_per_group);
-                uint32_t bit       = (uint32_t)(base % fs->sb.blocks_per_group);
-                uint64_t bmap_phys;
-
-                if (ext4_fs_read_block(fs, bgd_fs_block, scratch_bgd) != 0) {
-                    say_simple(err, err_len, "BGD read failed (blk free)"); return -1;
-                }
-                {
-                    uint8_t *be = scratch_bgd + grp * fs->bgd_size;
-                    uint16_t fl; uint32_t fh;
-                    bmap_phys = (((fs->bgd_size >= 64u)
-                                  ? ((uint64_t)le32(be + 0x20) << 32) : 0u)
-                                 | (uint64_t)le32(be + 0x00));
-                    if (ext4_fs_read_block(fs, bmap_phys, scratch_bitmap) != 0) {
-                        say_simple(err, err_len, "block bitmap read failed"); return -1;
-                    }
-                    scratch_bitmap[bit >> 3] &= ~(uint8_t)(1u << (bit & 7u));
-                    fl = le16(be + 0x0C); fh = (fs->bgd_size >= 64u) ? le16(be + 0x2C) : 0u;
-                    fl++; if (fl == 0u) fh++;
-                    be[0x0C]=(uint8_t)fl; be[0x0D]=(uint8_t)(fl>>8);
-                    if (fs->bgd_size>=64u){be[0x2C]=(uint8_t)fh; be[0x2D]=(uint8_t)(fh>>8);}
-                    { uint32_t bcs=bitmap_compute_csum(fs,scratch_bitmap);
-                      be[0x18]=(uint8_t)bcs; be[0x19]=(uint8_t)(bcs>>8);
-                      if (fs->bgd_size>=64u){be[0x38]=(uint8_t)(bcs>>16);be[0x39]=(uint8_t)(bcs>>24);}
-                    }
-                    { uint16_t bc=bgd_compute_csum(fs,grp,be);
-                      be[0x1E]=(uint8_t)bc; be[0x1F]=(uint8_t)(bc>>8); }
-                }
-                if (ext4_fs_read_block(fs, sb_fs_block, scratch_sb) != 0) {
-                    say_simple(err, err_len, "SB read failed (blk free)"); return -1;
-                }
-                {
-                    uint8_t *sb = scratch_sb + sb_offset_in_block;
-                    uint32_t lo = le32(sb+0x0C);
-                    uint32_t hi = (fs->sb.feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) ? le32(sb+0x158) : 0u;
-                    uint64_t fb = ((uint64_t)hi<<32)|lo; fb++;
-                    sb[0x0C]=(uint8_t)fb; sb[0x0D]=(uint8_t)(fb>>8);
-                    sb[0x0E]=(uint8_t)(fb>>16); sb[0x0F]=(uint8_t)(fb>>24);
-                    if (fs->sb.feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) {
-                        uint32_t h32=(uint32_t)(fb>>32);
-                        sb[0x158]=(uint8_t)h32; sb[0x159]=(uint8_t)(h32>>8);
-                        sb[0x15A]=(uint8_t)(h32>>16); sb[0x15B]=(uint8_t)(h32>>24);
-                    }
-                    if (fs->sb.feature_ro_compat & 0x400u) {
-                        uint32_t cs; sb[0x3FC]=sb[0x3FD]=0; sb[0x3FE]=sb[0x3FF]=0;
-                        cs=crc32c(CRC32C_INIT,sb,0x3FC);
-                        sb[0x3FC]=(uint8_t)cs; sb[0x3FD]=(uint8_t)(cs>>8);
-                        sb[0x3FE]=(uint8_t)(cs>>16); sb[0x3FF]=(uint8_t)(cs>>24);
-                    }
-                }
-                scratch_trans.block_count = 3u;
-                scratch_trans.fs_block[0] = bmap_phys; scratch_trans.buf[0] = scratch_bitmap;
-                scratch_trans.fs_block[1] = bgd_fs_block; scratch_trans.buf[1] = scratch_bgd;
-                scratch_trans.fs_block[2] = sb_fs_block;  scratch_trans.buf[2] = scratch_sb;
-                if (ext4_journal_commit(fs, &scratch_trans, err, err_len) != 0) return -1;
+                if (free_one_data_block(fs, phys + (uint64_t)bi,
+                                        err, err_len) != 0) return -1;
             }
         }
     }
@@ -2187,6 +2208,175 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
     rc = ext4_journal_commit(fs, &scratch_trans, err, err_len);
     if (rc) return -1;
 
+    return 0;
+}
+
+/* --- Truncate-down ------------------------------------------------------- */
+
+/* Shrink a regular file to new_size (must be ≤ current size).  Frees data
+ * blocks past the new boundary one at a time (3-block tx: bitmap + BGD +
+ * fs sb), then commits a final 1-block tx that writes back the inode with
+ * the truncated extent tree, updated size, blocks_count, and mtime.
+ *
+ * The data-block frees happen BEFORE the inode update to avoid a window
+ * in which the inode claims fewer blocks than the bitmap reflects (which
+ * could let allocator hand out a block we're still in the middle of
+ * freeing).  If we crash mid-flight the inode still claims the freed
+ * blocks; e2fsck reconciles by re-flagging them as in-use, costing the
+ * truncate but never causing aliasing.
+ *
+ * Refuses extent-tree depth > 0 (same constraint as the rest of the
+ * write path).  Same-size or no-op calls return success without writing.
+ */
+int ext4_file_truncate(struct ext4_fs *fs, uint32_t inode_num,
+                       uint64_t new_size, uint32_t now_unix,
+                       char *err, uint32_t err_len) {
+    static struct ext4_inode file_inode;
+    uint32_t       bs;
+    uint32_t       new_block_count;
+    uint32_t       new_size_lo, new_size_hi;
+    uint32_t       blocks_count_lo;
+    uint32_t       freed_blocks;
+    uint64_t       inode_table_block;
+    uint64_t       inode_byte_in_table;
+    uint64_t       inode_fs_block;
+    uint32_t       inode_offset_in_block;
+    uint8_t       *inode_in_block;
+    int            rc;
+
+    if (err && err_len) err[0] = '\0';
+    if (inode_num == 0u || inode_num == 2u) {
+        say_simple(err, err_len, "cannot truncate inode 0 or root"); return -1;
+    }
+    if (fs->sb.block_size > EXT4_WRITE_BUF_SIZE) {
+        say_simple(err, err_len, "block_size > write cap"); return -1;
+    }
+
+    if (ext4_inode_read(fs, inode_num, &file_inode) != 0) {
+        say_simple(err, err_len, "file inode read failed"); return -1;
+    }
+    if ((file_inode.mode & 0xF000u) == EXT4_S_IFDIR) {
+        say_simple(err, err_len, "is a directory"); return -1;
+    }
+    if (new_size > file_inode.size) {
+        say_simple(err, err_len, "new_size > current size — not a truncate-down"); return -1;
+    }
+    if (new_size == file_inode.size) return 0;  /* no-op */
+
+    {
+        const uint8_t *iblk = file_inode.i_block;
+        if (le16(iblk + 0) != EXT4_EXT_MAGIC) {
+            say_simple(err, err_len, "file lacks extent header"); return -1;
+        }
+        if (le16(iblk + 6) != 0) {
+            say_simple(err, err_len, "extent tree depth>0"); return -1;
+        }
+    }
+
+    bs              = fs->sb.block_size;
+    new_block_count = (new_size == 0u) ? 0u
+                                       : (uint32_t)((new_size + bs - 1u) / bs);
+    freed_blocks    = 0u;
+
+    /* ----------------------------------------------------------------
+     * Walk extents in reverse: free trailing data blocks (3-block tx
+     * each: bitmap + BGD + SB), and rewrite file_inode.i_block in place
+     * to drop or shrink extents.  The same modified i_block is then
+     * memcpy'd into the inode block in the final transaction.
+     * ---------------------------------------------------------------- */
+    {
+        uint8_t *iblk = file_inode.i_block;
+        int      ei;
+        uint16_t num_extents = le16(iblk + 2);
+        uint16_t kept = num_extents;
+
+        for (ei = (int)num_extents - 1; ei >= 0; ei--) {
+            uint8_t *e = iblk + 12u + (uint32_t)ei * 12u;
+            uint32_t ext_logical = le32(e + 0);
+            uint16_t ext_len     = le16(e + 4);
+            uint64_t ext_phys    = ((uint64_t)le16(e + 6) << 32)
+                                 | (uint64_t)le32(e + 8);
+            uint32_t bi;
+            uint32_t free_count_in_extent;
+
+            if (ext_logical >= new_block_count) {
+                free_count_in_extent = ext_len;
+                kept--;
+                memset(e, 0, 12u);
+            } else if (ext_logical + ext_len > new_block_count) {
+                uint16_t shrunk = (uint16_t)(new_block_count - ext_logical);
+                free_count_in_extent = ext_len - shrunk;
+                e[4] = (uint8_t) shrunk;
+                e[5] = (uint8_t)(shrunk >> 8);
+            } else {
+                break;  /* extent below boundary; extents are ordered */
+            }
+
+            for (bi = 0; bi < free_count_in_extent; bi++) {
+                uint64_t blk_phys = ext_phys + (uint64_t)(ext_len - 1u - bi);
+                if (free_one_data_block(fs, blk_phys, err, err_len) != 0) return -1;
+                freed_blocks++;
+            }
+        }
+        iblk[2] = (uint8_t) kept;
+        iblk[3] = (uint8_t)(kept >> 8);
+    }
+
+    /* ----------------------------------------------------------------
+     * Final transaction: write back inode with truncated extent tree,
+     * new size, reduced blocks_count, and bumped mtime.
+     * ---------------------------------------------------------------- */
+    {
+        uint32_t group          = (inode_num - 1u) / fs->sb.inodes_per_group;
+        uint32_t index_in_group = (inode_num - 1u) % fs->sb.inodes_per_group;
+        const uint8_t *bgd0     = fs->bgd_buf + group * fs->bgd_size;
+        uint32_t lo32 = le32(bgd0 + 0x08);
+        uint32_t hi32 = (fs->bgd_size >= 64u) ? le32(bgd0 + 0x28) : 0u;
+        inode_table_block = ((uint64_t)hi32 << 32) | lo32;
+        inode_byte_in_table   = (uint64_t)index_in_group * fs->sb.inode_size;
+        inode_fs_block        = inode_table_block + inode_byte_in_table / bs;
+        inode_offset_in_block = (uint32_t)(inode_byte_in_table % bs);
+    }
+
+    rc = ext4_fs_read_block(fs, inode_fs_block, scratch_inode_block);
+    if (rc) { say_simple(err, err_len, "inode block read failed (truncate)"); return -1; }
+    inode_in_block = scratch_inode_block + inode_offset_in_block;
+
+    /* Copy the in-memory truncated extent tree into the inode block. */
+    memcpy(inode_in_block + 0x28, file_inode.i_block, 60u);
+
+    /* Update inode size. */
+    new_size_lo = (uint32_t)(new_size & 0xFFFFFFFFul);
+    new_size_hi = (uint32_t)(new_size >> 32);
+    inode_in_block[0x04] = (uint8_t) new_size_lo;
+    inode_in_block[0x05] = (uint8_t)(new_size_lo >>  8);
+    inode_in_block[0x06] = (uint8_t)(new_size_lo >> 16);
+    inode_in_block[0x07] = (uint8_t)(new_size_lo >> 24);
+    inode_in_block[0x6C] = (uint8_t) new_size_hi;
+    inode_in_block[0x6D] = (uint8_t)(new_size_hi >>  8);
+    inode_in_block[0x6E] = (uint8_t)(new_size_hi >> 16);
+    inode_in_block[0x6F] = (uint8_t)(new_size_hi >> 24);
+
+    /* Reduce inode.blocks_lo (units: 512-byte sectors). */
+    blocks_count_lo  = le32(inode_in_block + 0x1C);
+    blocks_count_lo -= freed_blocks * (bs / 512u);
+    inode_in_block[0x1C] = (uint8_t) blocks_count_lo;
+    inode_in_block[0x1D] = (uint8_t)(blocks_count_lo >>  8);
+    inode_in_block[0x1E] = (uint8_t)(blocks_count_lo >> 16);
+    inode_in_block[0x1F] = (uint8_t)(blocks_count_lo >> 24);
+
+    /* mtime + recompute i_checksum (matches extend_block). */
+    inode_in_block[0x10] = (uint8_t) now_unix;
+    inode_in_block[0x11] = (uint8_t)(now_unix >>  8);
+    inode_in_block[0x12] = (uint8_t)(now_unix >> 16);
+    inode_in_block[0x13] = (uint8_t)(now_unix >> 24);
+    ext4_inode_recompute_csum(fs, inode_num, inode_in_block);
+
+    scratch_trans.block_count = 1u;
+    scratch_trans.fs_block[0] = inode_fs_block;
+    scratch_trans.buf[0]      = scratch_inode_block;
+    rc = ext4_journal_commit(fs, &scratch_trans, err, err_len);
+    if (rc) return -1;
     return 0;
 }
 

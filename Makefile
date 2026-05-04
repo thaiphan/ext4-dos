@@ -23,7 +23,7 @@ PYTHON ?= python3
 CFLAGS_HOST := -std=c99 -Wall -Wextra -Wpedantic -O2 -Isrc
 
 WCC_ENV := WATCOM=$(WATCOM) INCLUDE=$(WATCOM)/h
-WCC_DOS := $(WCC) -bt=dos -ms -zq -i=$(WATCOM)/h -i=src
+WCC_DOS := $(WCC) -bt=dos -ms -zq -os -i=$(WATCOM)/h -i=src
 WCL_DOS := $(WCL) -bt=dos -ms -zq
 
 BUILD    := build
@@ -74,7 +74,7 @@ vpath %.c tools src/blockdev src/ext4 src/partition src/util
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_xgroup_test $(HOST_DIR)/host_create_test $(HOST_DIR)/host_mkdir_test $(HOST_DIR)/host_rmdir_test $(HOST_DIR)/host_del_test $(HOST_DIR)/host_rename_test $(HOST_DIR)/host_crc32c_test
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_xgroup_test $(HOST_DIR)/host_create_test $(HOST_DIR)/host_mkdir_test $(HOST_DIR)/host_rmdir_test $(HOST_DIR)/host_del_test $(HOST_DIR)/host_rename_test $(HOST_DIR)/host_truncate_test $(HOST_DIR)/host_crc32c_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
@@ -112,13 +112,16 @@ $(HOST_DIR)/host_del_test: tools/host_del_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 $(HOST_DIR)/host_rename_test: tools/host_rename_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
+$(HOST_DIR)/host_truncate_test: tools/host_truncate_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
 $(HOST_DIR)/host_crc32c_test: tools/host_crc32c_test.c src/util/crc32c.c | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR):
 	mkdir -p $@
 
-dos-build: $(DOS_DIR)/ext4cli.exe $(DOS_DIR)/ext4.exe $(DOS_DIR)/ext4chk.exe $(DOS_DIR)/ext4dir.exe $(DOS_DIR)/ext4cnt.exe $(DOS_DIR)/ext4dmp.exe $(DOS_DIR)/ext4wr.exe $(DOS_DIR)/ext4prb.exe $(DOS_DIR)/ext4xfr.exe
+dos-build: $(DOS_DIR)/ext4cli.exe $(DOS_DIR)/ext4.exe $(DOS_DIR)/ext4chk.exe $(DOS_DIR)/ext4dir.exe $(DOS_DIR)/ext4cnt.exe $(DOS_DIR)/ext4dmp.exe $(DOS_DIR)/ext4wr.exe $(DOS_DIR)/ext4prb.exe $(DOS_DIR)/ext4xfr.exe $(DOS_DIR)/ext4tr.exe
 
 $(DOS_DIR)/ext4cli.exe: $(DOS_CLI_OBJ)
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
@@ -145,6 +148,9 @@ $(DOS_DIR)/ext4prb.exe: $(DOS_DIR)/tsr_probe.obj
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
 $(DOS_DIR)/ext4xfr.exe: $(DOS_DIR)/tsr_xfree.obj
+	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
+
+$(DOS_DIR)/ext4tr.exe: $(DOS_DIR)/tsr_truncate.obj
 	$(WCC_ENV) $(WCL_DOS) $^ -fe=$@
 
 $(DOS_DIR)/%.obj: %.c | $(DOS_DIR)
@@ -192,6 +198,9 @@ host-test: host-build tests/images/journal.img tests/images/journal-csum.img tes
 	@echo "==> running host_rename_test (rename)"
 	@cp tests/images/write.img tests/images/rename-test.img
 	@$(HOST_DIR)/host_rename_test tests/images/rename-test.img
+	@echo "==> running host_truncate_test (truncate-down)"
+	@cp tests/images/write.img tests/images/truncate-test.img
+	@$(HOST_DIR)/host_truncate_test tests/images/truncate-test.img
 
 host-stress: host-build tests/images/stress.img
 	@echo "==> running host_stress_test"
