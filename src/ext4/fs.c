@@ -7,17 +7,13 @@
 int ext4_fs_open(struct ext4_fs *fs, struct blockdev *bd, uint64_t partition_lba) {
     uint8_t  sb_buf[1024];
     uint32_t sector_size;
-    uint64_t bgd_block;
-    uint64_t bgd_byte;
-    uint64_t bgd_sector;
-    uint32_t bgd_total_bytes;
-    uint32_t sectors_to_read;
     char     jerr[64];
     int      rc;
 
     memset(fs, 0, sizeof *fs);
     fs->bd = bd;
     fs->partition_lba = partition_lba;
+    fs->bgd_cached_block = EXT4_FS_BGD_INVALID;
 
     /* Superblock is at byte 1024 of the partition.
      * sector_size assumed to divide 1024 cleanly (true for 512 and 1024). */
@@ -26,9 +22,6 @@ int ext4_fs_open(struct ext4_fs *fs, struct blockdev *bd, uint64_t partition_lba
                    1024u / sector_size, sb_buf);
     if (rc) return -1;
     if (ext4_superblock_parse(sb_buf, &fs->sb) != 0) return -2;
-
-    /* BGD table starts at FS block 1 if block_size > 1024, else block 2. */
-    bgd_block = (fs->sb.block_size > 1024u) ? 1u : 2u;
 
     /* Number of block groups = ceil(blocks_count / blocks_per_group). */
     {
@@ -40,15 +33,13 @@ int ext4_fs_open(struct ext4_fs *fs, struct blockdev *bd, uint64_t partition_lba
 
     fs->bgd_size = (fs->sb.feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) ? 64u : 32u;
 
-    bgd_total_bytes = fs->bgd_count * fs->bgd_size;
-    if (bgd_total_bytes > EXT4_FS_BGD_BUF_SIZE) return -4;
-
-    bgd_byte = bgd_block * (uint64_t)fs->sb.block_size;
-    bgd_sector = partition_lba + bgd_byte / sector_size;
-    sectors_to_read = (bgd_total_bytes + sector_size - 1u) / sector_size;
-
-    rc = bdev_read(bd, bgd_sector, sectors_to_read, fs->bgd_buf);
-    if (rc) return -5;
+    /* BGDs are loaded on demand by ext4_fs_bgd_get — no bulk preload, no
+     * cap on the BGD table size. The bgd_buf field is a single-FS-block
+     * cache; bgd_cached_block tracks which fs_block is resident. Big
+     * filesystems with thousands of groups work transparently — random
+     * access pays one extra bdev_read per cache miss, sequential access
+     * (find_free_block scanning) hits the cache for groups that share an
+     * FS block. */
 
     /* Journal init: a parse failure does not block the mount — callers
      * can inspect fs->jbd.present. Replay failure is a different story:
@@ -99,4 +90,37 @@ int ext4_fs_read_block(struct ext4_fs *fs, uint64_t fs_block, void *out_buf) {
     sector  = (uint32_t)(fs->partition_lba + byte / fs->bd->sector_size);
     sectors = fs->sb.block_size / fs->bd->sector_size;
     return bdev_read(fs->bd, sector, sectors, out_buf);
+}
+
+/* On-demand BGD reader. The BGD table on ext4 starts at fs block 1
+ * (block_size > 1024) or fs block 2 (block_size == 1024 — superblock
+ * shares fs block 0 with the boot sector and lives in fs block 1).
+ * For bigger filesystems the table spans many fs blocks. We read just
+ * the block holding the requested group's BGD entry. */
+const uint8_t *ext4_fs_bgd_get(struct ext4_fs *fs, uint32_t group) {
+    uint32_t bgd_table_start;
+    uint64_t bgd_byte_in_partition;
+    uint64_t fs_block;
+    uint32_t off_in_block;
+
+    if (group >= fs->bgd_count) return NULL;
+
+    bgd_table_start = (fs->sb.block_size > 1024u) ? 1u : 2u;
+    bgd_byte_in_partition = (uint64_t)bgd_table_start * fs->sb.block_size
+                          + (uint64_t)group * fs->bgd_size;
+    fs_block     = bgd_byte_in_partition / fs->sb.block_size;
+    off_in_block = (uint32_t)(bgd_byte_in_partition % fs->sb.block_size);
+
+    if (fs->bgd_cached_block != (uint32_t)fs_block) {
+        if (ext4_fs_read_block(fs, fs_block, fs->bgd_buf) != 0) {
+            fs->bgd_cached_block = EXT4_FS_BGD_INVALID;
+            return NULL;
+        }
+        fs->bgd_cached_block = (uint32_t)fs_block;
+    }
+    return fs->bgd_buf + off_in_block;
+}
+
+void ext4_fs_bgd_invalidate(struct ext4_fs *fs) {
+    fs->bgd_cached_block = EXT4_FS_BGD_INVALID;
 }

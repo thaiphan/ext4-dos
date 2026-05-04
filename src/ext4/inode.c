@@ -29,9 +29,8 @@ int ext4_inode_read(struct ext4_fs *fs, uint32_t ino, struct ext4_inode *out) {
 
     group          = (ino - 1u) / fs->sb.inodes_per_group;
     index_in_group = (ino - 1u) % fs->sb.inodes_per_group;
-    if (group >= fs->bgd_count) return -2;
-
-    bgd = fs->bgd_buf + (uint32_t)group * fs->bgd_size;
+    bgd = ext4_fs_bgd_get(fs, group);
+    if (bgd == NULL) return -2;
     inode_table_lo = le32(bgd + 0x08);
     inode_table_hi = (fs->bgd_size >= 64u) ? le32(bgd + 0x28) : 0u;
     inode_table_block = ((uint64_t)inode_table_hi << 32) | inode_table_lo;

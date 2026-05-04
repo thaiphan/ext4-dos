@@ -174,7 +174,7 @@ int ext4_file_write_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
         say_simple(err, err_len, "inode group out of range");
         return -1;
     }
-    bgd = fs->bgd_buf + (uint32_t)group * fs->bgd_size;
+    bgd = ext4_fs_bgd_get(fs, group);
     {
         uint32_t lo = le32(bgd + 0x08);
         uint32_t hi = (fs->bgd_size >= 64u) ? le32(bgd + 0x28) : 0u;
@@ -453,7 +453,7 @@ static uint32_t s_inode_gen;
 static int read_inode_block(struct ext4_fs *fs, uint32_t ino, uint8_t *buf) {
     uint32_t g  = (ino - 1u) / fs->sb.inodes_per_group;
     uint32_t i  = (ino - 1u) % fs->sb.inodes_per_group;
-    const uint8_t *b0 = fs->bgd_buf + g * fs->bgd_size;
+    const uint8_t *b0 = ext4_fs_bgd_get(fs, g);
     uint64_t it = ((uint64_t)((fs->bgd_size >= 64u) ? le32(b0 + 0x28) : 0u) << 32)
                 | (uint64_t)le32(b0 + 0x08);
     uint64_t ib = (uint64_t)i * fs->sb.inode_size;
@@ -643,7 +643,7 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
         uint32_t       g0, idx0;
         g0   = (parent_ino - 1u) / fs->sb.inodes_per_group;
         idx0 = (parent_ino - 1u) % fs->sb.inodes_per_group;
-        bgd0 = fs->bgd_buf + (uint32_t)g0 * fs->bgd_size;
+        bgd0 = ext4_fs_bgd_get(fs, g0);
         {
             uint32_t lo = le32(bgd0 + 0x08);
             uint32_t hi = (fs->bgd_size >= 64u) ? le32(bgd0 + 0x28) : 0u;
@@ -719,7 +719,7 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
     inode_group         = (alloc_inode_num - 1u) / fs->sb.inodes_per_group;
     inode_idx_in_group  = (alloc_inode_num - 1u) % fs->sb.inodes_per_group;
     {
-        const uint8_t *bgd0 = fs->bgd_buf + (uint32_t)inode_group * fs->bgd_size;
+        const uint8_t *bgd0 = ext4_fs_bgd_get(fs, inode_group);
         uint32_t lo = le32(bgd0 + 0x08);
         uint32_t hi = (fs->bgd_size >= 64u) ? le32(bgd0 + 0x28) : 0u;
         inode_table_block = ((uint64_t)hi << 32) | lo;
@@ -795,10 +795,10 @@ static uint32_t alloc_group;             /* block group index */
 
 /* Initialize scratch_bitmap for a BLOCK_UNINIT group g: mark reserved
  * blocks (SB backup/GDT prefix, block bitmap, inode bitmap, inode table)
- * as used; the rest are free. All data comes from the read-only in-memory
- * BGD cache (not scratch_bgd which may have pending writes). */
-static void init_uninit_bitmap(const struct ext4_fs *fs, uint32_t g) {
-    const uint8_t *bgd = fs->bgd_buf + (uint32_t)g * fs->bgd_size;
+ * as used; the rest are free. Reads BGD on demand (no longer const fs —
+ * ext4_fs_bgd_get may mutate the BGD cache). */
+static void init_uninit_bitmap(struct ext4_fs *fs, uint32_t g) {
+    const uint8_t *bgd = ext4_fs_bgd_get(fs, g);
     uint64_t group_first, bmap_phys, ibmap_phys, itable_phys;
     uint32_t itable_size, bit, b;
     uint64_t start, end;
@@ -1132,7 +1132,7 @@ int ext4_file_extend_block(struct ext4_fs *fs, struct ext4_inode *inode_in,
         return -1;
     }
     {
-        const uint8_t *bgd0 = fs->bgd_buf + (uint32_t)group * fs->bgd_size;
+        const uint8_t *bgd0 = ext4_fs_bgd_get(fs, group);
         uint32_t lo = le32(bgd0 + 0x08);
         uint32_t hi = (fs->bgd_size >= 64u) ? le32(bgd0 + 0x28) : 0u;
         inode_table_block = ((uint64_t)hi << 32) | lo;
@@ -1310,7 +1310,7 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
     {
         uint32_t g0   = (parent_ino - 1u) / fs->sb.inodes_per_group;
         uint32_t idx0 = (parent_ino - 1u) % fs->sb.inodes_per_group;
-        const uint8_t *bgd0 = fs->bgd_buf + g0 * fs->bgd_size;
+        const uint8_t *bgd0 = ext4_fs_bgd_get(fs, g0);
         uint64_t itab = ((uint64_t)((fs->bgd_size >= 64u)
                                     ? le32(bgd0 + 0x28) : 0u) << 32)
                       | (uint64_t)le32(bgd0 + 0x08);
@@ -1398,7 +1398,7 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
     {
         uint32_t g   = (new_ino - 1u) / fs->sb.inodes_per_group;
         uint32_t idx = (new_ino - 1u) % fs->sb.inodes_per_group;
-        const uint8_t *bgd0 = fs->bgd_buf + g * fs->bgd_size;
+        const uint8_t *bgd0 = ext4_fs_bgd_get(fs, g);
         uint64_t itab = ((uint64_t)((fs->bgd_size >= 64u)
                                     ? le32(bgd0 + 0x28) : 0u) << 32)
                       | (uint64_t)le32(bgd0 + 0x08);
@@ -1552,7 +1552,7 @@ uint32_t ext4_dir_create(struct ext4_fs *fs, uint32_t parent_ino,
     {
         uint32_t g   = (parent_ino - 1u) / fs->sb.inodes_per_group;
         uint32_t idx = (parent_ino - 1u) % fs->sb.inodes_per_group;
-        const uint8_t *bgd0 = fs->bgd_buf + g * fs->bgd_size;
+        const uint8_t *bgd0 = ext4_fs_bgd_get(fs, g);
         uint64_t itab = ((uint64_t)((fs->bgd_size >= 64u)
                                     ? le32(bgd0 + 0x28) : 0u) << 32)
                       | (uint64_t)le32(bgd0 + 0x08);
@@ -1676,7 +1676,7 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
     {
         uint32_t g0  = (parent_ino - 1u) / fs->sb.inodes_per_group;
         uint32_t id0 = (parent_ino - 1u) % fs->sb.inodes_per_group;
-        const uint8_t *b0 = fs->bgd_buf + g0 * fs->bgd_size;
+        const uint8_t *b0 = ext4_fs_bgd_get(fs, g0);
         uint64_t it = ((uint64_t)((fs->bgd_size >= 64u) ? le32(b0 + 0x28) : 0u) << 32)
                     | (uint64_t)le32(b0 + 0x08);
         uint64_t ib = (uint64_t)id0 * fs->sb.inode_size;
@@ -1820,7 +1820,7 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
      * avoids e2fsck warnings about non-zero inodes in free bitmap slots). */
     {
         uint32_t g = inode_group, idx = inode_bit;
-        const uint8_t *b0 = fs->bgd_buf + g * fs->bgd_size;
+        const uint8_t *b0 = ext4_fs_bgd_get(fs, g);
         uint64_t it = ((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
         uint64_t ib = (uint64_t)idx * fs->sb.inode_size;
         dir_inode_fs_block = it + ib / fs->sb.block_size;
@@ -1835,7 +1835,7 @@ int ext4_dir_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t dir_ino,
     {
         uint32_t g = (parent_ino-1u)/fs->sb.inodes_per_group;
         uint32_t id= (parent_ino-1u)%fs->sb.inodes_per_group;
-        const uint8_t *b0 = fs->bgd_buf + g * fs->bgd_size;
+        const uint8_t *b0 = ext4_fs_bgd_get(fs, g);
         uint64_t it = ((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
         uint64_t ib = (uint64_t)id * fs->sb.inode_size;
         parent_inode_fs_block = it + ib / fs->sb.block_size;
@@ -2015,7 +2015,7 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
     {
         uint32_t g0 = (parent_ino-1u)/fs->sb.inodes_per_group;
         uint32_t id0= (parent_ino-1u)%fs->sb.inodes_per_group;
-        const uint8_t *b0 = fs->bgd_buf + g0 * fs->bgd_size;
+        const uint8_t *b0 = ext4_fs_bgd_get(fs, g0);
         uint64_t it = ((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
         uint64_t ib = (uint64_t)id0 * fs->sb.inode_size;
         if (ext4_fs_read_block(fs, it + ib/fs->sb.block_size, scratch_inode_block) != 0) {
@@ -2087,7 +2087,7 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
     }
     {
         uint32_t g=inode_group, idx=inode_bit;
-        const uint8_t *b0=fs->bgd_buf+g*fs->bgd_size;
+        const uint8_t *b0=ext4_fs_bgd_get(fs, g);
         uint64_t it=((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
         uint64_t ib=(uint64_t)idx*fs->sb.inode_size;
         file_inode_fs_block = it + ib/fs->sb.block_size;
@@ -2102,7 +2102,7 @@ int ext4_file_remove(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
     {
         uint32_t g=(parent_ino-1u)/fs->sb.inodes_per_group;
         uint32_t id=(parent_ino-1u)%fs->sb.inodes_per_group;
-        const uint8_t *b0=fs->bgd_buf+g*fs->bgd_size;
+        const uint8_t *b0=ext4_fs_bgd_get(fs, g);
         uint64_t it=((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
         uint64_t ib=(uint64_t)id*fs->sb.inode_size;
         parent_inode_fs_block=it+ib/fs->sb.block_size;
@@ -2247,7 +2247,7 @@ int ext4_file_truncate(struct ext4_fs *fs, uint32_t inode_num,
     {
         uint32_t group          = (inode_num - 1u) / fs->sb.inodes_per_group;
         uint32_t index_in_group = (inode_num - 1u) % fs->sb.inodes_per_group;
-        const uint8_t *bgd0     = fs->bgd_buf + group * fs->bgd_size;
+        const uint8_t *bgd0     = ext4_fs_bgd_get(fs, group);
         uint32_t lo32 = le32(bgd0 + 0x08);
         uint32_t hi32 = (fs->bgd_size >= 64u) ? le32(bgd0 + 0x28) : 0u;
         inode_table_block = ((uint64_t)hi32 << 32) | lo32;
@@ -2329,7 +2329,7 @@ int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
     {
         uint32_t g0 = (parent_ino-1u)/fs->sb.inodes_per_group;
         uint32_t id0= (parent_ino-1u)%fs->sb.inodes_per_group;
-        const uint8_t *b0 = fs->bgd_buf + g0 * fs->bgd_size;
+        const uint8_t *b0 = ext4_fs_bgd_get(fs, g0);
         uint64_t it = ((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
         uint64_t ib = (uint64_t)id0 * fs->sb.inode_size;
         if (ext4_fs_read_block(fs, it + ib/fs->sb.block_size, scratch_inode_block) != 0) {
@@ -2390,7 +2390,7 @@ int ext4_rename(struct ext4_fs *fs, uint32_t parent_ino, uint32_t file_ino,
     {
         uint32_t g=(parent_ino-1u)/fs->sb.inodes_per_group;
         uint32_t id=(parent_ino-1u)%fs->sb.inodes_per_group;
-        const uint8_t *b0=fs->bgd_buf+g*fs->bgd_size;
+        const uint8_t *b0=ext4_fs_bgd_get(fs, g);
         uint64_t it=((uint64_t)((fs->bgd_size>=64u)?le32(b0+0x28):0u)<<32)|(uint64_t)le32(b0+0x08);
         uint64_t ib=(uint64_t)id*fs->sb.inode_size;
         parent_inode_fs_block=it+ib/fs->sb.block_size;

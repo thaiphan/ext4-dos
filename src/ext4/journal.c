@@ -839,6 +839,12 @@ int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
      * jsb.sequence to its own (higher) seq in step 5. */
     fs->jbd.sequence = this_seq + 1u;
 
+    /* The trans may have updated a BGD on disk; the BGD cache (single
+     * fs-block) might now be stale if it was holding the same block.
+     * Cheap to invalidate unconditionally — next ext4_fs_bgd_get will
+     * re-read fresh data. */
+    ext4_fs_bgd_invalidate(fs);
+
     return 0;
 }
 
