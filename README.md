@@ -17,6 +17,7 @@ Pre-built `.EXE` binaries are attached to each [GitHub release](../../releases).
 | `ext4cnt.exe` | Read per-subfunction call counters from a loaded TSR. |
 | `ext4dmp.exe` | Dump diagnostic capture state from a loaded TSR. |
 | `ext4xfr.exe` | Verify `INT 2Fh AX=11A3h` (Get Extended Free Space) against the loaded TSR, both directly and via `INT 21h AX=7303h`. |
+| `ext4tr.exe`  | Truncate a file via `INT 21h AH=40h CX=0` ("set EOF to current SFT pos"). Used by the test suite to exercise truncate-down. |
 
 The `ext4` prefix marks them as belonging to the ext4 module; future modules (LFN, networking, etc.) will follow the same pattern.
 
@@ -67,8 +68,8 @@ Drive letters require the trailing `:` (so `Z` alone is treated as nothing — o
 
 - **MS-DOS 4: DIR's "bytes free" display is wrong for ext4 disks larger than ~96 MB.** The redirector returns the right numbers; only MS-DOS 4 DIR's printed `bytes free` line is wrong (a buggy display path inside MS-DOS 4's `COMMAND.COM` itself, not the redirector). FreeDOS displays the correct value. *Actual file operations are unaffected — file sizes, free space used by writes, etc. all work correctly; only that one DIR line is misformatted.* The redirector implements `INT 2Fh AX=11A3h` (Get Extended Free Space) for callers that opt in via `INT 21h AX=7303h`, but MS-DOS 4 `DIR` predates that API and only ever issues the legacy 16-bit query, so a redirector-side fix can't reach it. Workaround: use a different shell (FreeDOS's `FREECOM`) or a third-party DIR utility.
 - **Long filenames** are exposed only as 8.3 aliases (`VERY~876.TXT`), not as their real long names. The DOS LFN ecosystem (DOSLFN.COM etc.) is FAT-only and has no protocol for asking redirectors about long names. See [`docs/dos-internals.md`](docs/dos-internals.md) for the full story.
-- **Cross-directory rename** isn't supported (`REN A:\X.TXT B:\Y.TXT` between two subdirs of D:). Same-directory `REN` works.
-- **Truncate-down** isn't supported — writes can extend a file but can't shrink it.
+- **Cross-directory rename** is implemented and host-tested (`ext4_rename_xdir`) but not yet exposed through the DOS TSR — the small-model `_TEXT` segment is at its 64 KiB cap. Same-directory `REN` works on every DOS. Lifting this needs either a memory-model change or further function extraction.
+- **DOS COPY of a shorter file over an existing one** still fails: truncate-down works at the redirector level (programs that explicitly call `INT 21h AH=40h` with `CX=0` succeed), but `REM_CREATE` refuses replace-on-existing. The natural follow-up is to make `REM_CREATE` truncate-then-open instead of returning access-denied.
 
 ## DOS internals: working notes
 
