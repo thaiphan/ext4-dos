@@ -1,8 +1,8 @@
 # ext4-dos
 
-A 16-bit DOS TSR that exposes an ext4 partition as a drive letter, so DOS programs (`DIR`, `TYPE`, file managers, etc.) can read it the same way they read a FAT drive.
+A 16-bit DOS TSR that exposes an ext4 partition as a drive letter, so DOS programs (`DIR`, `TYPE`, `COPY`, file managers, etc.) can use it the same way they use a FAT drive.
 
-Targets FreeDOS 1.4 and MS-DOS 4.0. Both verified end-to-end: `DIR D:` lists ext4 entries with real timestamps and free space, `TYPE D:\HELLO.TXT` reads file content. Read-only for v1; write support is explicitly a separate later project.
+Targets FreeDOS 1.4 and MS-DOS 4.0. Both verified end-to-end: `DIR D:` lists ext4 entries with real timestamps and free space, `TYPE D:\HELLO.TXT` reads files, `COPY`/`REN`/`DEL`/`MD`/`RD` write through to the underlying ext4 filesystem (with journal commits + metadata checksums + post-run `e2fsck` clean as the regression net).
 
 ## Download
 
@@ -16,6 +16,7 @@ Pre-built `.EXE` binaries are attached to each [GitHub release](../../releases).
 | `ext4dir.exe` | Raw INT 21h FindFirst smoke test against the TSR. |
 | `ext4cnt.exe` | Read per-subfunction call counters from a loaded TSR. |
 | `ext4dmp.exe` | Dump diagnostic capture state from a loaded TSR. |
+| `ext4xfr.exe` | Verify `INT 2Fh AX=11A3h` (Get Extended Free Space) against the loaded TSR, both directly and via `INT 21h AX=7303h`. |
 
 The `ext4` prefix marks them as belonging to the ext4 module; future modules (LFN, networking, etc.) will follow the same pattern.
 
@@ -34,6 +35,10 @@ Reboot. Every boot, the TSR scans BIOS hard disks 0x80..0x83 for an ext4 partiti
 C:\> DIR D:              ext4 root listing — real timestamps, real sizes.
 C:\> TYPE D:\README.MD   Read a file.
 C:\> COPY D:\DATA\*.TXT C:\BACKUP\    Copy files off. Wildcards and subdirs work.
+C:\> COPY MYFILE.TXT D:\ Write a file (creates, extends, journals).
+C:\> MD D:\NEW           Make a directory.
+C:\> DEL D:\OLD.TXT      Delete a file.
+C:\> REN D:\A.TXT B.TXT  Rename within a directory.
 C:\> CD D:\PROJECTS      Change into ext4 directories like normal.
 
 C:\> EXT4 -U             Uninstall. Frees TSR memory; the drive disappears.
@@ -42,7 +47,7 @@ ext4-dos uninstalled
 
 This mirrors how MSCDEX exposes a CD-ROM. The auto-pick chooses the lowest free slot at or above D:, so the letter is stable as long as your other drivers are.
 
-Read-only: `DEL`, `COPY *.* D:\`, `MD D:\NEW`, etc. all fail cleanly with "Write protect error" — the disk is never modified.
+Writes go through an ext4 journal commit per operation (metadata checksums included). The regression suite runs `e2fsck -fn` on the partition after every test boot — failures fail the build.
 
 Long filenames on disk are exposed as 8.3 short names with deterministic `~HHH` aliases (where `HHH` is a hex hash). `DIR` shows you the alias; `TYPE D:\VERY~876.TXT` opens the underlying long-named file. The mapping is stable across runs.
 
@@ -60,9 +65,10 @@ Drive letters require the trailing `:` (so `Z` alone is treated as nothing — o
 
 ## Known limitations
 
-- **Read-only.** Writes are out of scope for v1.
-- **MS-DOS 4: DIR's "bytes free" display is wrong for ext4 disks larger than ~96 MB.** The redirector returns the right numbers; only MS-DOS 4 DIR's printed `bytes free` line is wrong (a buggy display path in MS-DOS 4 itself). FreeDOS shows the correct value. *Actual file operations are unaffected.* Future fix: implement `INT 2Fh AX=11A3h` (Get Extended Free Space) so callers that opt in get full 32-bit precision.
+- **MS-DOS 4: DIR's "bytes free" display is wrong for ext4 disks larger than ~96 MB.** The redirector returns the right numbers; only MS-DOS 4 DIR's printed `bytes free` line is wrong (a buggy display path inside MS-DOS 4's `COMMAND.COM` itself, not the redirector). FreeDOS displays the correct value. *Actual file operations are unaffected — file sizes, free space used by writes, etc. all work correctly; only that one DIR line is misformatted.* The redirector implements `INT 2Fh AX=11A3h` (Get Extended Free Space) for callers that opt in via `INT 21h AX=7303h`, but MS-DOS 4 `DIR` predates that API and only ever issues the legacy 16-bit query, so a redirector-side fix can't reach it. Workaround: use a different shell (FreeDOS's `FREECOM`) or a third-party DIR utility.
 - **Long filenames** are exposed only as 8.3 aliases (`VERY~876.TXT`), not as their real long names. The DOS LFN ecosystem (DOSLFN.COM etc.) is FAT-only and has no protocol for asking redirectors about long names. See [`docs/dos-internals.md`](docs/dos-internals.md) for the full story.
+- **Cross-directory rename** isn't supported (`REN A:\X.TXT B:\Y.TXT` between two subdirs of D:). Same-directory `REN` works.
+- **Truncate-down** isn't supported — writes can extend a file but can't shrink it.
 
 ## DOS internals: working notes
 
@@ -85,13 +91,11 @@ The setup script pins to a specific upstream DOSBox-X commit so the build is rep
 
 Existing DOS-side ext support is ext2-era. Modern Linux disks use ext4-specific features — extent trees, htree directories, the journal, metadata checksums — that older tools don't understand and silently misread. This project aims to do it right, or refuse cleanly when it can't.
 
-## Scope (v1)
+## Scope
 
-- Read-only.
 - Real-mode 16-bit only — no DOS extender required, runs on a stock FreeDOS install.
 - Refuses to mount when an ext4 feature flag we don't explicitly support is present, rather than risk silent misreads.
-
-Write support is a separate, later project.
+- Reads + writes through an ext4 journal, with `metadata_csum` honored on both read and write. Post-run `e2fsck -fn` is the regression net — every test boot validates that the on-disk image is still clean.
 
 ## License
 
