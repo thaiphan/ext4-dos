@@ -425,13 +425,15 @@ elif (( EXTFREE_DIRECT_FREE != INIT_FREE )); then
     echo "FAIL: AX=11A3h direct bytes free (${EXTFREE_DIRECT_FREE}) doesn't match install-time snapshot (${INIT_FREE})" >&2
     fail=1
 fi
-# AX=7303h on MS-DOS 4 must NOT have populated the struct — the kernel
-# either returns CF=1 outright, or silently zeroes (we observe the latter
-# under DOSBox-X).  Either way 'bytes total: 0' is the distinguishing
-# feature: a successful call would report the real ~66 MB.
-EXTFREE_KERNEL_TOTAL=$(awk '/INT 21h AX=7303h on/,EOF' <<<"$OUT" | grep -oE 'bytes total *: *[0-9]+' | head -1 | grep -oE '[0-9]+$' || true)
-if [[ -n "${EXTFREE_KERNEL_TOTAL:-}" ]] && (( EXTFREE_KERNEL_TOTAL != 0 )); then
-    echo "FAIL: AX=7303h on MS-DOS 4 returned non-zero data (kernel shouldn't recognize this call)" >&2
+# AX=7303h on MS-DOS 4 must now succeed — our INT 21h hook bridges
+# AH=73h to the same install-time snapshot AL=A3h uses, since MS-DOS 4
+# kernel itself doesn't know AH=73h. Free bytes must match the snapshot.
+EXTFREE_KERNEL_FREE=$(awk '/INT 21h AX=7303h on/,EOF' <<<"$OUT" | grep -oE 'bytes free *: *[0-9]+' | head -1 | grep -oE '[0-9]+$' || true)
+if [[ -z "${EXTFREE_KERNEL_FREE:-}" ]]; then
+    echo "FAIL: AX=7303h on MS-DOS 4 didn't print bytes free — bridge not firing?" >&2
+    fail=1
+elif (( EXTFREE_KERNEL_FREE != INIT_FREE )); then
+    echo "FAIL: AX=7303h on MS-DOS 4 bytes free (${EXTFREE_KERNEL_FREE}) doesn't match install-time snapshot (${INIT_FREE})" >&2
     fail=1
 fi
 # SKIP(MSDOS4): wildcard DIR Y:\*.TXT assertion — call returns no entries;

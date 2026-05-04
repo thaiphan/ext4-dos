@@ -58,6 +58,14 @@ struct dos_quirks {
                                  * 0:0); kernel returns CF=1 AX=3 for every
                                  * ChDir on Y:, including "Y:\". Other DOS
                                  * versions don't take this path. */
+    uint8_t  ah73_bridge;       /* Enable INT 21h AX=7303h "Get Extended Free
+                                 * Space" bridge. Older DOS versions (MS-DOS
+                                 * 4/5/6, OEM clones from that era) predate
+                                 * the FAT32 extended API and return "invalid
+                                 * function". We forge the dispatch from the
+                                 * install-time snapshot. Disabled on DOS 7+
+                                 * (Win95, FreeDOS) — those have native AH=73h
+                                 * and we'd be shadowing them. */
 };
 
 static struct dos_quirks g_quirks;
@@ -1042,6 +1050,52 @@ found:
                 return;
             }
         }
+    }
+
+    /* AX=7303h "Get Extended Free Space" bridge for pre-Win95 DOS.
+     *
+     * MS-DOS 4/5/6 predate the FAT32 extended API and don't recognize
+     * AH=73h (zero matches for "73h"/"7303"/"11A3" in the MS-DOS 4
+     * source tree; same lineage applies to 5 and 6). For any caller
+     * that wants 32-bit-precise free-space numbers on our drive — Win9x
+     * utilities, cross-platform tools, a swapped-in FREECOM — we forge
+     * the dispatch from the same install-time snapshot AL=A3h uses.
+     *
+     * Layout matches FreeDOS hdr/xstructs.h: 44-byte struct, sectors-
+     * per-cluster=1 with bytes/sector=block_size (caller can re-scale).
+     *
+     * Gated on g_quirks.ah73_bridge (= DOS major < 7). DOS 7+ — Win95,
+     * FreeDOS, OEM clones reporting 7.x — have native AH=73h, so we
+     * never shadow them. */
+    if (g_quirks.ah73_bridge && r.w.ax == 0x7303u && g_fs_ready) {
+        uint8_t __far *path = (uint8_t __far *)MK_FP(r.x.ds, r.w.dx);
+        uint8_t        c0   = path[0];
+        if (c0 >= 'a' && c0 <= 'z') c0 = (uint8_t)(c0 - 0x20);
+        if (c0 == g_drive_letter && path[1] == ':' && r.w.cx >= 44u) {
+            uint8_t __far *xfs = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+            uint32_t       blocks_total = g_safe_blocks_count_lo;
+            uint32_t       blocks_free  = g_safe_free_blocks_count_lo;
+            uint32_t       bs           = g_safe_block_size;
+            uint32_t       total_sectors = blocks_total;
+            uint32_t       free_sectors  = blocks_free;
+            int            i;
+            for (i = 0; i < 44; i++) xfs[i] = 0;
+            *(uint16_t __far *)(xfs + 0x00) = 44u;          /* xfs_datasize */
+            /* xfs_version (+0x02) stays 0 */
+            *(uint32_t __far *)(xfs + 0x04) = 1ul;          /* xfs_clussize (sectors/cluster) */
+            *(uint32_t __far *)(xfs + 0x08) = bs;           /* xfs_secsize  (bytes/sector) */
+            *(uint32_t __far *)(xfs + 0x0C) = blocks_free;  /* xfs_freeclusters */
+            *(uint32_t __far *)(xfs + 0x10) = blocks_total; /* xfs_totalclusters */
+            *(uint32_t __far *)(xfs + 0x14) = free_sectors; /* xfs_freesectors */
+            *(uint32_t __far *)(xfs + 0x18) = total_sectors;/* xfs_totalsectors */
+            *(uint32_t __far *)(xfs + 0x1C) = blocks_free;  /* xfs_freeunits */
+            *(uint32_t __far *)(xfs + 0x20) = blocks_total; /* xfs_totalunits */
+            r.w.ax = 0;
+            r.w.flags &= ~1u;
+            return;
+        }
+        /* Not our drive: chain so kernel returns "invalid function" as
+         * usual (which prompts callers to fall back to AH=36h). */
     }
 
     /* AH=3Bh ChDir intercept for our drive — surgical fix for one MS-DOS 4 bug.
@@ -2396,6 +2450,9 @@ static void detect_dos_quirks(void) {
     g_quirks.cds_flags       = 0x8000u; /* curdir_isnet */
     g_quirks.ioctl_hook      = 0u;
     g_quirks.chdir_intercept = 0u;
+    /* AH=73h was added in MS-DOS 7.0 (Win95). Anything pre-7 needs the
+     * bridge; FreeDOS reports as 7.10 and has its own dispatch. */
+    g_quirks.ah73_bridge     = (g_quirks.major < 7u) ? 1u : 0u;
 
     if (g_quirks.is_msdos4) {
         g_quirks.cds_flags       = 0xC000u; /* curdir_isnet | curdir_inuse */
