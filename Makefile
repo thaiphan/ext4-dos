@@ -42,6 +42,7 @@ LIB_SRCS_HOST := \
 	src/ext4/inode.c \
 	src/ext4/extent.c \
 	src/ext4/dir.c \
+	src/ext4/htree.c \
 	src/ext4/journal.c \
 	src/partition/mbr.c \
 	src/util/crc32c.c
@@ -55,6 +56,7 @@ DOS_CLI_OBJ := \
 	$(DOS_DIR)/inode.obj \
 	$(DOS_DIR)/extent.obj \
 	$(DOS_DIR)/dir.obj \
+	$(DOS_DIR)/htree.obj \
 	$(DOS_DIR)/journal.obj \
 	$(DOS_DIR)/mbr.obj \
 	$(DOS_DIR)/crc32c.obj
@@ -68,6 +70,7 @@ TSR_OBJ := \
 	$(DOS_DIR)/inode.obj \
 	$(DOS_DIR)/extent.obj \
 	$(DOS_DIR)/dir.obj \
+	$(DOS_DIR)/htree.obj \
 	$(DOS_DIR)/journal.obj \
 	$(DOS_DIR)/mbr.obj \
 	$(DOS_DIR)/crc32c.obj
@@ -78,7 +81,7 @@ vpath %.c tools src/blockdev src/ext4 src/partition src/util
 
 all: host-build
 
-host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_journal_csum_test $(HOST_DIR)/host_journal_streaming_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_orphan_recover_test $(HOST_DIR)/host_crash_recovery_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_xgroup_test $(HOST_DIR)/host_create_test $(HOST_DIR)/host_mkdir_test $(HOST_DIR)/host_rmdir_test $(HOST_DIR)/host_del_test $(HOST_DIR)/host_rename_test $(HOST_DIR)/host_rename_xdir_test $(HOST_DIR)/host_truncate_test $(HOST_DIR)/host_crc32c_test
+host-build: $(HOST_DIR)/host_cli $(HOST_DIR)/host_features_test $(HOST_DIR)/host_stress_test $(HOST_DIR)/host_journal_test $(HOST_DIR)/host_journal_csum_test $(HOST_DIR)/host_journal_streaming_test $(HOST_DIR)/host_checkpoint_test $(HOST_DIR)/host_orphan_recover_test $(HOST_DIR)/host_crash_recovery_test $(HOST_DIR)/host_write_test $(HOST_DIR)/host_xgroup_test $(HOST_DIR)/host_create_test $(HOST_DIR)/host_mkdir_test $(HOST_DIR)/host_rmdir_test $(HOST_DIR)/host_del_test $(HOST_DIR)/host_rename_test $(HOST_DIR)/host_rename_xdir_test $(HOST_DIR)/host_truncate_test $(HOST_DIR)/host_crc32c_test $(HOST_DIR)/host_htree_test
 
 $(HOST_DIR)/host_cli: tools/host_cli.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
@@ -87,6 +90,9 @@ $(HOST_DIR)/host_features_test: tools/host_features_test.c src/ext4/features.c |
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_stress_test: tools/host_stress_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
+	$(CC) $(CFLAGS_HOST) -o $@ $^
+
+$(HOST_DIR)/host_htree_test: tools/host_htree_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
 	$(CC) $(CFLAGS_HOST) -o $@ $^
 
 $(HOST_DIR)/host_journal_test: tools/host_journal_test.c $(LIB_SRCS_HOST) | $(HOST_DIR)
@@ -181,7 +187,7 @@ $(DOS_DIR)/%.obj: %.c | $(DOS_DIR)
 $(DOS_DIR):
 	mkdir -p $@
 
-host-test: host-build tests/images/journal.img tests/images/journal-csum.img tests/images/journal-large.img tests/images/write.img tests/images/write-csum.img tests/images/xgroup.img
+host-test: host-build tests/images/journal.img tests/images/journal-csum.img tests/images/journal-large.img tests/images/write.img tests/images/write-csum.img tests/images/xgroup.img tests/images/htree.img
 	@echo "==> running host_features_test"
 	@$(HOST_DIR)/host_features_test
 	@echo "==> running host_crc32c_test"
@@ -239,6 +245,8 @@ host-test: host-build tests/images/journal.img tests/images/journal-csum.img tes
 	@echo "==> running host_truncate_test (truncate-down)"
 	@cp tests/images/write.img tests/images/truncate-test.img
 	@$(HOST_DIR)/host_truncate_test tests/images/truncate-test.img
+	@echo "==> running host_htree_test (htree-aware CREATE into /htreedir)"
+	@$(HOST_DIR)/host_htree_test tests/images/htree.img tests/images/htree-test.img
 
 host-stress: host-build tests/images/stress.img
 	@echo "==> running host_stress_test"
@@ -263,6 +271,9 @@ tests/images/write-csum.img: scripts/mkfixture-write-csum.py
 	$(PYTHON) $<
 
 tests/images/xgroup.img: scripts/mkfixture-xgroup.py
+	$(PYTHON) $<
+
+tests/images/htree.img: scripts/mkfixture-htree.py
 	$(PYTHON) $<
 
 dos-test: dos-build fixture-partitioned

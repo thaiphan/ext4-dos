@@ -28,6 +28,9 @@ int ext4_superblock_parse(const uint8_t *buf, struct ext4_superblock *sb) {
     sb->last_mounted[64] = '\0';
     memcpy(sb->journal_uuid, buf + 0xD0, 16);
     sb->journal_inum = le32(buf + 0xE0);
+    /* htree state (s_hash_seed at 0xEC, s_def_hash_version at 0xFC) is
+     * read on demand in src/ext4/htree.c rather than stored in this
+     * struct — keeps struct ext4_fs's DGROUP layout stable. */
 
     {
         uint32_t blocks_lo = le32(buf + 0x04);

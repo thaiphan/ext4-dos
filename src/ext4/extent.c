@@ -1,6 +1,7 @@
 #include "extent.h"
 #include "fs.h"
 #include "inode.h"
+#include "htree.h"
 #include "journal.h"
 #include "../blockdev/blockdev.h"
 #include "../util/endian.h"
@@ -630,12 +631,6 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
     rc = ext4_inode_read(fs, parent_ino, &parent_inode);
     if (rc) { say_simple(err, err_len, "parent inode read failed"); return 0; }
 
-    /* Refuse htree directories (EXT2_INDEX_FL = 0x1000 in i_flags). */
-    if (parent_inode.flags & 0x1000u) {
-        say_simple(err, err_len, "htree dir — only linear dirs supported");
-        return 0;
-    }
-
     /* Get parent_gen from raw inode: offset 0x64 in inode bytes.
      * Read the inode FS block temporarily into scratch_inode_block. */
     {
@@ -657,9 +652,41 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
         parent_gen = le32(scratch_inode_block + inode_offset + 0x64);
     }
 
-    /* --- Scan parent dir blocks for an entry slot --- */
+    /* --- Locate entry slot in parent dir ---
+     *
+     * For non-htree dirs (linear): scan all parent data blocks; insert
+     * into the first one with room.
+     *
+     * For htree dirs (EXT2_INDEX_FL = 0x1000): walk the dx_root index
+     * to find THE specific leaf block whose hash range covers the new
+     * name. Linux readers consult the index by hash, so an entry
+     * inserted into the wrong leaf would be unreachable. If the
+     * targeted leaf is full, refuse — leaf splits aren't implemented.
+     * Multi-level htrees and unsupported hash versions also refuse.
+     * See src/ext4/htree.c for the index walker. */
     dir_blk = scratch_data;
-    {
+    if (parent_inode.flags & 0x1000u) {
+        uint32_t leaf_logical;
+        int      hrc = ext4_htree_find_leaf(fs, &parent_inode,
+                                             name, name_len,
+                                             scratch_data, &leaf_logical);
+        if (hrc == -2) { say_simple(err, err_len, "htree hash version unsupported"); return 0; }
+        if (hrc == -3) { say_simple(err, err_len, "htree multi-level not supported"); return 0; }
+        if (hrc != 0)  { say_simple(err, err_len, "htree leaf locate failed");        return 0; }
+
+        rc = ext4_extent_lookup(fs, parent_inode.i_block, leaf_logical, &dir_phys);
+        if (rc) { say_simple(err, err_len, "htree leaf lookup failed"); return 0; }
+        dir_fs_block = dir_phys;
+        rc = ext4_fs_read_block(fs, dir_fs_block, dir_blk);
+        if (rc) { say_simple(err, err_len, "htree leaf read failed"); return 0; }
+        found_slot = dir_find_slot_for_entry(dir_blk, fs->sb.block_size,
+                                             new_rec_needed);
+        if (found_slot) slot_off = s_dir_slot_off;
+        if (!found_slot) {
+            say_simple(err, err_len, "htree leaf full — split not implemented");
+            return 0;
+        }
+    } else {
         uint32_t nblocks = (uint32_t)((parent_inode.size + fs->sb.block_size - 1u)
                                       / fs->sb.block_size);
         uint32_t b;
@@ -673,10 +700,10 @@ uint32_t ext4_file_create(struct ext4_fs *fs, uint32_t parent_ino,
                                                  new_rec_needed);
             if (found_slot) slot_off = s_dir_slot_off;
         }
-    }
-    if (!found_slot) {
-        say_simple(err, err_len, "no room in parent dir");
-        return 0;
+        if (!found_slot) {
+            say_simple(err, err_len, "no room in parent dir");
+            return 0;
+        }
     }
 
     /* --- Allocate a free inode --- */
