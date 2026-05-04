@@ -770,23 +770,38 @@ int ext4_journal_commit(struct ext4_fs *fs, struct ext4_jbd_trans *trans,
 int ext4_journal_checkpoint(struct ext4_fs *fs, char *err, uint32_t err_len) {
     uint32_t i;
     int      rc;
+    int      had_replay;
+    int      recover_set;
 
     if (err && err_len) err[0] = '\0';
-    if (!fs->jbd.replay_active) return 0;
+    if (!fs->jbd.present) return 0;
+
+    had_replay  = fs->jbd.replay_active;
+    /* Crash window in ext4_journal_commit: if we crashed after step 1
+     * (set RECOVER) but before step 5 (jsb.start update), the next mount
+     * sees RECOVER=1 with jsb.start=0. The walker no-ops on start==0, so
+     * replay_active stays 0 — but RECOVER would be stuck on disk forever
+     * unless we clear it here. e2fsprogs clears RECOVER on any successful
+     * recovery, even an empty one; match that behavior. */
+    recover_set = (fs->sb.feature_incompat & 0x4u) != 0u;
+    if (!had_replay && !recover_set) return 0;
+
     if (!bdev_writable(fs->bd)) {
         say(err, err_len, "bdev read-only; staying in soft-replay");
         return -3; /* matches BDEV_ERR_RO */
     }
 
     /* 1. Flush each journaled block to its on-disk location. */
-    for (i = 0; i < fs->jbd.replay_count; i++) {
-        rc = checkpoint_one_block(fs,
-                                  fs->jbd.replay[i].fs_block,
-                                  fs->jbd.replay[i].journal_blk,
-                                  fs->jbd.replay[i].is_escape);
-        if (rc) {
-            say_dec(err, err_len, "checkpoint flush failed at index", (int32_t)i);
-            return rc;
+    if (had_replay) {
+        for (i = 0; i < fs->jbd.replay_count; i++) {
+            rc = checkpoint_one_block(fs,
+                                      fs->jbd.replay[i].fs_block,
+                                      fs->jbd.replay[i].journal_blk,
+                                      fs->jbd.replay[i].is_escape);
+            if (rc) {
+                say_dec(err, err_len, "checkpoint flush failed at index", (int32_t)i);
+                return rc;
+            }
         }
     }
 

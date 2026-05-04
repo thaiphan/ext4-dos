@@ -62,7 +62,10 @@ int ext4_fs_open(struct ext4_fs *fs, struct blockdev *bd, uint64_t partition_lba
      * bdev we stay in soft-replay mode. */
     if (ext4_journal_init(fs, jerr, sizeof jerr) == 0 && fs->jbd.present) {
         (void)ext4_journal_replay(fs, jerr, sizeof jerr);
-        if (fs->jbd.replay_active && bdev_writable(fs->bd)) {
+        if (bdev_writable(fs->bd)) {
+            /* Always invoke checkpoint on writable mounts: it self-decides
+             * whether work is needed (replay map populated OR RECOVER stuck
+             * on FS SB from a prior crash-mid-commit). No-op if already clean. */
             (void)ext4_journal_checkpoint(fs, jerr, sizeof jerr);
         }
     }
