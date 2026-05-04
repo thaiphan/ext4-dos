@@ -807,13 +807,22 @@ int ext4_journal_checkpoint(struct ext4_fs *fs, char *err, uint32_t err_len) {
     if (err && err_len) err[0] = '\0';
     if (!fs->jbd.present) return 0;
 
-    /* Crash window in ext4_journal_commit: if we crashed after step 1
-     * (set RECOVER) but before step 5 (jsb.start update), the next mount
-     * sees RECOVER=1 with jsb.start=0. The walker no-ops on start==0, so
-     * replay_active stays 0 — but RECOVER would be stuck on disk forever
-     * unless we clear it here. e2fsprogs clears RECOVER on any successful
-     * recovery, even an empty one; match that behavior. */
-    if (!fs->jbd.replay_active && (fs->sb.feature_incompat & 0x4u) == 0u) return 0;
+    /* Crash windows that need cleanup here:
+     *   (a) commit-step 1 succeeded (RECOVER=1) but step 5 didn't (jsb.start
+     *       still 0): orphan-RECOVER. Walker no-ops; this branch clears RECOVER.
+     *   (b) commit completed and the journaled FS SB landed during checkpoint
+     *       (overwriting the on-disk RECOVER bit back to 0) but the
+     *       update_jsb(0,...) didn't: on-disk RECOVER=0 yet jsb.start != 0.
+     *       Streaming-flush replay in writable mode applies the journaled
+     *       SB to disk, so the FS sb's RECOVER reads as 0 even though the
+     *       journal head still points at the partial txn. We MUST run
+     *       update_jsb(0,...) to clean it; otherwise jsb.start sticks
+     *       permanently and every subsequent mount needlessly replays.
+     * fs->jbd.start reflects the on-disk jsb.start as init read it
+     * (streaming replay doesn't zero it; only this checkpoint does). */
+    if (!fs->jbd.replay_active
+        && (fs->sb.feature_incompat & 0x4u) == 0u
+        && fs->jbd.start == 0u) return 0;
 
     if (!bdev_writable(fs->bd)) {
         say(err, err_len, "bdev read-only; staying in soft-replay");
@@ -867,11 +876,13 @@ int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len) {
     uint32_t blocktype;
     uint32_t unsupported;
 
-    fs->jbd.present       = 0;
-    fs->jbd.replay_active = 0;
-    fs->jbd.extent_count  = 0;
-    fs->jbd.replay_count  = 0;
-    fs->jbd.revoke_count  = 0;
+    fs->jbd.present            = 0;
+    fs->jbd.replay_active      = 0;
+    fs->jbd.extent_count       = 0;
+    fs->jbd.replay_count       = 0;
+    fs->jbd.revoke_count       = 0;
+    fs->jbd.pre_replay_start   = 0;
+    fs->jbd.pre_replay_recover = (uint8_t)((fs->sb.feature_incompat & 0x4u) ? 1u : 0u);
 
     inum = fs->sb.journal_inum;
     if (inum == 0) return 0;
@@ -944,11 +955,12 @@ int ext4_journal_init(struct ext4_fs *fs, char *err, uint32_t err_len) {
         return -9;
     }
 
-    fs->jbd.blocksize = be32(jsb_buf + 0x0C);
-    fs->jbd.maxlen    = be32(jsb_buf + 0x10);
-    fs->jbd.first     = be32(jsb_buf + 0x14);
-    fs->jbd.sequence  = be32(jsb_buf + 0x18);
-    fs->jbd.start     = be32(jsb_buf + 0x1C);
+    fs->jbd.blocksize        = be32(jsb_buf + 0x0C);
+    fs->jbd.maxlen           = be32(jsb_buf + 0x10);
+    fs->jbd.first            = be32(jsb_buf + 0x14);
+    fs->jbd.sequence         = be32(jsb_buf + 0x18);
+    fs->jbd.start            = be32(jsb_buf + 0x1C);
+    fs->jbd.pre_replay_start = fs->jbd.start;
 
     if (blocktype == EXT4_JBD_BT_SUPER_V2) {
         fs->jbd.feature_incompat = be32(jsb_buf + 0x28);

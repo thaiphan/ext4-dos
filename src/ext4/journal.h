@@ -76,7 +76,8 @@ struct ext4_jbd_extent {
 struct ext4_jbd {
     uint8_t  present;       /* 0 = no journal handle (no s_journal_inum) */
     uint8_t  replay_active; /* 0 = clean mount, no redirect needed */
-    uint8_t  pad[2];
+    uint8_t  pre_replay_recover; /* RECOVER bit on FS sb at init (pre-replay) */
+    uint8_t  pad;
 
     uint32_t inum;          /* journal inode number */
     uint32_t blocksize;     /* journal block size; matches fs block_size */
@@ -84,6 +85,7 @@ struct ext4_jbd {
     uint32_t first;         /* first log block (after the journal superblock) */
     uint32_t sequence;      /* first-expected commit id */
     uint32_t start;         /* log start block; 0 means clean — no replay needed */
+    uint32_t pre_replay_start; /* jsb.start as seen at init, before replay/checkpoint */
 
     uint32_t feature_incompat;
     uint8_t  uuid[16];      /* journal-internal uuid; CRC32C seed */
