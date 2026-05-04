@@ -23,12 +23,11 @@
 #define JBD_ACTION_BUILD  2
 #define JBD_ACTION_FLUSH  3
 
-/* Forward decl — iterate_descriptor_tags (FLUSH branch) calls
- * checkpoint_one_block_buf, defined alongside the other writable-side
- * helpers further down. */
-static int  checkpoint_one_block_buf(struct ext4_fs *fs, uint64_t fs_block,
-                                     uint32_t jblk, uint8_t is_escape,
-                                     uint8_t *scratch);
+/* Forward decl — iterate_descriptor_tags (FLUSH branch) hands an already-
+ * loaded journal data block to apply_journaled_block_to_fs after the per-
+ * tag csum verify; defined alongside the other writable-side helpers. */
+static int  apply_journaled_block_to_fs(struct ext4_fs *fs, uint64_t fs_block,
+                                        uint8_t *scratch, uint8_t is_escape);
 
 /* DGROUP statics — DOS small-model has ~4 KB stack, and bdev_read
  * paths can run with SS != DS in interrupt context. See feedback memory:
@@ -236,17 +235,13 @@ static int iterate_descriptor_tags(struct ext4_fs *fs, uint32_t this_seq,
         uint32_t flags;
         int      is_escape, same_uuid;
 
-        if (fs->jbd.csum_v3) {
-            /* tag3 layout: blocknr(4), flags(4), blocknr_high(4), checksum(4) */
-            fs_block = (uint64_t)be32(p + 0);
-            flags    = be32(p + 4);
-            if (fs->jbd.has_64bit) fs_block |= ((uint64_t)be32(p + 8) << 32);
-        } else {
-            /* tag layout: blocknr(4), checksum(2), flags(2), blocknr_high(4 if 64bit) */
-            fs_block = (uint64_t)be32(p + 0);
-            flags    = (uint32_t)be16(p + 6);
-            if (fs->jbd.has_64bit) fs_block |= ((uint64_t)be32(p + 8) << 32);
-        }
+        /* Tag layouts (see jbd_tag_bytes / verify_tag_data_block):
+         *   v3: blocknr(4) | flags(4)  | blocknr_high(4) | checksum(4)
+         *   v2: blocknr(4) | csum16(2) | flags(2)        | [blocknr_high(4)]
+         * blocknr/blocknr_high are the same in both layouts; flags differ. */
+        fs_block = (uint64_t)be32(p + 0);
+        if (fs->jbd.has_64bit) fs_block |= ((uint64_t)be32(p + 8) << 32);
+        flags = fs->jbd.csum_v3 ? be32(p + 4) : (uint32_t)be16(p + 6);
 
         is_escape = (flags & EXT4_JBD_TAG_FLAG_ESCAPE)    ? 1 : 0;
         same_uuid = (flags & EXT4_JBD_TAG_FLAG_SAME_UUID) ? 1 : 0;
@@ -260,16 +255,43 @@ static int iterate_descriptor_tags(struct ext4_fs *fs, uint32_t this_seq,
         /* BUILD: add to soft-replay map. FLUSH: write straight to fs_block
          * (walk order is seq-ascending, so a block journaled multiple
          * times naturally ends up with its latest version on disk —
-         * one extra write per dup, rare in practice). FLUSH uses jsb_buf
-         * as scratch so it doesn't clobber the descriptor in walk_buf. */
+         * one extra write per dup, rare in practice). jsb_buf is scratch
+         * so we don't clobber the descriptor in walk_buf.
+         *
+         * Per-tag CSUM verify (CSUM_V2/V3 only): walk_log already
+         * verified the descriptor + commit blocks; this catches a torn
+         * write inside the data itself, where the txn looks committed
+         * but the on-disk data is garbage. Refusing is safer than
+         * applying garbage to the fs — bail the whole walk on mismatch.
+         *
+         * The pre-read also serves the FLUSH path (no double-read). */
         if ((action == JBD_ACTION_BUILD || action == JBD_ACTION_FLUSH)
             && !is_revoked(&fs->jbd, fs_block, this_seq)) {
+            int rc = ext4_journal_read_log_block(fs, *this_block, jsb_buf);
+            if (rc) return -7;
+            /* Per-tag CSUM verify — spec is crc32c(uuid + seq_be32 + blk).
+             * Caller already verified descriptor + commit; this catches a
+             * torn write inside the data itself. Tag csum field offsets:
+             *   csum_v3: tag+12 (4 BE)   csum_v2: tag+4 (2 BE) low-16 of crc. */
+            if (fs->jbd.csum_v2 || fs->jbd.csum_v3) {
+                uint8_t  seq_be[4];
+                uint32_t c;
+                be32_pack(seq_be, this_seq);
+                c = crc32c(CRC32C_INIT, fs->jbd.uuid, 16);
+                c = crc32c(c, seq_be, 4);
+                c = crc32c(c, jsb_buf, fs->jbd.blocksize);
+                if (fs->jbd.csum_v3) {
+                    if (c != be32(p + 12)) return -8;
+                } else {
+                    if ((c & 0xFFFFu) != (uint32_t)be16(p + 4)) return -8;
+                }
+            }
             if (action == JBD_ACTION_BUILD) {
                 if (replay_upsert(&fs->jbd, fs_block, *this_block,
                                   (uint8_t)is_escape) < 0) return -1;
-            } else {
-                if (checkpoint_one_block_buf(fs, fs_block, *this_block,
-                                             (uint8_t)is_escape, jsb_buf) != 0) return -2;
+            } else if (apply_journaled_block_to_fs(fs, fs_block, jsb_buf,
+                                                   (uint8_t)is_escape) != 0) {
+                return -2;
             }
         }
 
@@ -356,7 +378,10 @@ static int walk_log(struct ext4_fs *fs, int action, uint32_t *last_seq_io) {
              * commit for THIS transaction never landed atomically. */
             if (!verify_meta_block(&fs->jbd, walk_buf)) { log_end = 1; break; }
             rc = iterate_descriptor_tags(fs, this_seq, &this_block, walk_buf, action);
-            if (rc) return -4;
+            /* Propagate the underlying rc so per-tag CSUM mismatch (-8)
+             * and read failure (-7) surface distinctly in the err string,
+             * not collapsed into a single placeholder. */
+            if (rc) return rc;
             break;
 
         case EXT4_JBD_BT_COMMIT:
@@ -464,19 +489,16 @@ int ext4_journal_lookup(const struct ext4_fs *fs, uint64_t fs_block,
 
 /* --- Hard checkpoint (write replay map back to disk) -------------------- */
 
-/* Write one journal-recorded block back to its on-disk fs_block
- * location. Restores the JBD magic if the tag was escaped. The caller
- * picks the scratch buffer: map-based callers pass walk_buf (which is
- * dormant by then); the streaming-flush walker passes jsb_buf so it
- * doesn't clobber the descriptor it's iterating over in walk_buf. */
-static int checkpoint_one_block_buf(struct ext4_fs *fs, uint64_t fs_block,
-                                    uint32_t jblk, uint8_t is_escape,
-                                    uint8_t *scratch) {
+/* Apply an already-loaded journaled data block to its on-disk fs_block.
+ * Used by both the streaming-flush walker (iterate_descriptor_tags,
+ * which scratches into jsb_buf) and the soft-replay-map flush
+ * (ext4_journal_checkpoint, which scratches into walk_buf — walker is
+ * done by then). Caller does the read; this restores the JBD magic if
+ * the tag was escaped, then writes to fs_block. */
+static int apply_journaled_block_to_fs(struct ext4_fs *fs, uint64_t fs_block,
+                                       uint8_t *scratch, uint8_t is_escape) {
     uint32_t byte, sector, sectors;
-    int      rc;
 
-    rc = ext4_journal_read_log_block(fs, jblk, scratch);
-    if (rc) return rc;
     if (is_escape) {
         scratch[0] = 0xC0; scratch[1] = 0x3B;
         scratch[2] = 0x39; scratch[3] = 0x98;
@@ -830,14 +852,18 @@ int ext4_journal_checkpoint(struct ext4_fs *fs, char *err, uint32_t err_len) {
     }
 
     /* 1. Flush each journaled block to its on-disk location. walk_buf is
-     * dormant by now (we're past the log walker), so reuse it as scratch. */
+     * dormant by now (we're past the log walker), so reuse it as scratch.
+     * Read journal block, apply via the same helper iterate_descriptor_tags
+     * uses on the streaming-flush path. */
     if (fs->jbd.replay_active) {
         for (i = 0; i < fs->jbd.replay_count; i++) {
-            rc = checkpoint_one_block_buf(fs,
-                                          fs->jbd.replay[i].fs_block,
-                                          fs->jbd.replay[i].journal_blk,
-                                          fs->jbd.replay[i].is_escape,
-                                          walk_buf);
+            rc = ext4_journal_read_log_block(fs, fs->jbd.replay[i].journal_blk, walk_buf);
+            if (rc == 0) {
+                rc = apply_journaled_block_to_fs(fs,
+                                                 fs->jbd.replay[i].fs_block,
+                                                 walk_buf,
+                                                 fs->jbd.replay[i].is_escape);
+            }
             if (rc) {
                 say_dec(err, err_len, "checkpoint flush failed at index", (int32_t)i);
                 return rc;
