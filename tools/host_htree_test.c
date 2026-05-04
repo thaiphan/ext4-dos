@@ -177,6 +177,54 @@ int main(int argc, char **argv) {
 
     ASSERT(fs.jbd.start == 0, "journal must be clean after htree mkdir");
 
+    /* Cross-dir RENAME into htree: take the file we created in the root
+     * (control.txt) and move it into /htreedir, exercising the new-parent-
+     * htree branch of ext4_rename_xdir. */
+    {
+        uint32_t control_ino = ext4_path_lookup(&fs, "/control.txt");
+        int rxc;
+        ASSERT(control_ino != 0, "/control.txt should exist in fixture");
+        rxc = ext4_rename_xdir(&fs, /*old_parent=*/2u, control_ino,
+                               /*new_parent=*/many_ino,
+                               "moved.txt", 9u, 0x6A000000u, err, sizeof err);
+        ASSERT(rxc == 0,
+               "ext4_rename_xdir from root into htree parent rc=%d err='%s'",
+               rxc, err);
+        if (rxc == 0) {
+            uint32_t after = ext4_path_lookup(&fs, "/htreedir/moved.txt");
+            ASSERT(after == control_ino,
+                   "/htreedir/moved.txt lookup returned %u, expected %u",
+                   after, control_ino);
+            ASSERT(ext4_path_lookup(&fs, "/control.txt") == 0,
+                   "/control.txt should be gone after xdir-rename");
+        }
+    }
+    ASSERT(fs.jbd.start == 0, "journal must be clean after htree xdir RENAME (into)");
+
+    /* Cross-dir RENAME OUT of htree: take a pre-existing htree-leaf entry
+     * and move it back into the root. Exercises the old-parent-htree
+     * branch (linear scan of leaves looking for the entry by inode). */
+    {
+        uint32_t f001_ino = ext4_path_lookup(&fs, "/htreedir/file001.txt");
+        int rxc;
+        ASSERT(f001_ino != 0, "/htreedir/file001.txt should still exist");
+        rxc = ext4_rename_xdir(&fs, /*old_parent=*/many_ino, f001_ino,
+                               /*new_parent=*/2u,
+                               "outof.txt", 9u, 0x6A000000u, err, sizeof err);
+        ASSERT(rxc == 0,
+               "ext4_rename_xdir out of htree parent rc=%d err='%s'",
+               rxc, err);
+        if (rxc == 0) {
+            uint32_t after = ext4_path_lookup(&fs, "/outof.txt");
+            ASSERT(after == f001_ino,
+                   "/outof.txt lookup returned %u, expected %u",
+                   after, f001_ino);
+            ASSERT(ext4_path_lookup(&fs, "/htreedir/file001.txt") == 0,
+                   "/htreedir/file001.txt should be gone after xdir-rename out");
+        }
+    }
+    ASSERT(fs.jbd.start == 0, "journal must be clean after htree xdir RENAME (out)");
+
     file_bdev_close(bd);
 
     /* e2fsck -fn must report clean. mke2fs will verify the index

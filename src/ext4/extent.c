@@ -2561,9 +2561,6 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     if (ext4_inode_read(fs, file_ino, &file_inode) != 0) {
         say_simple(err, err_len, "file inode read failed"); return -1;
     }
-    if ((old_par_inode.flags & 0x1000u) || (new_par_inode.flags & 0x1000u)) {
-        say_simple(err, err_len, "htree parent not supported"); return -1;
-    }
     is_dir = ((file_inode.mode & 0xF000u) == EXT4_S_IFDIR);
 
     if (is_dir) {
@@ -2609,29 +2606,74 @@ int ext4_rename_xdir(struct ext4_fs *fs,
         new_par_gen        = le32(scratch_inode_block + new_par_inode_offset + 0x64);
     }
 
-    /* Find old entry in old parent's first dir block. */
-    if (ext4_extent_lookup(fs, old_par_inode.i_block, 0, &old_dir_phys) != 0) {
-        say_simple(err, err_len, "old parent dir block lookup"); return -1;
-    }
-    if (ext4_fs_read_block(fs, old_dir_phys, scratch_parent_dir) != 0) {
-        say_simple(err, err_len, "old parent dir block read"); return -1;
-    }
-    found_old = dir_find_entry_by_inode(scratch_parent_dir, fs->sb.block_size, file_ino);
-    if (!found_old) {
-        say_simple(err, err_len, "file not in old parent"); return -1;
+    /* Find old entry in old parent. Linear: scan block 0 (htree's block 0
+     * holds only `.`/`..`/index, no real entries — would always miss).
+     * htree: walk leaves 1..N looking for the entry by inode #. We don't
+     * use the hash to locate it because we don't carry the OLD name —
+     * just the inode. Cost is O(num_leaves), bounded by parent->size.
+     * On hit, scratch_parent_dir holds the leaf and old_dir_phys is its
+     * physical block. */
+    if (old_par_inode.flags & 0x1000u) {
+        uint32_t nblks = (uint32_t)((old_par_inode.size
+                                     + fs->sb.block_size - 1u)
+                                    / fs->sb.block_size);
+        uint32_t b;
+        for (b = 1; b < nblks && !found_old; b++) {
+            if (ext4_extent_lookup(fs, old_par_inode.i_block, b, &old_dir_phys) != 0) continue;
+            if (ext4_fs_read_block(fs, old_dir_phys, scratch_parent_dir) != 0) continue;
+            found_old = dir_find_entry_by_inode(scratch_parent_dir,
+                                                fs->sb.block_size, file_ino);
+        }
+        if (!found_old) {
+            say_simple(err, err_len, "file not found in htree leaves"); return -1;
+        }
+    } else {
+        if (ext4_extent_lookup(fs, old_par_inode.i_block, 0, &old_dir_phys) != 0) {
+            say_simple(err, err_len, "old parent dir block lookup"); return -1;
+        }
+        if (ext4_fs_read_block(fs, old_dir_phys, scratch_parent_dir) != 0) {
+            say_simple(err, err_len, "old parent dir block read"); return -1;
+        }
+        found_old = dir_find_entry_by_inode(scratch_parent_dir, fs->sb.block_size, file_ino);
+        if (!found_old) {
+            say_simple(err, err_len, "file not in old parent"); return -1;
+        }
     }
     old_slot_off = s_dir_entry_off; old_prev_off = s_dir_prev_off;
 
-    /* Find a slot for the new entry in new parent's first dir block. */
-    if (ext4_extent_lookup(fs, new_par_inode.i_block, 0, &new_dir_phys) != 0) {
-        say_simple(err, err_len, "new parent dir block lookup"); return -1;
-    }
-    if (ext4_fs_read_block(fs, new_dir_phys, scratch_data) != 0) {
-        say_simple(err, err_len, "new parent dir block read"); return -1;
-    }
-    found_new = dir_find_slot_for_entry(scratch_data, fs->sb.block_size, new_rec_needed);
-    if (!found_new) {
-        say_simple(err, err_len, "no room in new parent dir"); return -1;
+    /* Find a slot for the new entry in new parent. Linear: scan block 0.
+     * htree: hash the new name, walk dx_root to the right leaf, try
+     * insert there. Refuse if leaf is full (no split). */
+    if (new_par_inode.flags & 0x1000u) {
+        uint32_t leaf_logical;
+        int      hrc = ext4_htree_find_leaf(fs, &new_par_inode,
+                                             new_name, new_name_len,
+                                             scratch_data, &leaf_logical);
+        if (hrc == -2) { say_simple(err, err_len, "htree hash unsupported"); return -1; }
+        if (hrc == -3) { say_simple(err, err_len, "htree multi-level not supported"); return -1; }
+        if (hrc != 0)  { say_simple(err, err_len, "htree leaf locate failed"); return -1; }
+
+        if (ext4_extent_lookup(fs, new_par_inode.i_block, leaf_logical, &new_dir_phys) != 0) {
+            say_simple(err, err_len, "htree leaf lookup"); return -1;
+        }
+        if (ext4_fs_read_block(fs, new_dir_phys, scratch_data) != 0) {
+            say_simple(err, err_len, "htree leaf read"); return -1;
+        }
+        found_new = dir_find_slot_for_entry(scratch_data, fs->sb.block_size, new_rec_needed);
+        if (!found_new) {
+            say_simple(err, err_len, "htree leaf full — split not implemented"); return -1;
+        }
+    } else {
+        if (ext4_extent_lookup(fs, new_par_inode.i_block, 0, &new_dir_phys) != 0) {
+            say_simple(err, err_len, "new parent dir block lookup"); return -1;
+        }
+        if (ext4_fs_read_block(fs, new_dir_phys, scratch_data) != 0) {
+            say_simple(err, err_len, "new parent dir block read"); return -1;
+        }
+        found_new = dir_find_slot_for_entry(scratch_data, fs->sb.block_size, new_rec_needed);
+        if (!found_new) {
+            say_simple(err, err_len, "no room in new parent dir"); return -1;
+        }
     }
     slot_off = s_dir_slot_off;
 
