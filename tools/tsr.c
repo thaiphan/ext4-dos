@@ -1620,14 +1620,15 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
             return;
         }
 
-        case 0x17: { /* REM_CREATE — create a new file (or open existing for r/w).
-                      * Creates a new file in a linear (non-htree) parent directory.
-                      * If file already exists: refuse with access denied (no
-                      * truncate supported). */
+        case 0x17: { /* REM_CREATE — create a new file, or truncate-then-open
+                      * an existing one (matches AH=3Ch semantics).  DOS COPY
+                      * relies on the truncate-on-replace path to overwrite a
+                      * longer file with a shorter one. */
             static char path_buf[128];
             static char werr[64];
             uint8_t __far *sft;
             uint32_t       new_inode_num;
+            uint32_t       existing_inode_num;
             uint32_t       parent_ino;
             int            rc_path;
             int            base_idx;
@@ -1648,16 +1649,65 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                 return;
             }
 
+            /* TSR has no wall clock; use a fixed timestamp (~2026). */
+            now_unix = 0x6A000000u;
+
+            /* Truncate-on-replace: if the file already exists, truncate it
+             * to zero and hand back an SFT pointing at the (now empty)
+             * inode.  Same pattern as REM_WRITE's truncate-down path. */
+            existing_inode_num = path_lookup_with_alias(&g_fs, path_buf);
+            if (existing_inode_num != 0) {
+                slot = alloc_open_slot(r.x.es, r.w.di);
+                if (!slot) {
+                    r.w.ax = 4u; /* TOO_MANY_OPEN_FILES */
+                    r.w.flags |= 1u;
+                    return;
+                }
+                werr[0] = '\0';
+                if (ext4_file_truncate(&g_fs, existing_inode_num, 0u,
+                                       now_unix, werr, sizeof werr) != 0) {
+                    slot->used = 0;
+                    r.w.ax = DOS_ERR_WRITE_PROTECT;
+                    r.w.flags |= 1u;
+                    return;
+                }
+                if (ext4_inode_read(&g_fs, existing_inode_num,
+                                    &slot->inode) != 0) {
+                    slot->used = 0;
+                    r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                    r.w.flags |= 1u;
+                    return;
+                }
+                slot->used      = 1;
+                slot->sft_seg   = r.x.es;
+                slot->sft_off   = r.w.di;
+                slot->inode_num = existing_inode_num;
+
+                sft = (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+                *(uint16_t __far *)(sft + SFT_REF_COUNT_OFF) = 1u;
+                *(uint16_t __far *)(sft + SFT_DEVINFO_OFF)   =
+                    (uint16_t)(0x8000u | g_drive_index);
+                sft[SFT_FILE_ATTR_OFF] = 0x00u;
+                {
+                    uint32_t td = unix_to_dos(now_unix);
+                    *(uint16_t __far *)(sft + SFT_FILE_TIME_OFF) =
+                        (uint16_t)(td & 0xFFFFul);
+                    *(uint16_t __far *)(sft + SFT_FILE_DATE_OFF) =
+                        (uint16_t)(td >> 16);
+                }
+                *(uint32_t __far *)(sft + SFT_FILE_SIZE_OFF)     = 0u;
+                *(uint32_t __far *)(sft + SFT_FILE_POSITION_OFF) = 0u;
+                *(uint16_t __far *)(sft + SFT_UID_OFF) = 0u;
+                *(uint16_t __far *)(sft + SFT_PID_OFF) = 0u;
+
+                r.w.flags &= ~1u;
+                return;
+            }
+
             /* Split path: find last '/' to get parent + basename. */
             base_idx = 0;
             for (p = 0; path_buf[p]; p++) {
                 if (path_buf[p] == '/') base_idx = p + 1;
-            }
-            /* Refuse if file already exists. */
-            if (path_lookup_with_alias(&g_fs, path_buf) != 0) {
-                r.w.ax = 5u; /* ACCESS_DENIED */
-                r.w.flags |= 1u;
-                return;
             }
             /* Resolve parent directory. base_idx is one past the last '/'.
              * Copy path_buf[0..base_idx-2] (strips trailing slash). */
@@ -1685,9 +1735,6 @@ void __interrupt __far my_int2f_handler(union INTPACK r) {
                 r.w.flags |= 1u;
                 return;
             }
-
-            /* TSR has no wall clock; use a fixed timestamp (~2026). */
-            now_unix = 0x6A000000u;
 
             slot = alloc_open_slot(r.x.es, r.w.di);
             if (!slot) {

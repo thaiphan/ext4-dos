@@ -113,6 +113,18 @@ echo === Remove directory: RD Y:\NEWDIR === >> C:\OUT.TXT
 RD Y:\NEWDIR >> C:\OUT.TXT
 echo === DIR Y: (NEWDIR must be gone) === >> C:\OUT.TXT
 DIR Y: >> C:\OUT.TXT
+echo === Truncate-on-replace setup: COPY Y:\TARGET.TXT Y:\REPLACE.TXT (2048B) === >> C:\OUT.TXT
+COPY Y:\TARGET.TXT Y:\REPLACE.TXT >> C:\OUT.TXT
+echo === DIR Y:\REPLACE.TXT (expect size 2048 before truncate-on-replace) === >> C:\OUT.TXT
+DIR Y:\REPLACE.TXT >> C:\OUT.TXT
+echo === Truncate-on-replace: COPY Y:\HELLO.TXT Y:\REPLACE.TXT (61B over 2048B) === >> C:\OUT.TXT
+COPY Y:\HELLO.TXT Y:\REPLACE.TXT >> C:\OUT.TXT
+echo === DIR Y:\REPLACE.TXT (expect size 61 after truncate-on-replace) === >> C:\OUT.TXT
+DIR Y:\REPLACE.TXT >> C:\OUT.TXT
+echo === TYPE Y:\REPLACE.TXT (expect HELLO content, no stale TARGET data) === >> C:\OUT.TXT
+TYPE Y:\REPLACE.TXT >> C:\OUT.TXT
+echo === DEL Y:\REPLACE.TXT (cleanup truncate-on-replace dest) === >> C:\OUT.TXT
+DEL Y:\REPLACE.TXT >> C:\OUT.TXT
 echo === DEL Y:\NEWCOPY.TXT (remove created file) === >> C:\OUT.TXT
 DEL Y:\NEWCOPY.TXT >> C:\OUT.TXT
 echo === DIR Y: after DEL (NEWCOPY must be gone, HELLO still there) === >> C:\OUT.TXT
@@ -294,6 +306,26 @@ fi
 EXTFREE_KERNEL_FREE=$(awk '/INT 21h AX=7303h on/,EOF' <<<"$OUT" | grep -oE 'bytes free *: *[0-9]+' | head -1 | grep -oE '[0-9]+$' || true)
 if [[ -n "${EXTFREE_KERNEL_FREE:-}" ]] && (( EXTFREE_KERNEL_FREE != INIT_FREE )); then
     echo "FAIL: AX=7303h via kernel bytes free (${EXTFREE_KERNEL_FREE}) doesn't match install-time snapshot (${INIT_FREE})" >&2
+    fail=1
+fi
+# Truncate-on-replace: COPY HELLO.TXT (61B) over REPLACE.TXT (2048B from
+# TARGET.TXT) must shrink REPLACE.TXT to 61 bytes and leave only HELLO
+# content — no stale 'B'/'C' bytes from the prior TARGET copy.
+if ! grep -F -A6 'DIR Y:\REPLACE.TXT (expect size 2048' <<<"$OUT" | grep -qE "REPLACE[[:space:]]+TXT[[:space:]]+2[,]?048"; then
+    echo "FAIL: Y:\\REPLACE.TXT not 2048 bytes after initial multi-block COPY (precondition for truncate-on-replace)" >&2
+    fail=1
+fi
+if ! grep -F -A6 'DIR Y:\REPLACE.TXT (expect size 61' <<<"$OUT" | grep -qE "REPLACE[[:space:]]+TXT[[:space:]]+61"; then
+    echo "FAIL: Y:\\REPLACE.TXT not 61 bytes after truncate-on-replace (REM_CREATE didn't truncate existing file)" >&2
+    fail=1
+fi
+REPLACE_AFTER=$(grep -F -A3 'TYPE Y:\REPLACE.TXT (expect HELLO' <<<"$OUT")
+if ! grep -q "Hello, ext4-dos!" <<<"$REPLACE_AFTER"; then
+    echo "FAIL: Y:\\REPLACE.TXT after truncate-on-replace doesn't contain HELLO content" >&2
+    fail=1
+fi
+if grep -qE 'B{100}' <<<"$REPLACE_AFTER"; then
+    echo "FAIL: Y:\\REPLACE.TXT after truncate-on-replace still has stale 'B' bytes (TARGET data not truncated)" >&2
     fail=1
 fi
 # DEL: NEWCOPY.TXT must be absent after DEL, HELLO.TXT must still be present.

@@ -195,6 +195,11 @@ echo === Remove directory: RD Y:\NEWDIR === >> A:\OUT.TXT
 RD Y:\NEWDIR >> A:\OUT.TXT
 echo === DIR Y: (NEWDIR must be gone, TARGET extended to 2048) === >> A:\OUT.TXT
 DIR Y: >> A:\OUT.TXT
+REM SKIP(MSDOS4): truncate-on-replace via DOS COPY.  MS-DOS 4 routes
+REM AX=6C00h (action=replace) through redirector AL=0x2E ExtOpen, not
+REM AL=0x17 REM_CREATE.  Detecting the replace intent requires reading
+REM EXTOPEN_FLAG out of the SDA; tracked as separate work.  FreeDOS goes
+REM through AL=0x17 and its regression covers the truncate-on-replace path.
 echo === DEL Y:\NEWCOPY.TXT (remove created file) === >> A:\OUT.TXT
 DEL Y:\NEWCOPY.TXT >> A:\OUT.TXT
 echo === DIR Y: after DEL (NEWCOPY must be gone, HELLO still there) === >> A:\OUT.TXT
@@ -368,6 +373,9 @@ if ! grep -F -A6 'DIR Y:\RENAMED.TXT (must exist' <<<"$OUT" | grep -qE "RENAMED[
     echo "FAIL: Y:\\RENAMED.TXT (post-REN) not visible at size 2048" >&2
     fail=1
 fi
+# SKIP(MSDOS4): truncate-on-replace via DOS COPY — MS-DOS 4 routes through
+# AL=0x2E ExtOpen, not AL=0x17 REM_CREATE.  See heredoc above and the
+# FreeDOS runner for the regression that covers the AL=0x17 path.
 # DEL Y:\NEWCOPY.TXT — NEWCOPY must be gone, HELLO still present.
 if grep -F -A20 'DIR Y: after DEL' <<<"$OUT" | grep -qE "NEWCOPY[[:space:]]+TXT"; then
     echo "FAIL: Y:\\NEWCOPY.TXT still visible after DEL" >&2
