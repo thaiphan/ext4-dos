@@ -1940,6 +1940,40 @@ extopen_notfound:
                 r.w.flags |= 1u;
                 return;
             }
+
+            /* Truncate-on-replace for MS-DOS 4 AX=6C00h.  MS-DOS 4
+             * routes both TYPE (read) and COPY-overwrite (write to
+             * truncate) through AL=0x2E.  In CREATE.ASM:Set_EXT_mode,
+             * DOS ORs the user's BX (open mode) into ES:[DI].sf_mode
+             * before IFS_extopen, so sf_open_mode access bits at our
+             * entry tell us write intent.  Only truncate when AL=0x2E
+             * (the ExtOpen path), the file size is non-zero (no point
+             * otherwise), and access bits include write — matches DOS
+             * COPY's `creat_open_flag = 0x0112` (replace+create) which
+             * sets BX = 1 (write_open_mode).  TYPE uses BX = 0
+             * (read_open_mode) and isn't affected. */
+            if (al == 0x2E && slot->inode.size != 0u) {
+                uint8_t __far *sft_pre =
+                    (uint8_t __far *)MK_FP(r.x.es, r.w.di);
+                uint16_t mode_in =
+                    *(uint16_t __far *)(sft_pre + SFT_OPEN_MODE_OFF);
+                if ((mode_in & 0x07u) != 0u) {
+                    static char werr_t[64];
+                    werr_t[0] = '\0';
+                    if (ext4_file_truncate(&g_fs, inode_num, 0u,
+                                           slot->inode.mtime + 1u,
+                                           werr_t, sizeof werr_t) == 0) {
+                        if (ext4_inode_read(&g_fs, inode_num,
+                                            &slot->inode) != 0) {
+                            g_ff_capture.last_open_rc = -105;
+                            r.w.ax = DOS_ERR_FILE_NOT_FOUND;
+                            r.w.flags |= 1u;
+                            return;
+                        }
+                    }
+                }
+            }
+
             slot->used      = 1;
             slot->sft_seg   = r.x.es;
             slot->sft_off   = r.w.di;

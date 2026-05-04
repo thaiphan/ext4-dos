@@ -195,11 +195,18 @@ echo === Remove directory: RD Y:\NEWDIR === >> A:\OUT.TXT
 RD Y:\NEWDIR >> A:\OUT.TXT
 echo === DIR Y: (NEWDIR must be gone, TARGET extended to 2048) === >> A:\OUT.TXT
 DIR Y: >> A:\OUT.TXT
-REM SKIP(MSDOS4): truncate-on-replace via DOS COPY.  MS-DOS 4 routes
-REM AX=6C00h (action=replace) through redirector AL=0x2E ExtOpen, not
-REM AL=0x17 REM_CREATE.  Detecting the replace intent requires reading
-REM EXTOPEN_FLAG out of the SDA; tracked as separate work.  FreeDOS goes
-REM through AL=0x17 and its regression covers the truncate-on-replace path.
+echo === Truncate-on-replace setup: COPY Y:\TARGET.TXT Y:\REPLACE.TXT (2048B) === >> A:\OUT.TXT
+COPY Y:\TARGET.TXT Y:\REPLACE.TXT >> A:\OUT.TXT
+echo === DIR Y:\REPLACE.TXT (expect size 2048 before truncate-on-replace) === >> A:\OUT.TXT
+DIR Y:\REPLACE.TXT >> A:\OUT.TXT
+echo === Truncate-on-replace: COPY A:\HELLO2.TXT Y:\REPLACE.TXT (61B over 2048B) === >> A:\OUT.TXT
+COPY A:\HELLO2.TXT Y:\REPLACE.TXT >> A:\OUT.TXT
+echo === DIR Y:\REPLACE.TXT (expect size 61 after truncate-on-replace) === >> A:\OUT.TXT
+DIR Y:\REPLACE.TXT >> A:\OUT.TXT
+echo === TYPE Y:\REPLACE.TXT (expect HELLO content, no stale TARGET data) === >> A:\OUT.TXT
+TYPE Y:\REPLACE.TXT >> A:\OUT.TXT
+echo === DEL Y:\REPLACE.TXT (cleanup truncate-on-replace dest) === >> A:\OUT.TXT
+DEL Y:\REPLACE.TXT >> A:\OUT.TXT
 echo === DEL Y:\NEWCOPY.TXT (remove created file) === >> A:\OUT.TXT
 DEL Y:\NEWCOPY.TXT >> A:\OUT.TXT
 echo === DIR Y: after DEL (NEWCOPY must be gone, HELLO still there) === >> A:\OUT.TXT
@@ -373,9 +380,27 @@ if ! grep -F -A6 'DIR Y:\RENAMED.TXT (must exist' <<<"$OUT" | grep -qE "RENAMED[
     echo "FAIL: Y:\\RENAMED.TXT (post-REN) not visible at size 2048" >&2
     fail=1
 fi
-# SKIP(MSDOS4): truncate-on-replace via DOS COPY — MS-DOS 4 routes through
-# AL=0x2E ExtOpen, not AL=0x17 REM_CREATE.  See heredoc above and the
-# FreeDOS runner for the regression that covers the AL=0x17 path.
+# Truncate-on-replace via DOS COPY: MS-DOS 4 routes AX=6C00h
+# (action=replace) through redirector AL=0x2E ExtOpen.  COPY HELLO2 (61B)
+# over REPLACE.TXT (2048B from TARGET.TXT) must shrink REPLACE.TXT to 61
+# bytes and leave only HELLO content.
+if ! grep -F -A6 'DIR Y:\REPLACE.TXT (expect size 2048' <<<"$OUT" | grep -qE "REPLACE[[:space:]]+TXT[[:space:]]+2[,]?048"; then
+    echo "FAIL: Y:\\REPLACE.TXT not 2048 bytes after initial multi-block COPY (precondition for truncate-on-replace)" >&2
+    fail=1
+fi
+if ! grep -F -A6 'DIR Y:\REPLACE.TXT (expect size 61' <<<"$OUT" | grep -qE "REPLACE[[:space:]]+TXT[[:space:]]+61"; then
+    echo "FAIL: Y:\\REPLACE.TXT not 61 bytes after truncate-on-replace (AL=0x2E didn't truncate existing file)" >&2
+    fail=1
+fi
+REPLACE_AFTER=$(grep -F -A3 'TYPE Y:\REPLACE.TXT (expect HELLO' <<<"$OUT")
+if ! grep -q "Hello, ext4-dos!" <<<"$REPLACE_AFTER"; then
+    echo "FAIL: Y:\\REPLACE.TXT after truncate-on-replace doesn't contain HELLO content" >&2
+    fail=1
+fi
+if grep -qE 'B{100}' <<<"$REPLACE_AFTER"; then
+    echo "FAIL: Y:\\REPLACE.TXT after truncate-on-replace still has stale 'B' bytes (TARGET data not truncated)" >&2
+    fail=1
+fi
 # DEL Y:\NEWCOPY.TXT — NEWCOPY must be gone, HELLO still present.
 if grep -F -A20 'DIR Y: after DEL' <<<"$OUT" | grep -qE "NEWCOPY[[:space:]]+TXT"; then
     echo "FAIL: Y:\\NEWCOPY.TXT still visible after DEL" >&2
