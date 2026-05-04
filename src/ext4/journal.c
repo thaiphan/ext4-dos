@@ -159,7 +159,23 @@ static int revoke_upsert(struct ext4_jbd *j, uint64_t fs_block,
     return 0;
 }
 
-/* A revoke at seq R means: skip tags from transactions whose seq <= R. */
+/* Is fs_block revoked relative to a tag at this_seq?
+ *
+ * Rule (matches Linux jbd2_journal_test_revoke and lwext4 ext4_journal.c
+ * jbd_replay_block_tags): skip iff this_seq <= revoke_seq. Equivalently
+ * apply iff this_seq > revoke_seq.
+ *
+ * Concrete walk:
+ *   txn 1: desc B (X)    txn 2: revoke B    txn 3: desc B (Y)
+ *   REVOKE pass populates revoke[B] = 2.
+ *   BUILD/FLUSH at txn 1: is_revoked(B, 1)? 2 >= 1 → true → skip (stale X).
+ *   BUILD/FLUSH at txn 3: is_revoked(B, 3)? 2 >= 3 → false → apply (current Y).
+ *
+ * Edge case — same-txn revoke + descriptor for the same block:
+ *   txn Y contains both. is_revoked(B, Y) → Y >= Y → true → skip.
+ *   This matches kernel behavior; modern jbd2 doesn't generate this case
+ *   (the descriptor's data IS the current value, so a same-txn revoke
+ *   would be redundant). If it ever appeared, kernel and us both skip. */
 static int is_revoked(const struct ext4_jbd *j, uint64_t fs_block, uint32_t this_seq) {
     uint32_t i;
     for (i = 0; i < j->revoke_count; i++) {
@@ -246,6 +262,10 @@ static int iterate_descriptor_tags(struct ext4_fs *fs, uint32_t this_seq,
         is_escape = (flags & EXT4_JBD_TAG_FLAG_ESCAPE)    ? 1 : 0;
         same_uuid = (flags & EXT4_JBD_TAG_FLAG_SAME_UUID) ? 1 : 0;
         last_tag  = (flags & EXT4_JBD_TAG_FLAG_LAST_TAG)  ? 1 : 0;
+        /* EXT4_JBD_TAG_FLAG_DELETED is intentionally ignored here.
+         * Modern jbd2 (Linux + lwext4) doesn't emit it; if a fixture ever
+         * sets it, the right behavior is the same as treating the tag
+         * normally + relying on the revoke list to suppress staleness. */
 
         /* Advance past the descriptor (or the previous tag's data block)
          * to point at THIS tag's data block. */
