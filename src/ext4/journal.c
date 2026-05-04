@@ -17,22 +17,11 @@
  * FLUSH (writable mounts only) skips the map and writes each non-
  * revoked tag's data block directly to its fs_block on disk — no cap.
  * SCAN→REVOKE→FLUSH is the writable-mount path; SCAN→REVOKE→BUILD is
- * the read-only soft-replay path.
- *
- * The FLUSH path is omitted on the DOS TSR build (__WATCOMC__) to keep
- * the _TEXT segment under 64 KiB. The DOS TSR falls back to BUILD on
- * writable mounts; if BUILD overflows EXT4_JBD_REPLAY_MAP_MAX, the
- * replay aborts and ext4_fs_open returns an error so the caller
- * refuses the mount rather than serving stale on-disk data. The
- * cross-OS scenario (Linux dirties a journal with > cap unique blocks,
- * user reboots into DOS) is uncommon — workaround is to boot Linux
- * once and let it complete the recovery before mounting from DOS. */
+ * the read-only soft-replay path. */
 #define JBD_ACTION_SCAN   0
 #define JBD_ACTION_REVOKE 1
 #define JBD_ACTION_BUILD  2
-#ifndef __WATCOMC__
 #define JBD_ACTION_FLUSH  3
-#endif
 
 /* Forward decl — iterate_descriptor_tags (FLUSH branch) calls
  * checkpoint_one_block_buf, defined alongside the other writable-side
@@ -268,23 +257,21 @@ static int iterate_descriptor_tags(struct ext4_fs *fs, uint32_t this_seq,
         (*this_block)++;
         wrap_jblk(fs, this_block);
 
-        /* BUILD: add to soft-replay map. FLUSH (host only): write straight
-         * to fs_block (walk order is seq-ascending, so a block journaled
-         * multiple times naturally ends up with its latest version on
-         * disk). FLUSH uses jsb_buf as scratch so it doesn't clobber the
-         * descriptor in walk_buf. */
-        if (action == JBD_ACTION_BUILD
+        /* BUILD: add to soft-replay map. FLUSH: write straight to fs_block
+         * (walk order is seq-ascending, so a block journaled multiple
+         * times naturally ends up with its latest version on disk —
+         * one extra write per dup, rare in practice). FLUSH uses jsb_buf
+         * as scratch so it doesn't clobber the descriptor in walk_buf. */
+        if ((action == JBD_ACTION_BUILD || action == JBD_ACTION_FLUSH)
             && !is_revoked(&fs->jbd, fs_block, this_seq)) {
-            if (replay_upsert(&fs->jbd, fs_block, *this_block,
-                              (uint8_t)is_escape) < 0) return -1;
+            if (action == JBD_ACTION_BUILD) {
+                if (replay_upsert(&fs->jbd, fs_block, *this_block,
+                                  (uint8_t)is_escape) < 0) return -1;
+            } else {
+                if (checkpoint_one_block_buf(fs, fs_block, *this_block,
+                                             (uint8_t)is_escape, jsb_buf) != 0) return -2;
+            }
         }
-#ifndef __WATCOMC__
-        else if (action == JBD_ACTION_FLUSH
-            && !is_revoked(&fs->jbd, fs_block, this_seq)) {
-            if (checkpoint_one_block_buf(fs, fs_block, *this_block,
-                                         (uint8_t)is_escape, jsb_buf) != 0) return -2;
-        }
-#endif
 
         p         += tag_bytes;
         remaining -= (int32_t)tag_bytes;
@@ -446,14 +433,8 @@ int ext4_journal_replay(struct ext4_fs *fs, char *err, uint32_t err_len) {
      * set on disk so the next mount retries idempotently; cleanup
      * (zero jsb.start, clear RECOVER) is delegated to fs.c's call to
      * ext4_journal_checkpoint, whose orphan-RECOVER branch handles the
-     * no-map case. (DOS TSR build uses BUILD unconditionally — see
-     * note next to JBD_ACTION_FLUSH.) */
-#ifdef __WATCOMC__
-    (void)writable;
-    rc = walk_log(fs, JBD_ACTION_BUILD, &last_seq);
-#else
+     * no-map case. */
     rc = walk_log(fs, writable ? JBD_ACTION_FLUSH : JBD_ACTION_BUILD, &last_seq);
-#endif
     if (rc) {
         fs->jbd.replay_count = 0;
         fs->jbd.revoke_count = 0;
@@ -461,13 +442,9 @@ int ext4_journal_replay(struct ext4_fs *fs, char *err, uint32_t err_len) {
         return rc;
     }
 
-#ifndef __WATCOMC__
     if (!writable) {
         fs->jbd.replay_active = (uint8_t)((fs->jbd.replay_count > 0) ? 1 : 0);
     }
-#else
-    fs->jbd.replay_active = (uint8_t)((fs->jbd.replay_count > 0) ? 1 : 0);
-#endif
     return 0;
 }
 

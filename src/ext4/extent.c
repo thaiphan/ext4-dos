@@ -2562,6 +2562,11 @@ int ext4_rename_xdir(struct ext4_fs *fs,
     return 0;
 }
 
+#ifndef __WATCOMC__
+/* Host-only convenience helper used by host_write_test / host_stress_test.
+ * Excluded from the DOS TSR to keep _TEXT under 64 KiB — the TSR reads
+ * blocks one at a time via ext4_file_read_block, doesn't need the
+ * gather-multiple-blocks variant. */
 int ext4_file_read_head(struct ext4_fs *fs, const struct ext4_inode *inode,
                         uint32_t length, void *out_buf) {
     static uint8_t blk[EXT4_EXT_NODE_BUF];
@@ -2586,3 +2591,4 @@ int ext4_file_read_head(struct ext4_fs *fs, const struct ext4_inode *inode,
     }
     return (int)length;
 }
+#endif
